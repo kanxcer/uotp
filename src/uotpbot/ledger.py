@@ -204,7 +204,22 @@ def _utcnow() -> str:
 
 
 class Ledger:
-    """Append-only double-entry ledger backed by SQLite."""
+    """Append-only double-entry ledger backed by SQLite.
+
+    Storage-independence note: every SQL statement routes through :meth:`_q`
+    (table name + placeholder style) and the two primitives :meth:`_execute`
+    and :meth:`_write`. That is the entire seam a different backend has to
+    provide; see :class:`pgstore.PostgresLedger`. The double-entry logic --
+    which is the part where a bug costs real money -- lives only here, so it
+    is tested once and shared by every backend.
+    """
+
+    #: Row shape of one posting after expansion. Placeholders are ``?`` here;
+    #: :meth:`_q` translates for other drivers.
+    _INSERT_SQL = (
+        "INSERT INTO {t} (ts, ref, account, debit_p, credit_p, memo) "
+        "VALUES (?, ?, ?, ?, ?, ?)"
+    )
 
     def __init__(self, path: Optional[Path | str] = None) -> None:
         # check_same_thread=False is required, not a convenience: an HTTP
@@ -215,6 +230,8 @@ class Ledger:
         #
         # Sharing the connection across threads means the caller must
         # serialise access, hence the lock below. Every operation takes it.
+        self._table = "postings"
+        self._ph = "?"
         self._conn = sqlite3.connect(
             str(path) if path else ":memory:", check_same_thread=False
         )
@@ -225,18 +242,23 @@ class Ledger:
             self._conn.executescript(SCHEMA)
             self._conn.commit()
 
+    # -- backend seam ------------------------------------------------------
+    def _q(self, sql: str) -> str:
+        """Translate canonical SQL (``{t}`` table, ``?`` placeholders)."""
+        return sql.replace("{t}", self._table).replace("?", self._ph)
+
+    def _tx(self):
+        """A write transaction context. sqlite: the connection itself."""
+        return self._conn
+
     # -- locked access ---------------------------------------------------
     def _execute(self, sql: str, params: tuple = ()) -> list[tuple]:
         with self._lock:
-            return list(self._conn.execute(sql, params))
+            return list(self._conn.execute(self._q(sql), params))
 
     def _write(self, rows: list[tuple]) -> None:
-        with self._lock, self._conn:
-            self._conn.executemany(
-                "INSERT INTO postings (ts, ref, account, debit_p, credit_p, memo) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                rows,
-            )
+        with self._lock, self._tx():
+            self._conn.executemany(self._q(self._INSERT_SQL), rows)
 
     # -- writing ---------------------------------------------------------
     def post(
@@ -269,7 +291,7 @@ class Ledger:
         """Net balance, positive in the account's normal direction."""
         row = self._execute(
             "SELECT COALESCE(SUM(debit_p),0), COALESCE(SUM(credit_p),0) "
-            "FROM postings WHERE account = ?",
+            "FROM {t} WHERE account = ?",
             (str(account),),
         )[0]
         debit, credit = int(row[0]), int(row[1])
@@ -277,13 +299,13 @@ class Ledger:
 
     def trial_balance(self) -> dict[Account, Money]:
         """Balance of every account that has activity."""
-        accounts = {Account(a) for (a,) in self._execute("SELECT DISTINCT account FROM postings")}
+        accounts = {Account(a) for (a,) in self._execute("SELECT DISTINCT account FROM {t}")}
         return {a: self.balance(a) for a in sorted(accounts)}
 
     def verify(self) -> None:
         """Assert the fundamental invariant. Raises if the ledger is broken."""
         row = self._execute(
-            "SELECT COALESCE(SUM(debit_p),0), COALESCE(SUM(credit_p),0) FROM postings"
+            "SELECT COALESCE(SUM(debit_p),0), COALESCE(SUM(credit_p),0) FROM {t}"
         )[0]
         total_debit, total_credit = int(row[0]), int(row[1])
         if total_debit != total_credit:
@@ -309,7 +331,7 @@ class Ledger:
     def ledger_for(self, ref: str) -> list[Posting]:
         """Every posting sharing a reference -- the audit trail of one order."""
         rows = self._execute(
-            "SELECT ts, ref, account, debit_p, credit_p, memo FROM postings "
+            "SELECT ts, ref, account, debit_p, credit_p, memo FROM {t} "
             "WHERE ref = ? ORDER BY id",
             (ref,),
         )
@@ -323,7 +345,7 @@ class Ledger:
 
     def history(self, limit: int = 200) -> list[tuple]:
         return self._execute(
-            "SELECT ts, ref, account, debit_p, credit_p, memo FROM postings "
+            "SELECT ts, ref, account, debit_p, credit_p, memo FROM {t} "
             "ORDER BY id DESC LIMIT ?",
             (limit,),
         )

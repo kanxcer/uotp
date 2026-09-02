@@ -98,6 +98,15 @@ class Settings:
     allowed_users: tuple[str, ...] = ()
     owner_id: str = ""
     ledger_path: str = "ledger.db"
+    #: Postgres connection string. When set, BOTH the ledger and the sub-bot
+    #: registry live there instead of sqlite -- they must share one durability
+    #: story, because a registry that outlives the ledger keeps charging fees
+    #: against books that no longer exist. On Render's free tier (no disk)
+    #: this is the only configuration whose audit trail survives a deploy.
+    database_url: str = ""
+    #: Schema the app's tables live in. A dedicated schema keeps the ledger
+    #: off PostgREST's default surface and cleanly nameable in backups.
+    database_schema: str = "uotp"
     prices_path: Optional[str] = None
     #: Where white-label sub-bot records live. Must be on the same persistent
     #: disk as the ledger: a sub-bot registry that survives a redeploy but a
@@ -112,6 +121,10 @@ class Settings:
     #: quietly change after the fact, because the agreed figure is stored per
     #: sub-bot in the registry.
     platform_fee_rate: Decimal = Decimal("0.05")
+    #: Your margin over true cost when pricing services (target-margin
+    #: strategy). 0.10 = you keep ~10% of each sale after every cost. Deliberately
+    #: an env var: this is a business decision, not a code constant.
+    pricing_target_margin: Decimal = Decimal("0.35")
 
     @property
     def has_telegram(self) -> bool:
@@ -155,7 +168,10 @@ def from_environment(env_file: Optional[Path | str] = None) -> Settings:
         status_complete=_get("UOTP_STATUS_COMPLETE", "6"),
         status_cancel=_get("UOTP_STATUS_CANCEL", "8"),
         prices_country=_get("UOTP_PRICES_COUNTRY", "0"),
-        prices_operator=_get("UOTP_PRICES_OPERATOR", "any"),
+        # Numeric operator id, verified live: "any"/"0" are rejected with
+        # BAD_OPERATOR, ids >= 2 pass validation (the provider then answered
+        # NO_CONNECTION -- its own backend, not our parameters).
+        prices_operator=_get("UOTP_PRICES_OPERATOR", "2"),
         service_map=_parse_service_map(_get("UOTP_SERVICE_MAP", "")),
         balance_divisor=_decimal("UOTP_BALANCE_DIVISOR", "1"),
         timeout=float(_get("UOTP_TIMEOUT", "30")),
@@ -188,11 +204,29 @@ def from_environment(env_file: Optional[Path | str] = None) -> Settings:
         allowed_users=allowed,
         owner_id=_get("TELEGRAM_OWNER_ID", ""),
         ledger_path=_get("LEDGER_PATH", "ledger.db"),
+        database_url=_get("DATABASE_URL", ""),
+        database_schema=_get("DATABASE_SCHEMA", "uotp"),
         prices_path=_get("PRICES_PATH") or None,
         subbots_path=_get("SUBBOTS_PATH", "subbots.db"),
         whitelabel_enabled=_bool("WHITELABEL_ENABLED", False),
         platform_fee_rate=_fee_rate(_get("PLATFORM_FEE_RATE", "0.05")),
+        pricing_target_margin=_fraction("PRICING_TARGET_MARGIN", "0.35"),
     )
+
+
+def _fraction(name: str, default: str) -> Decimal:
+    """Parse a (0, 1) fraction env var; reject nonsense at startup."""
+    raw = _get(name, default)
+    try:
+        value = Decimal(raw)
+    except ArithmeticError as exc:
+        raise ConfigError(f"{name}={raw!r} is not a valid decimal") from exc
+    if not (Decimal(0) < value < Decimal(1)):
+        raise ConfigError(
+            f"{name}={raw} must be a fraction strictly between 0 and 1 "
+            "(e.g. 0.10 for a 10% margin)"
+        )
+    return value
 
 
 def _fee_rate(raw: str) -> Decimal:

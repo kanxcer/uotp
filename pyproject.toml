@@ -13,6 +13,7 @@ dependencies = []
 
 [project.optional-dependencies]
 telegram = ["python-telegram-bot>=21.0"]
+postgres = ["psycopg[binary]>=3.2"]
 dev = ["pytest>=8.0"]
 
 [project.scripts]
@@ -22,7 +23,7 @@ uotpbot = "uotpbot.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-uotpbot = ["../../data/*.csv"]
+uotpbot = ["data/*.csv"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

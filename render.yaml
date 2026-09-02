@@ -3,49 +3,55 @@
 #   render up          # create/update everything from this file
 #
 # The bot is a long-polling Telegram client: it makes an outbound connection
-# and never needs inbound traffic. That makes a **Background Worker** the
-# natural fit. But a Web Service works too, because `serve` also binds $PORT
-# and answers /healthz and /readyz -- use whichever your plan allows.
+# and never needs inbound traffic. `serve` also binds $PORT and answers
+# /healthz and /readyz, so a Web Service works.
 #
-# IMPORTANT -- the ledger is SQLite. Render's container filesystem is wiped on
-# every deploy, so without a persistent disk the entire audit trail (and any
-# order that was mid-flight) disappears on the next release. `disk` below
-# mounts one at /var/data; note that persistent disks are not available on the
-# free plan. If you cannot mount one, move the ledger to a managed database
-# rather than accepting silent data loss.
+# STORAGE -- since the Postgres backend landed, this blueprint uses the FREE
+# plan with NO disk: the ledger and the white-label registry live in Postgres
+# (Supabase) via DATABASE_URL. Persistent data no longer depends on Render's
+# filesystem at all, so the free tier's wiped-on-deploy container is
+# irrelevant to money records. If you would rather keep sqlite, use the
+# starter plan with a persistent disk and set LEDGER_PATH/SUBBOTS_PATH there.
 
 services:
-  # --- Option A: Web Service (what you asked for) ------------------------
   - type: web
     name: uotpbot
     runtime: python
-    plan: starter
-    region: singapore
-    pythonVersion: 3.11.9
-    # `.[telegram]` matters: python-telegram-bot is an optional extra, and a
-    # bare `pip install .` starts an HTTP server that accepts no orders.
-    buildCommand: pip install --upgrade pip && pip install ".[telegram]"
+    plan: free
+    region: singapore          # same region as the Supabase project
+    pythonVersion: "3.11.9"    # known-good on Render; project needs >=3.10
+    # `[telegram,postgres]` matters: python-telegram-bot and psycopg are
+    # optional extras, and a bare `pip install .` starts an HTTP server that
+    # accepts no orders and cannot reach Postgres.
+    buildCommand: pip install --upgrade pip && pip install ".[telegram,postgres]"
     startCommand: python -m uotpbot serve
     # Liveness, not readiness: a provider outage must not get the process
     # killed and restarted, because a restart mid-order is how you charge a
     # customer and deliver nothing. /readyz reports the outage instead.
     healthCheckPath: /healthz
-    disk:
-      name: uotpbot-ledger
-      mountPath: /var/data
-      sizeGB: 1
     envVars:
       - key: PYTHONUNBUFFERED
         value: "1"
-      - key: PORT
-        value: "8080"
-      # On ephemeral storage this is wiped every deploy -- hence the disk above.
-      - key: LEDGER_PATH
-        value: /var/data/ledger.db
+      # --- secrets: set via `render up` prompt or the dashboard ----------
+      # Supabase pooler URL. Use the SESSION pooler (port 5432): the direct
+      # db.<ref>.supabase.co host is IPv6-only (unreachable from Render), and
+      # the transaction pooler (6543) disables features for no benefit here --
+      # psycopg prepared statements are already switched off in pgstore.
+      - key: DATABASE_URL
+        sync: false
+      - key: DATABASE_SCHEMA
+        value: uotp
       - key: UOTP_API_KEY
-        sync: false          # set once in the dashboard; never commit a key
+        sync: false          # set once; never commit a key
       - key: UOTP_BASE_URL
         value: https://uotp.store/api/stubs/handler_api.php
+      # Verified live 2026-09-02: country 0 passes validation, operator must
+      # be a numeric id >= 2; the provider then answered NO_CONNECTION (its
+      # own backend), which the app reports as provider-down, not a crash.
+      - key: UOTP_PRICES_COUNTRY
+        value: "0"
+      - key: UOTP_PRICES_OPERATOR
+        value: "2"
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_OWNER_ID
@@ -53,49 +59,21 @@ services:
       - key: TELEGRAM_ALLOWED_USERS
         sync: false
       # --- white-label sub-bots -----------------------------------------
-      # Off by default. Set to true once you have decided to let owners run
-      # their own clones of this bot.
+      # Off by default. With DATABASE_URL set, sub-bot records live in
+      # Postgres alongside the ledger, so no SUBBOTS_PATH is needed.
       - key: WHITELABEL_ENABLED
         value: "false"
-      # MUST be on the persistent disk, not the container filesystem. A
-      # registry that survives a redeploy while the ledger does not would
-      # keep charging owners fees it can no longer account for.
-      - key: SUBBOTS_PATH
-        value: /var/data/subbots.db
       # The platform's cut of an own-API sub-bot sale, as a fraction of
-      # gross. This is what owners are shown at creation time and what is
-      # recorded against their bot; it is not something that can be changed
-      # quietly afterwards, because the agreed rate is stored per sub-bot.
+      # gross -- disclosed to the owner at creation and stored per sub-bot.
       # Out-of-range values fail at startup rather than mid-sale.
       - key: PLATFORM_FEE_RATE
         value: "0.05"
-      # Only set this once you have confirmed reselling is permitted for the
-      # account. See docs/RESEARCH.md -- uotp.in's terms prohibit reselling.
+      # Payment-gateway settings: placeholders, set yours before opening up.
       - key: FEE_GATEWAY_RATE
         value: "0.02"
+      - key: FEE_GATEWAY_FIXED
+        value: "0"
+      - key: FEE_GST_RATE
+        value: "0"
       - key: ENGINE_RETRY_CAP
         value: "3"
-
-  # --- Option B: Background Worker (usually the better fit) --------------
-  # Uncomment this and comment out the web service above. No port, no health
-  # check path -- the platform just keeps the process alive.
-  #
-  # - type: worker
-  #   name: uotpbot-worker
-  #   runtime: python
-  #   plan: starter
-  #   region: singapore
-  #   pythonVersion: 3.11.9
-  #   buildCommand: pip install --upgrade pip && pip install ".[telegram]"
-  #   startCommand: python -m uotpbot serve
-  #   disk:
-  #     name: uotpbot-ledger
-  #     mountPath: /var/data
-  #     sizeGB: 1
-  #   envVars:
-  #     - key: LEDGER_PATH
-  #       value: /var/data/ledger.db
-  #     - key: UOTP_API_KEY
-  #       sync: false
-  #     - key: TELEGRAM_BOT_TOKEN
-  #       sync: false

@@ -210,9 +210,17 @@ class SubBot:
 
 
 class SubBotRegistry:
-    """SQLite-backed store of white-label bots. Thread-safe, like the ledger."""
+    """SQLite-backed store of white-label bots. Thread-safe, like the ledger.
+
+    Storage-independence note: same seam as :class:`ledger.Ledger` -- SQL is
+    canonical (``{t}`` table, ``?`` placeholders) and all of it flows through
+    :meth:`_execute` / :meth:`_write`. :class:`pgstore.PostgresRegistry`
+    overrides only the connection and those two primitives.
+    """
 
     def __init__(self, path: Optional[str] = None) -> None:
+        self._table = "subbots"
+        self._ph = "?"
         self._conn = sqlite3.connect(path or ":memory:", check_same_thread=False)
         self._lock = threading.RLock()
         with self._lock:
@@ -224,34 +232,49 @@ class SubBotRegistry:
         with self._lock:
             self._conn.close()
 
+    # -- backend seam ------------------------------------------------------
+    def _q(self, sql: str) -> str:
+        """Translate canonical SQL (``{t}`` table, ``?`` placeholders)."""
+        return sql.replace("{t}", self._table).replace("?", self._ph)
+
+    def _tx(self):
+        """A write transaction context. sqlite: the connection itself."""
+        return self._conn
+
+    def _execute(self, sql: str, params: tuple = ()) -> list[tuple]:
+        with self._lock:
+            return list(self._conn.execute(self._q(sql), params))
+
+    def _write(self, sql: str, params: tuple = ()) -> int:
+        """Run one DML statement inside a transaction; returns rowcount."""
+        with self._lock, self._tx():
+            cur = self._conn.execute(self._q(sql), params)
+            return cur.rowcount
+
     # -- writing ---------------------------------------------------------
     def add(self, bot: SubBot) -> SubBot:
         if self.find_by_token(bot.bot_token):
             raise WhiteLabelError("that bot token is already registered")
-        with self._lock, self._conn:
-            self._conn.execute(
-                "INSERT INTO subbots (id, owner_id, bot_token, mode, provider_key, "
-                "provider_url, fee_rate, fee_fixed_p, disclosed_at, disclosure, "
-                "created_at, active) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    bot.id, bot.owner_id, bot.bot_token, bot.mode.value,
-                    bot.provider_key, bot.provider_url, str(bot.fee.rate),
-                    bot.fee.fixed.paise, bot.disclosed_at, bot.disclosure,
-                    bot.created_at, int(bot.active),
-                ),
-            )
+        self._write(
+            "INSERT INTO {t} (id, owner_id, bot_token, mode, provider_key, "
+            "provider_url, fee_rate, fee_fixed_p, disclosed_at, disclosure, "
+            "created_at, active) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                bot.id, bot.owner_id, bot.bot_token, bot.mode.value,
+                bot.provider_key, bot.provider_url, str(bot.fee.rate),
+                bot.fee.fixed.paise, bot.disclosed_at, bot.disclosure,
+                bot.created_at, int(bot.active),
+            ),
+        )
         return bot
 
     def set_active(self, bot_id: str, active: bool) -> None:
-        with self._lock, self._conn:
-            self._conn.execute(
-                "UPDATE subbots SET active = ? WHERE id = ?", (int(active), bot_id)
-            )
+        self._write(
+            "UPDATE {t} SET active = ? WHERE id = ?", (int(active), bot_id)
+        )
 
     def delete(self, bot_id: str) -> bool:
-        with self._lock, self._conn:
-            cur = self._conn.execute("DELETE FROM subbots WHERE id = ?", (bot_id,))
-            return cur.rowcount > 0
+        return self._write("DELETE FROM {t} WHERE id = ?", (bot_id,)) > 0
 
     # -- reading ---------------------------------------------------------
     @staticmethod
@@ -268,37 +291,32 @@ class SubBotRegistry:
              "fee_rate, fee_fixed_p, disclosed_at, disclosure, created_at, active")
 
     def find_by_token(self, token: str) -> Optional[SubBot]:
-        with self._lock:
-            row = self._conn.execute(
-                f"SELECT {self._COLS} FROM subbots WHERE bot_token = ?", (token,)
-            ).fetchone()
-        return self._row_to_bot(row) if row else None
+        rows = self._execute(
+            f"SELECT {self._COLS} FROM {{t}} WHERE bot_token = ?", (token,)
+        )
+        return self._row_to_bot(rows[0]) if rows else None
 
     def find(self, bot_id: str) -> Optional[SubBot]:
-        with self._lock:
-            row = self._conn.execute(
-                f"SELECT {self._COLS} FROM subbots WHERE id = ?", (bot_id,)
-            ).fetchone()
-        return self._row_to_bot(row) if row else None
+        rows = self._execute(
+            f"SELECT {self._COLS} FROM {{t}} WHERE id = ?", (bot_id,)
+        )
+        return self._row_to_bot(rows[0]) if rows else None
 
     def for_owner(self, owner_id: str) -> list[SubBot]:
-        with self._lock:
-            rows = self._conn.execute(
-                f"SELECT {self._COLS} FROM subbots WHERE owner_id = ? ORDER BY created_at",
-                (owner_id,),
-            ).fetchall()
+        rows = self._execute(
+            f"SELECT {self._COLS} FROM {{t}} WHERE owner_id = ? ORDER BY created_at",
+            (owner_id,),
+        )
         return [self._row_to_bot(r) for r in rows]
 
     def all_active(self) -> list[SubBot]:
-        with self._lock:
-            rows = self._conn.execute(
-                f"SELECT {self._COLS} FROM subbots WHERE active = 1 ORDER BY created_at"
-            ).fetchall()
+        rows = self._execute(
+            f"SELECT {self._COLS} FROM {{t}} WHERE active = 1 ORDER BY created_at"
+        )
         return [self._row_to_bot(r) for r in rows]
 
     def count(self) -> int:
-        with self._lock:
-            return int(self._conn.execute("SELECT COUNT(*) FROM subbots").fetchone()[0])
+        return int(self._execute("SELECT COUNT(*) FROM {t}")[0][0])
 
     def platform_earnings(self) -> Money:
         """Sum of fees the platform is entitled to across active bots.

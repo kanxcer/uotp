@@ -43,7 +43,7 @@ The live service catalogue at `uotp.in/services` says otherwise:
 | Facebook | ₹5 | **₹13** | Binance | ₹22 |
 
 Nothing on the page is below ₹10. The full transcribed table is in
-[`data/uotp_prices.csv`](../data/uotp_prices.csv).
+[`src/uotpbot/data/uotp_prices.csv`](../src/uotpbot/data/uotp_prices.csv).
 
 ### Why this matters arithmetically
 
@@ -97,7 +97,7 @@ splits failure into two kinds because they are treated differently:
 - **silent** — number is live but no OTP ever arrives. This is the refundable
   case, and only for `refund_share` of the charge.
 
-Rates per service in `data/uotp_prices.csv` are **engineering priors**, set by
+Rates per service in `src/uotpbot/data/uotp_prices.csv` are **engineering priors**, set by
 how hard each platform blocks VoIP ranges (Google, Apple, Meta, Binance,
 Coinbase, PayPal worst; plain messaging apps best). They are not measured
 truth. Run `python -m uotpbot.cli calibrate` with real order history to
@@ -176,7 +176,7 @@ path, the honest reading: `getBalance` is the only fully functional action
 right now. `getPrices` can be made to pass validation (`country=0`,
 `operator=2`) but the backend must come up before it returns prices. No
 purchase has ever completed against this endpoint, so the catalogue in
-`data/uotp_prices.csv` (transcribed from the public services page) remains
+`src/uotpbot/data/uotp_prices.csv` (transcribed from the public services page) remains
 the source of truth until `getPrices` answers.
 
 Two safety decisions fall directly out of this and are implemented in

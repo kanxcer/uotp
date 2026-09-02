@@ -86,10 +86,11 @@ asserts debits == credits and runs on every read.
 ```bash
 pip install -e ".[dev]"          # core + tests
 pip install -e ".[telegram]"     # add the Telegram transport
+pip install -e ".[postgres]"     # add Postgres storage (Supabase)
 ```
 
 Requires Python 3.10+. The core has **no runtime dependencies** — the HTTP
-client is `urllib`, storage is `sqlite3`.
+client is `urllib`, storage defaults to `sqlite3`.
 
 ## Configure
 
@@ -188,8 +189,33 @@ If the closed-form expectation were wrong, those would diverge. The suite runs
 this check across the whole catalogue.
 
 ```bash
-pytest            # 366 tests, lint clean (ruff)
+pytest            # 370 tests, lint clean (ruff)
 ```
+
+## Storage: sqlite or Postgres (Supabase)
+
+Two backends, picked by one setting:
+
+| | sqlite (default) | Postgres (`DATABASE_URL` set) |
+|---|---|---|
+| Tables | `ledger.db`, `subbots.db` files | `uotp.postings`, `uotp.subbots` |
+| Durability | needs a persistent disk | the database's problem |
+| Fits | local dev, paid Render + disk | Render free tier, containers |
+
+```bash
+DATABASE_URL=postgresql://postgres.<ref>:<pw>@aws-0-<region>.pooler.supabase.com:5432/postgres
+```
+
+Use the **session pooler** (port 5432): the direct `db.<ref>.supabase.co` host
+is IPv6-only and unreachable from Render, and the transaction pooler (6543)
+adds pgBouncer caveats for no benefit here (prepared statements are already
+switched off in `pgstore`). The Postgres backends are covered by the same
+conformance battery as sqlite — `tests/test_pgstore.py` runs the identical
+money flows against both (`UOTP_TEST_PG_DSN=... pytest tests/test_pgstore.py`).
+
+With `DATABASE_URL` set the ledger **and** the sub-bot registry move together
+— they must share one durability story, because a registry that outlives the
+ledger keeps charging owners fees nobody can account for.
 
 ## Deploying to Render
 
@@ -199,25 +225,26 @@ never needs inbound traffic. But `serve` also binds `$PORT` and answers
 Worker.
 
 ```
-Build:  pip install --upgrade pip && pip install ".[telegram]"
+Build:  pip install --upgrade pip && pip install ".[telegram,postgres]"
 Start:  python -m uotpbot serve
 Health: /healthz
 ```
 
-`render.yaml` in this repo wires all of that up — `render up` and you're done.
+`render.yaml` in this repo wires all of that up — free plan, no disk —
+`render up` and you're done.
 
-Required env vars: `UOTP_API_KEY`, `TELEGRAM_BOT_TOKEN`, `LEDGER_PATH`.
-See `.env.example` for the rest.
+Required env vars: `DATABASE_URL`, `UOTP_API_KEY`, `TELEGRAM_BOT_TOKEN`,
+`TELEGRAM_OWNER_ID`, `TELEGRAM_ALLOWED_USERS`. See `.env.example` for the rest.
 
-**The `.[telegram]` extra matters.** `python-telegram-bot` is optional; a bare
-`pip install .` starts an HTTP server that accepts no orders.
+**The extras matter.** A bare `pip install .` starts an HTTP server that
+accepts no orders and cannot reach Postgres.
 
-**The ledger is SQLite, and Render wipes the container filesystem on every
-deploy.** Without a persistent disk the entire audit trail disappears on the
-next release — and `render.yaml` mounts one at `/var/data` for that reason.
-Persistent disks are not on the free plan; if you cannot mount one, move the
-ledger to a managed database rather than accepting silent data loss. The server
-logs a loud warning at startup if `LEDGER_PATH` points at ephemeral storage.
+**Do not use sqlite on the free plan.** Render wipes the container filesystem
+on every deploy, so `ledger.db` — the entire audit trail, and any unreconciled
+order — disappears on the next release. That is exactly why the Postgres
+backend exists. With sqlite, pay for a disk; with Postgres, the free plan is
+fine. The server logs a loud warning at startup if a sqlite path sits on
+ephemeral storage.
 
 `/healthz` is deliberately liveness-only and never calls the network. Using
 `/readyz` as the health check would mean a provider outage gets the process
@@ -239,6 +266,8 @@ src/uotpbot/
   economics.py   delivery model, break-even, margin, expected contribution
   pricing.py     price ladder and markup strategies
   ledger.py      double-entry ledger; profit is derived, never stored
+  pgstore.py     Postgres (Supabase) backends for the ledger and registry
+  store.py       backend selection: sqlite by default, Postgres on DATABASE_URL
   orders.py      order lifecycle and the optimal retry policy
   engine.py      fulfilment; the only place money actually moves
   cli.py         commands, including the Monte Carlo validator
@@ -248,13 +277,13 @@ src/uotpbot/
   createbot.py   the /createbot conversation, terms shown before creation
   provider/      base protocol, UOTP HTTP adapter, deterministic mock
   bot/           transport-free command router + thin Telegram shell
-data/uotp_prices.csv   real uotp.in prices (transcribed 2026-09-01)
+src/uotpbot/data/uotp_prices.csv   real uotp.in prices (transcribed 2026-09-01)
 docs/RESEARCH.md       what the provider actually charges, with evidence
 ```
 
 ## Cost calibration
 
-The success/burn/refund rates in `data/uotp_prices.csv` are **engineering
+The success/burn/refund rates in `src/uotpbot/data/uotp_prices.csv` are **engineering
 priors**, set by how hard each platform blocks VoIP ranges. They are not
 measured truth. Once you have order history:
 

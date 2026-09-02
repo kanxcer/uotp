@@ -27,9 +27,10 @@ if TYPE_CHECKING:
 from .cli import main as cli_main
 from .config import ConfigError, Settings, from_environment
 from .engine import BotEngine
-from .ledger import Ledger
+from .money import Rate
 from .provider.base import ProviderError, ServiceUnavailable
 from .pricing import Pricer
+from .store import backend_name, make_ledger, make_registry
 
 log = logging.getLogger("uotpbot")
 
@@ -60,9 +61,14 @@ def _build(settings: Settings):
 
     catalog = load_catalog(Path(settings.prices_path) if settings.prices_path else None)
     provider = UotpProvider(settings.uotp)
-    ledger = Ledger(settings.ledger_path)
-    _warn_if_ephemeral(settings.ledger_path)
-    pricer = Pricer(catalog, fees=settings.fees)
+    ledger = make_ledger(settings)
+    if not settings.database_url:
+        # With Postgres the durability story is the database's, not the disk's.
+        _warn_if_ephemeral(settings.ledger_path)
+    pricer = Pricer(
+        catalog, fees=settings.fees,
+        target_margin=Rate(str(settings.pricing_target_margin)),
+    )
     engine = BotEngine(
         catalog, provider, ledger, pricer, fees=settings.fees, config=settings.engine
     )
@@ -171,10 +177,11 @@ def _make_whitelabel(settings: Settings, catalog, ledger, pricer) -> Optional[Wh
     if not settings.whitelabel_enabled:
         return None
     from .bot.commands import CommandRouter
-    from .whitelabel import MultiBotManager, SubBotRegistry
+    from .whitelabel import MultiBotManager
 
-    registry = SubBotRegistry(settings.subbots_path)
-    _warn_if_ephemeral(settings.subbots_path, var="SUBBOTS_PATH")
+    registry = make_registry(settings)
+    if not settings.database_url:
+        _warn_if_ephemeral(settings.subbots_path, var="SUBBOTS_PATH")
 
     def router_factory(bot):
         """One router per sub-bot.
@@ -266,7 +273,7 @@ def _check(settings: Settings) -> int:
         print(f"provider   FAIL {exc}")
     try:
         ledger.verify()
-        print(f"ledger     ok   {settings.ledger_path}")
+        print(f"ledger     ok   {backend_name(settings)}")
     except Exception as exc:  # noqa: BLE001
         problems.append(f"ledger: {exc}")
         print(f"ledger     FAIL {exc}")
