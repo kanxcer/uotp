@@ -24,6 +24,7 @@ Accounts follow the normal-balance convention::
 from __future__ import annotations
 
 import sqlite3
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -193,11 +194,36 @@ class Ledger:
     """Append-only double-entry ledger backed by SQLite."""
 
     def __init__(self, path: Optional[Path | str] = None) -> None:
-        self._conn = sqlite3.connect(str(path) if path else ":memory:")
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA foreign_keys=ON")
-        self._conn.executescript(SCHEMA)
-        self._conn.commit()
+        # check_same_thread=False is required, not a convenience: an HTTP
+        # server handles each request on a fresh thread, and without it every
+        # ledger read from a handler raises ProgrammingError. That is not a
+        # cosmetic failure -- it makes /readyz return 500 forever, so the
+        # platform never marks the service healthy.
+        #
+        # Sharing the connection across threads means the caller must
+        # serialise access, hence the lock below. Every operation takes it.
+        self._conn = sqlite3.connect(
+            str(path) if path else ":memory:", check_same_thread=False
+        )
+        self._lock = threading.RLock()
+        with self._lock:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA foreign_keys=ON")
+            self._conn.executescript(SCHEMA)
+            self._conn.commit()
+
+    # -- locked access ---------------------------------------------------
+    def _execute(self, sql: str, params: tuple = ()) -> list[tuple]:
+        with self._lock:
+            return list(self._conn.execute(sql, params))
+
+    def _write(self, rows: list[tuple]) -> None:
+        with self._lock, self._conn:
+            self._conn.executemany(
+                "INSERT INTO postings (ts, ref, account, debit_p, credit_p, memo) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                rows,
+            )
 
     # -- writing ---------------------------------------------------------
     def post(
@@ -212,12 +238,7 @@ class Ledger:
     ) -> Posting:
         """Record one balanced movement."""
         p = Posting(ts or _utcnow(), ref, debit, credit, amount, memo)
-        self._conn.executemany(
-            "INSERT INTO postings (ts, ref, account, debit_p, credit_p, memo) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            p.rows,
-        )
-        self._conn.commit()
+        self._write(list(p.rows))
         return p
 
     def post_many(self, postings: Iterable[Posting]) -> None:
@@ -225,12 +246,7 @@ class Ledger:
         rows: list[tuple] = []
         for p in postings:
             rows.extend(p.rows)
-        with self._conn:
-            self._conn.executemany(
-                "INSERT INTO postings (ts, ref, account, debit_p, credit_p, memo) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                rows,
-            )
+        self._write(rows)
 
     def close(self) -> None:
         self._conn.close()
@@ -238,27 +254,24 @@ class Ledger:
     # -- reading ---------------------------------------------------------
     def balance(self, account: Account) -> Money:
         """Net balance, positive in the account's normal direction."""
-        row = self._conn.execute(
+        row = self._execute(
             "SELECT COALESCE(SUM(debit_p),0), COALESCE(SUM(credit_p),0) "
             "FROM postings WHERE account = ?",
             (str(account),),
-        ).fetchone()
+        )[0]
         debit, credit = int(row[0]), int(row[1])
         return Money(debit - credit) if account.is_debit_normal else Money(credit - debit)
 
     def trial_balance(self) -> dict[Account, Money]:
         """Balance of every account that has activity."""
-        accounts = {
-            Account(a)
-            for (a,) in self._conn.execute("SELECT DISTINCT account FROM postings")
-        }
+        accounts = {Account(a) for (a,) in self._execute("SELECT DISTINCT account FROM postings")}
         return {a: self.balance(a) for a in sorted(accounts)}
 
     def verify(self) -> None:
         """Assert the fundamental invariant. Raises if the ledger is broken."""
-        row = self._conn.execute(
+        row = self._execute(
             "SELECT COALESCE(SUM(debit_p),0), COALESCE(SUM(credit_p),0) FROM postings"
-        ).fetchone()
+        )[0]
         total_debit, total_credit = int(row[0]), int(row[1])
         if total_debit != total_credit:
             raise LedgerError(
@@ -281,11 +294,11 @@ class Ledger:
 
     def ledger_for(self, ref: str) -> list[Posting]:
         """Every posting sharing a reference -- the audit trail of one order."""
-        rows = self._conn.execute(
+        rows = self._execute(
             "SELECT ts, ref, account, debit_p, credit_p, memo FROM postings "
             "WHERE ref = ? ORDER BY id",
             (ref,),
-        ).fetchall()
+        )
         out: list[Posting] = []
         for ts, r, acct, d, c, memo in rows:
             if d:
@@ -295,11 +308,11 @@ class Ledger:
         return out
 
     def history(self, limit: int = 200) -> list[tuple]:
-        return self._conn.execute(
+        return self._execute(
             "SELECT ts, ref, account, debit_p, credit_p, memo FROM postings "
             "ORDER BY id DESC LIMIT ?",
             (limit,),
-        ).fetchall()
+        )
 
     # -- convenience flows ----------------------------------------------
     def record_topup(

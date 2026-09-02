@@ -154,6 +154,45 @@ this check across the whole catalogue.
 pytest            # 210 tests, lint clean (ruff)
 ```
 
+## Deploying to Render
+
+The bot is a long-polling Telegram client — it opens an outbound connection and
+never needs inbound traffic. But `serve` also binds `$PORT` and answers
+`/healthz` and `/readyz`, so it works as either a Web Service or a Background
+Worker.
+
+```
+Build:  pip install --upgrade pip && pip install ".[telegram]"
+Start:  python -m uotpbot serve
+Health: /healthz
+```
+
+`render.yaml` in this repo wires all of that up — `render up` and you're done.
+
+Required env vars: `UOTP_API_KEY`, `TELEGRAM_BOT_TOKEN`, `LEDGER_PATH`.
+See `.env.example` for the rest.
+
+**The `.[telegram]` extra matters.** `python-telegram-bot` is optional; a bare
+`pip install .` starts an HTTP server that accepts no orders.
+
+**The ledger is SQLite, and Render wipes the container filesystem on every
+deploy.** Without a persistent disk the entire audit trail disappears on the
+next release — and `render.yaml` mounts one at `/var/data` for that reason.
+Persistent disks are not on the free plan; if you cannot mount one, move the
+ledger to a managed database rather than accepting silent data loss. The server
+logs a loud warning at startup if `LEDGER_PATH` points at ephemeral storage.
+
+`/healthz` is deliberately liveness-only and never calls the network. Using
+`/readyz` as the health check would mean a provider outage gets the process
+killed and restarted — and a restart mid-order is how you charge a customer and
+deliver nothing. `/readyz` reports the outage instead.
+
+Smoke-test a deploy with:
+
+```
+python -m uotpbot check     # verifies key, ledger, catalogue, pricing; exits 0/1
+```
+
 ## Layout
 
 ```
