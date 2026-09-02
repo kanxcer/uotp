@@ -18,11 +18,13 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Iterator, Mapping, Optional, Sequence
 
-from .money import INR, Money
+from .money import INR, Money, quantize_money
 
 __all__ = [
     "ServiceCost",
     "Catalog",
+    "ServerOption",
+    "load_servers_csv",
     "CatalogError",
     "load_catalog",
     "default_catalog",
@@ -50,6 +52,24 @@ PROVIDER_REFUND_WINDOW_MINUTES = 5
 
 class CatalogError(Exception):
     """Raised when the cost catalogue is missing a service or is malformed."""
+
+
+@dataclass(frozen=True, slots=True)
+class ServerOption:
+    """One SIM-bank server that can fulfil a service, at its own price/stock.
+
+    uotp.store sells the same service from several servers with different
+    prices and delivery quality (``score`` is their success heuristic,
+    ``is_best`` their recommended pick). Customers see these as a choice;
+    the engine buys from the chosen one.
+    """
+
+    server_id: str
+    price: Money
+    stock: int = 0
+    name: str = ""
+    score: Optional[Decimal] = None
+    is_best: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,6 +178,7 @@ class Catalog:
         *,
         min_charge: Money = PROVIDER_MIN_CHARGE,
         fallback_success_rate: Decimal = Decimal("0.90"),
+        servers: Optional[Mapping[str, Sequence["ServerOption"]]] = None,
     ) -> None:
         self._services: dict[str, ServiceCost] = {}
         for slug, cost in services.items():
@@ -165,6 +186,23 @@ class Catalog:
         self._packs: list[WalletPack] = sorted(packs, key=lambda p: p.credit.paise)
         self.min_charge = min_charge
         self.fallback_success_rate = fallback_success_rate
+        #: slug -> per-server options, cheapest-price first at load time.
+        self._servers: dict[str, tuple[ServerOption, ...]] = {
+            self._norm(slug): tuple(opts)
+            for slug, opts in (servers or {}).items()
+            if opts
+        }
+
+    def servers_for(self, slug: str) -> tuple[ServerOption, ...]:
+        """Every server able to fulfil ``slug``, cheapest first."""
+        return self._servers.get(self._norm(slug), ())
+
+    def server_option(self, slug: str, server_id: str) -> Optional[ServerOption]:
+        """One server option, e.g. the one a customer tapped."""
+        for opt in self.servers_for(slug):
+            if opt.server_id == str(server_id):
+                return opt
+        return None
 
     # -- loading ---------------------------------------------------------
     @classmethod
@@ -282,12 +320,56 @@ UOTP_PACKS: tuple[WalletPack, ...] = (
 _DEFAULT_CACHE: Optional[Catalog] = None
 
 
+def load_servers_csv(text: str) -> dict[str, list[ServerOption]]:
+    """Parse ``slug,server_id,name,price_inr,stock,score,is_best``.
+
+    The companion to the cost CSV: every SIM-bank server that can fulfil a
+    service, so customers can pick price vs. stock vs. quality explicitly.
+    """
+    body = "\n".join(
+        line for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")
+    )
+    reader = csv.DictReader(io.StringIO(body))
+    if reader.fieldnames is None or not {"slug", "server_id", "price_inr"}.issubset(set(reader.fieldnames)):
+        raise CatalogError("servers CSV is missing columns: slug, server_id, price_inr")
+    out: dict[str, list[ServerOption]] = {}
+    for row in reader:
+        slug = Catalog._norm((row.get("slug") or "").strip())
+        if not slug:
+            continue
+        try:
+            price = Decimal((row.get("price_inr") or "").strip())
+        except ArithmeticError:
+            continue
+        score_raw = (row.get("score") or "").strip()
+        try:
+            score = Decimal(score_raw) if score_raw else None
+        except ArithmeticError:
+            score = None
+        out.setdefault(slug, []).append(ServerOption(
+            server_id=(row.get("server_id") or "").strip(),
+            name=(row.get("name") or "").strip(),
+            price=quantize_money(price),
+            stock=int(float((row.get("stock") or "0").strip() or 0)),
+            score=score,
+            is_best=(row.get("is_best") or "").strip() in ("1", "true", "yes"),
+        ))
+    for opts in out.values():
+        opts.sort(key=lambda o: (o.price.paise, -o.stock))
+    return out
+
+
 def load_catalog(path: Optional[Path] = None, packs: Sequence[WalletPack] = UOTP_PACKS) -> Catalog:
-    """Load the bundled cost CSV, or an override path."""
+    """Load the bundled cost CSV (plus the server matrix), or an override path."""
     target = Path(path) if path else _DATA_DIR / "uotp_prices.csv"
     if not target.exists():
         raise CatalogError(f"cost catalogue not found at {target}")
-    return Catalog.from_csv(target.read_text(encoding="utf-8"), packs)
+    servers: dict[str, list[ServerOption]] = {}
+    # Only auto-load the server matrix next to the BUNDLED csv; an override
+    # path is a deliberate minimal catalog and must not silently gain one.
+    if path is None and (_DATA_DIR / "uotp_servers.csv").exists():
+        servers = load_servers_csv((_DATA_DIR / "uotp_servers.csv").read_text(encoding="utf-8"))
+    return Catalog.from_csv(target.read_text(encoding="utf-8"), packs, servers=servers)
 
 
 def default_catalog() -> Catalog:

@@ -140,9 +140,19 @@ class BotEngine:
         return fee
 
     # -- pricing ---------------------------------------------------------
-    def quote(self, service: str) -> tuple[Money, OrderEconomics]:
-        """Price and full economics for one service, right now."""
+    def quote(self, service: str, *, server: Optional[str] = None) -> tuple[Money, OrderEconomics]:
+        """Price and full economics for one service, right now.
+
+        With ``server`` the price is computed on THAT SIM-bank server's
+        price -- the customer picked it from the server list, so the quote
+        and the charge must match the tap, not the catalogue minimum.
+        """
         cost = self.catalog.get(service)
+        if server:
+            opt = self.catalog.server_option(service, server)
+            if opt is None:
+                raise EngineError(f"no server {server!r} for {service}")
+            cost = cost.with_overrides(list_price=opt.price, server=opt.server_id)
         advice = self.pricer.price(cost)
         econ = OrderEconomics.for_service(
             cost,
@@ -233,6 +243,7 @@ class BotEngine:
         *,
         country: Optional[str] = None,
         gross_price: Optional[Money] = None,
+        server: Optional[str] = None,
     ) -> FulfilResult:
         """Run one customer order end to end.
 
@@ -291,7 +302,7 @@ class BotEngine:
                 alloc = self.provider.buy_number(
                     service, order.country,
                     idempotency_key=f"{ref}-{order.attempts + 1}",
-                    server=getattr(cost, "server", ""),
+                    server=server if server is not None else getattr(cost, "server", ""),
                 )
             except InsufficientBalance as exc:
                 order.note(f"wallet short by {exc.shortfall}")
