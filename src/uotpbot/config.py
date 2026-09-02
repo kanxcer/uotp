@@ -99,6 +99,19 @@ class Settings:
     owner_id: str = ""
     ledger_path: str = "ledger.db"
     prices_path: Optional[str] = None
+    #: Where white-label sub-bot records live. Must be on the same persistent
+    #: disk as the ledger: a sub-bot registry that survives a redeploy but a
+    #: ledger that does not would charge fees it cannot account for.
+    subbots_path: str = "subbots.db"
+    #: Opt-in. Off by default so an existing deployment does not start
+    #: spawning pollers for bots nobody asked it to run.
+    whitelabel_enabled: bool = False
+    #: The platform's cut of an OWN_API sub-bot sale, as a fraction of gross.
+    #: Whatever is set here is what owners are shown at creation time and what
+    #: is recorded against their bot -- it is not a rate the platform can
+    #: quietly change after the fact, because the agreed figure is stored per
+    #: sub-bot in the registry.
+    platform_fee_rate: Decimal = Decimal("0.05")
 
     @property
     def has_telegram(self) -> bool:
@@ -176,4 +189,26 @@ def from_environment(env_file: Optional[Path | str] = None) -> Settings:
         owner_id=_get("TELEGRAM_OWNER_ID", ""),
         ledger_path=_get("LEDGER_PATH", "ledger.db"),
         prices_path=_get("PRICES_PATH") or None,
+        subbots_path=_get("SUBBOTS_PATH", "subbots.db"),
+        whitelabel_enabled=_bool("WHITELABEL_ENABLED", False),
+        platform_fee_rate=_fee_rate(_get("PLATFORM_FEE_RATE", "0.05")),
     )
+
+
+def _fee_rate(raw: str) -> Decimal:
+    """Validate PLATFORM_FEE_RATE at startup rather than on first sale.
+
+    A rate outside [0, 1] is rejected here as a ConfigError. Letting it reach
+    ``PlatformFee`` would raise a WhiteLabelError from inside the /createbot
+    handler, after an owner had already been shown terms and pasted a token.
+    """
+    try:
+        rate = Decimal(raw)
+    except ArithmeticError as exc:
+        raise ConfigError(f"PLATFORM_FEE_RATE={raw!r} is not a valid decimal") from exc
+    if not (Decimal(0) <= rate <= Decimal(1)):
+        raise ConfigError(
+            f"PLATFORM_FEE_RATE={raw} must be a fraction of gross in [0, 1] "
+            "(e.g. 0.05 for 5%)"
+        )
+    return rate

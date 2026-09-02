@@ -11,11 +11,13 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from ..catalog import Catalog
+from ..createbot import CreateBotFlow, CreateBotResult
 from ..economics import EconomicsError
 from ..engine import BotEngine
 from ..ledger import Ledger
 from ..money import Money
 from ..pricing import Pricer
+from ..whitelabel import PlatformFee, SubBotRegistry
 
 __all__ = ["CommandRouter", "HELP_TEXT"]
 
@@ -27,6 +29,9 @@ HELP_TEXT = """UOTP bot
 /wallet               Your balance
 /report               Revenue, cost and profit (owner only)
 /status               Wallet and ledger health (owner only)
+/createbot            Launch your own white-label copy of this bot
+/mybots               Your white-label bots and their agreed terms
+/deletebot <id>       Remove one of your bots
 /help                 This message
 
 Payment is collected before a number is bought. If no OTP arrives the order is
@@ -54,6 +59,8 @@ class CommandRouter:
         owner_id: str = "",
         allowed_users: tuple[str, ...] = (),
         balances: Optional[dict[str, Money]] = None,
+        subbots: Optional[SubBotRegistry] = None,
+        platform_fee: Optional[PlatformFee] = None,
     ) -> None:
         self.engine = engine
         self.catalog = catalog
@@ -64,6 +71,16 @@ class CommandRouter:
         #: Customer wallets. A real deployment backs this with the database;
         #: keeping it injected means the router stays testable.
         self.balances: dict[str, Money] = balances if balances is not None else {}
+        #: White-label sub-bots. ``None`` disables /createbot entirely rather
+        #: than silently running it against an in-memory store that loses every
+        #: bot on restart.
+        self.subbots = subbots
+        self._createbot_flow: Optional[CreateBotFlow] = (
+            CreateBotFlow(subbots, platform_fee) if subbots is not None else None
+        )
+        #: Set by the transport once a sub-bot's poller is live, so /createbot
+        #: can report that its bot actually started.
+        self.on_bot_created: Optional[Callable[[object], None]] = None
 
     # -- helpers ---------------------------------------------------------
     def balance_of(self, user_id: str) -> Money:
@@ -104,8 +121,25 @@ class CommandRouter:
             "report": self.cmd_report,
             "status": self.cmd_status,
         }
+
+        # White-label commands. /cancel always works so an owner stuck mid-flow
+        # can escape, even where /createbot is disabled.
+        if command == "cancel":
+            return self.cmd_cancel(user_id, args)
+        if self._createbot_flow is None:
+            if command in {"createbot", "mybots", "deletebot"}:
+                return Reply("White-label bots are not enabled on this bot.", ok=False)
+        else:
+            handlers["createbot"] = self.cmd_createbot
+            handlers["mybots"] = self.cmd_mybots
+            handlers["deletebot"] = self.cmd_deletebot
+
         handler = handlers.get(command)
         if handler is None:
+            # Not a command: it may be an answer to an in-progress /createbot.
+            pending_flow = self._createbot_flow
+            if pending_flow and pending_flow.pending(user_id):
+                return self._createbot_reply(pending_flow.on_text(user_id, text))
             return Reply(f"Unknown command /{command}. Try /help.", ok=False)
         try:
             return handler(user_id, args)
@@ -177,6 +211,60 @@ class CommandRouter:
             f"balance {self.balance_of(user_id)}.",
             ok=False,
         )
+
+    # -- white-label -----------------------------------------------------
+    def cmd_createbot(self, user_id: str, args: list[str]) -> Reply:
+        assert self._createbot_flow is not None
+        if args:
+            # `/createbot <token>` is accepted as a shortcut.
+            self._createbot_flow.start(user_id)
+            return self._createbot_reply(self._createbot_flow.on_text(user_id, args[0]))
+        return self._createbot_reply(self._createbot_flow.start(user_id))
+
+    def cmd_cancel(self, user_id: str, args: list[str]) -> Reply:
+        if self._createbot_flow and self._createbot_flow.pending(user_id):
+            self._createbot_flow.cancel(user_id)
+            return Reply("Cancelled. Nothing was created.")
+        return Reply("Nothing in progress.", ok=False)
+
+    def cmd_mybots(self, user_id: str, args: list[str]) -> Reply:
+        assert self.subbots is not None
+        bots = self.subbots.for_owner(user_id)
+        if not bots:
+            return Reply("You have no bots yet. Send /createbot to make one.", ok=False)
+        lines = []
+        for b in bots:
+            mode = "platform numbers" if b.mode.value == "platform_api" else "your own API"
+            state = "running" if b.active else "stopped"
+            fee = (
+                "no platform fee"
+                if b.mode.value == "platform_api"
+                else f"platform fee {b.fee.describe()}"
+            )
+            lines.append(f"`{b.id}` - {mode}, {fee}, {state}")
+        return Reply("Your bots:\n" + "\n".join(lines))
+
+    def cmd_deletebot(self, user_id: str, args: list[str]) -> Reply:
+        assert self.subbots is not None
+        if not args:
+            return Reply("Usage: /deletebot <bot id>. See /mybots.", ok=False)
+        bot = self.subbots.find(args[0])
+        if bot is None or bot.owner_id != user_id:
+            return Reply("No bot of yours has that id.", ok=False)
+        self.subbots.delete(bot.id)
+        return Reply(f"Deleted bot `{bot.id}`.")
+
+    def _createbot_reply(self, result: CreateBotResult) -> Reply:
+        if result.created is not None and self.on_bot_created is not None:
+            try:
+                self.on_bot_created(result.created)
+            except Exception as exc:  # the bot record exists; say so honestly
+                return Reply(
+                    f"{result.reply}\n\nNote: your bot was saved but its poller "
+                    f"did not start ({type(exc).__name__}). Use /restart to try again.",
+                    ok=False,
+                )
+        return Reply(result.reply)
 
     def cmd_report(self, user_id: str, args: list[str]) -> Reply:
         if not self._is_owner(user_id):

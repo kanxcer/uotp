@@ -16,7 +16,13 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING, Callable, Optional
+
+if TYPE_CHECKING:
+    from .whitelabel import MultiBotManager, SubBotRegistry
 
 from .cli import main as cli_main
 from .config import ConfigError, Settings, from_environment
@@ -32,15 +38,17 @@ log = logging.getLogger("uotpbot")
 EPHEMERAL_PREFIXES = ("/opt/render", "/var/task", "/tmp", "/app")
 
 
-def _warn_if_ephemeral(path: str) -> None:
+def _warn_if_ephemeral(path: str, *, var: str = "LEDGER_PATH") -> None:
+    """Shout when a database sits on storage that a redeploy will wipe."""
     resolved = str(Path(path).resolve())
     if any(resolved.startswith(p) for p in EPHEMERAL_PREFIXES):
         log.warning(
-            "LEDGER_PATH=%s is on ephemeral storage and WILL BE WIPED on the "
-            "next deploy, taking the entire audit trail with it. Attach a "
-            "persistent disk and point LEDGER_PATH at it (e.g. "
-            "/var/data/ledger.db), or move to a managed database.",
-            resolved,
+            "%s=%s is on ephemeral storage and WILL BE WIPED on the next "
+            "deploy. For the ledger that means the whole audit trail; for the "
+            "sub-bot registry it means every white-label bot and the fee terms "
+            "its owner agreed to. Attach a persistent disk and point %s at it "
+            "(e.g. /var/data/), or move to a managed database.",
+            var, resolved, var,
         )
 
 
@@ -97,18 +105,131 @@ def _serve(settings: Settings) -> int:
 
     from .bot.commands import CommandRouter
 
+    subbots = _make_whitelabel(settings, catalog, ledger, pricer)
+
     def router_factory() -> CommandRouter:
         return CommandRouter(
             engine, catalog, pricer, ledger,
             owner_id=settings.owner_id, allowed_users=settings.allowed_users,
+            subbots=subbots.registry if subbots else None,
+            platform_fee=_platform_fee(settings),
         )
+
+    poller = _make_poller(settings, router_factory)
+    if subbots is not None:
+        started = subbots.manager.start_all()
+        log.info("white-label: %d sub-bot(s) registered, started %d",
+                 subbots.registry.count(), len(started))
+        # `started` means "a thread was launched", not "it is working". Pollers
+        # fail asynchronously, so give them a moment before reporting.
+        time.sleep(1.0)
+        live = subbots.manager.running()
+        if subbots.manager.errors():
+            log.error(
+                "sub-bot pollers are not running: %s", subbots.manager.errors()
+            )
+        log.info("white-label: %d of %d sub-bot poller(s) alive", len(live), len(started))
+        # Wire /createbot to the manager so a newly created bot goes live
+        # without a redeploy.
+        def _on_created(bot) -> None:
+            if not subbots.manager.start(bot.id):
+                log.error("could not start sub-bot %s: %s", bot.id,
+                          subbots.manager.errors().get(bot.id, "unknown"))
+        subbots.on_created = _on_created
 
     server = HealthServer(
         engine, ledger,
-        poller=_make_poller(settings, router_factory),
+        poller=poller,
+        subbots=subbots.manager if subbots else None,
     )
     server.serve_forever()
+    if subbots is not None:
+        subbots.manager.stop_all()
+        subbots.registry.close()
     return 0
+
+
+def _platform_fee(settings: Settings):
+    """The disclosed fee owners will be shown, from PLATFORM_FEE_RATE."""
+    from .whitelabel import PlatformFee
+
+    return PlatformFee(rate=settings.platform_fee_rate)
+
+
+@dataclass
+class WhiteLabel:
+    """The white-label pieces ``serve`` needs, grouped for teardown."""
+
+    registry: "SubBotRegistry"
+    manager: "MultiBotManager"
+    on_created: Optional[Callable[[object], None]] = None
+
+
+def _make_whitelabel(settings: Settings, catalog, ledger, pricer) -> Optional[WhiteLabel]:
+    """Build the sub-bot registry and manager, or None when disabled."""
+    if not settings.whitelabel_enabled:
+        return None
+    from .bot.commands import CommandRouter
+    from .whitelabel import MultiBotManager, SubBotRegistry
+
+    registry = SubBotRegistry(settings.subbots_path)
+    _warn_if_ephemeral(settings.subbots_path, var="SUBBOTS_PATH")
+
+    def router_factory(bot):
+        """One router per sub-bot.
+
+        OWN_API bots charge the platform fee, routed through the engine so the
+        split happens in the same place the sale is posted. PLATFORM_API bots
+        get no fee hook at all: their platform revenue is the wholesale spread.
+        """
+        fee_fn = bot.fee.on if bot.mode.value == "own_api" else None
+        sub_engine = BotEngine(
+            catalog, _provider_for(bot, settings), ledger, pricer,
+            fees=settings.fees, config=settings.engine,
+            platform_fee_fn=fee_fn, fee_disclosure=bot.disclosure,
+        )
+        return CommandRouter(
+            sub_engine, catalog, pricer, ledger,
+            owner_id=bot.owner_id, allowed_users=(),
+        )
+
+    manager = MultiBotManager(registry, router_factory,
+                              poller_factory=lambda b, r: (lambda: _run_subbot(b, r, settings)))
+    wl = WhiteLabel(registry=registry, manager=manager)
+    return wl
+
+
+def _provider_for(bot, settings: Settings):
+    """Provider for a sub-bot: its own key in OWN_API mode, the platform's otherwise.
+
+    Only the credential changes. The endpoint, vocabulary and unit divisor are
+    inherited, because an OWN_API owner registers on the same provider -- they
+    supply a key, not a different API. ``bot.provider_url`` deliberately holds
+    the *signup page* shown to the owner, so it is never used as a base URL;
+    doing so would point every purchase at a web form.
+    """
+    import dataclasses
+
+    from .provider.uotp import UotpProvider
+
+    if bot.mode.value == "own_api" and bot.provider_key:
+        return UotpProvider(dataclasses.replace(settings.uotp, api_key=bot.provider_key))
+    return UotpProvider(settings.uotp)
+
+
+def _run_subbot(bot, router, settings: Settings) -> None:
+    """Long-poll one sub-bot. Raises if the transport is unavailable."""
+    from .bot.telegram import HAS_TELEGRAM, TelegramFrontend
+
+    if not HAS_TELEGRAM:
+        raise RuntimeError("python-telegram-bot is not installed")
+    from telegram.ext import Application, MessageHandler, filters
+
+    frontend = TelegramFrontend(router)
+    app = Application.builder().token(bot.bot_token).build()
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, frontend.on_message))
+    app.add_handler(MessageHandler(filters.COMMAND, frontend.on_message))
+    app.run_polling()
 
 
 def _check(settings: Settings) -> int:

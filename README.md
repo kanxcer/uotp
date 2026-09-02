@@ -133,6 +133,43 @@ Common flags: `--gateway-rate`, `--gateway-fixed`, `--gst-rate`,
 `--gst-exclusive`, `--chargeback-rate`, `--retry-cap`, `--strategy`,
 `--target-margin`, `--safety-buffer`.
 
+## White-label sub-bots
+
+Owners can launch their own clone of the bot. Off by default:
+`WHITELABEL_ENABLED=true`.
+
+`/createbot` walks them through pasting a bot token and choosing how the bot
+sources numbers:
+
+| Mode | Who pays the provider | Platform fee |
+|---|---|---|
+| **Platform numbers** | The platform's wallet, at the wholesale price | None |
+| **Your own API** | The owner, on their own provider key | `PLATFORM_FEE_RATE` of each sale |
+
+Platform-number bots take no percentage because the platform already earns the
+spread built into the wholesale price; charging both would be double dipping on
+the same rupee.
+
+### The fee is disclosed, not hidden
+
+This is a deliberate design decision, and `tests/test_whitelabel.py` pins it:
+
+- The rate is shown **before** the bot is created, with the signup link.
+- The agreed terms are stored on the sub-bot record, so the rate charged
+  cannot drift from the rate agreed (`test_disclosure_is_captured_at_creation_and_immutable`).
+- The cut is posted to its own ledger account, `revenue:platform_fee`, so an
+  owner can reconcile it line by line against their own provider invoice.
+
+A percentage taken quietly from someone else's sale is an unfair trade practice
+under the Consumer Protection Act 2019. It is also technically pointless here:
+in own-API mode the owner holds the API key, so their provider dashboard shows
+exactly what they were charged. A cut that does not reconcile with their own
+spend gets found, and then it becomes a chargeback rather than revenue.
+Disclosed, it is just a price.
+
+Set `PLATFORM_FEE_RATE=0.05` for 5%. Out-of-range values fail at startup, not
+mid-sale.
+
 ## Verifying the maths
 
 `simulate` runs a Monte Carlo written independently of the analytics, then
@@ -206,6 +243,9 @@ src/uotpbot/
   engine.py      fulfilment; the only place money actually moves
   cli.py         commands, including the Monte Carlo validator
   config.py      environment-driven settings
+  web.py         HTTP liveness/readiness/metrics for a Web Service
+  whitelabel.py  sub-bot records, the disclosed fee policy, poller manager
+  createbot.py   the /createbot conversation, terms shown before creation
   provider/      base protocol, UOTP HTTP adapter, deterministic mock
   bot/           transport-free command router + thin Telegram shell
 data/uotp_prices.csv   real uotp.in prices (transcribed 2026-09-01)

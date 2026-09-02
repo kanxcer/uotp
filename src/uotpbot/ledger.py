@@ -19,6 +19,7 @@ Accounts follow the normal-balance convention::
     liability:gst         GST collected, not yours  credit-normal
     equity:owner          owner capital / draws     credit-normal
     revenue:sales         what customers paid       credit-normal
+    revenue:platform_fee  the platform's cut of a white-label sale
 """
 
 from __future__ import annotations
@@ -62,11 +63,16 @@ TOPUP_FEE = Account("expense:topup_fee")
 GST = Account("liability:gst")
 OWNER = Account("equity:owner")
 SALES = Account("revenue:sales")
+#: The platform's cut of a white-label sale. Kept separate from ``revenue:sales``
+#: so a sub-bot owner's books show exactly what they kept and what the platform
+#: took -- a fee that is invisible in the ledger cannot be audited, and an
+#: unauditable fee is indistinguishable from a hidden one.
+PLATFORM_FEE = Account("revenue:platform_fee")
 
 #: Every account the bot may touch. Anything else is a typo, and a typo in an
 #: account name silently creates a phantom balance, so unknowns are rejected.
 KNOWN_ACCOUNTS: frozenset[Account] = frozenset(
-    {CASH, WALLET, COGS, GATEWAY, TOPUP_FEE, GST, OWNER, SALES}
+    {CASH, WALLET, COGS, GATEWAY, TOPUP_FEE, GST, OWNER, SALES, PLATFORM_FEE}
 )
 
 SCHEMA = """
@@ -140,6 +146,9 @@ class PnL:
     wallet_balance: Money
     cash_balance: Money
     owner_equity: Money
+    #: The platform's cut of white-label sales. Reported separately so it can
+    #: never be folded into the sub-bot owner's revenue by accident.
+    platform_fee: Money = Money(0)
 
     @property
     def gross_profit(self) -> Money:
@@ -155,6 +164,9 @@ class PnL:
 
         GST is deliberately excluded: it was never the business's money.
         Including it would overstate profit by 18% on every sale.
+
+        ``revenue`` already excludes any platform fee, so a sub-bot owner's
+        figure is what they actually kept.
         """
         return self.gross_profit - self.operating_expenses
 
@@ -180,6 +192,7 @@ class PnL:
             "net_profit": self.net_profit.to_plain(),
             "gross_margin": f"{self.gross_margin_ratio:.2%}",
             "net_margin": f"{self.net_margin_ratio:.2%}",
+            "platform_fee": self.platform_fee.to_plain(),
             "gst_collected": self.gst_collected.to_plain(),
             "wallet_balance": self.wallet_balance.to_plain(),
             "cash_balance": self.cash_balance.to_plain(),
@@ -290,6 +303,7 @@ class Ledger:
             wallet_balance=self.balance(WALLET),
             cash_balance=self.balance(CASH),
             owner_equity=self.balance(OWNER),
+            platform_fee=max(self.balance(PLATFORM_FEE), Money.zero()),
         )
 
     def ledger_for(self, ref: str) -> list[Posting]:
@@ -400,6 +414,52 @@ class Ledger:
         if not gateway_fee.is_zero:
             postings.append(Posting(_utcnow(), ref, GATEWAY, CASH, gateway_fee, "PSP fee"))
         self.post_many(postings)
+
+    def record_sale_split(
+        self,
+        gross: Money,
+        gateway_fee: Money,
+        gst: Money,
+        platform_fee: Money,
+        *,
+        ref: str,
+        memo: str = "",
+    ) -> None:
+        """A white-label sale, split at the moment of sale.
+
+        Of the gross: GST goes to a liability, the platform's cut goes to
+        ``revenue:platform_fee``, the PSP fee goes to expense, and the
+        remainder to the sub-bot owner's revenue. Splitting at sale time means
+        the owner's reported revenue is already net of the platform fee, so the
+        two can never silently disagree.
+
+        The PSP fee is booked as an expense rather than netted out of revenue,
+        matching :meth:`record_sale`. Netting it would double-count: once
+        against revenue and again against cash.
+        """
+        if platform_fee.is_negative:
+            raise LedgerError("platform_fee cannot be negative")
+        owner_revenue = gross - gst - platform_fee
+        if owner_revenue.is_negative:
+            raise LedgerError(
+                f"sale of {gross} cannot absorb {gst} GST + {platform_fee} platform fee"
+            )
+        if (gross - gateway_fee).is_negative:
+            raise LedgerError(f"sale of {gross} cannot absorb {gateway_fee} of fees")
+        postings = [Posting(_utcnow(), ref, CASH, SALES, owner_revenue, memo or "sale")]
+        if not platform_fee.is_zero:
+            postings.append(
+                Posting(_utcnow(), ref, CASH, PLATFORM_FEE, platform_fee, "platform fee")
+            )
+        if not gst.is_zero:
+            postings.append(Posting(_utcnow(), ref, CASH, GST, gst, "GST collected"))
+        if not gateway_fee.is_zero:
+            postings.append(Posting(_utcnow(), ref, GATEWAY, CASH, gateway_fee, "PSP fee"))
+        self.post_many(postings)
+
+    def platform_revenue(self) -> Money:
+        """Total the platform has earned from white-label sales."""
+        return max(self.balance(PLATFORM_FEE), Money.zero())
 
     def record_customer_refund(self, amount: Money, *, ref: str, memo: str = "") -> None:
         """Refund a customer. Reduces revenue; the number cost stays in COGS."""

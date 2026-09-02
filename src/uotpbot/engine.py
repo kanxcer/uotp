@@ -10,10 +10,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Optional
+from typing import Callable, Optional
 
 from .catalog import Catalog
-from .economics import FeeModel, OrderEconomics
+from .economics import EconomicsError, FeeModel, OrderEconomics
 from .ledger import COGS, OWNER, WALLET, Ledger
 from .money import Money
 from .orders import Order, OrderState, RetryDecision, retry_policy
@@ -28,7 +28,7 @@ from .provider.base import (
     PurchaseTimedOut,
 )
 
-__all__ = ["EngineConfig", "FulfilResult", "BotEngine"]
+__all__ = ["EngineConfig", "EngineError", "FulfilResult", "BotEngine"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +79,16 @@ class FulfilResult:
         }
 
 
+class EngineError(EconomicsError):
+    """An engine invariant was violated.
+
+    Subclasses :class:`EconomicsError` so the command layer's existing
+    ``except EconomicsError`` turns it into a chat message rather than a stack
+    trace. These are configuration faults, not normal order failures, so the
+    caller sees the reason verbatim.
+    """
+
+
 class BotEngine:
     """Buys numbers, waits for OTPs, and keeps the books honest."""
 
@@ -91,6 +101,8 @@ class BotEngine:
         *,
         fees: Optional[FeeModel] = None,
         config: Optional[EngineConfig] = None,
+        platform_fee_fn: Optional[Callable[[Money], Money]] = None,
+        fee_disclosure: str = "",
     ) -> None:
         self.catalog = catalog
         self.provider = provider
@@ -98,8 +110,31 @@ class BotEngine:
         self.pricer = pricer
         self.fees = fees or pricer.fees
         self.config = config or EngineConfig()
+        #: A white-label engine takes a cut of each sale. Setting this routes
+        #: sales through ``record_sale_split`` so the cut lands in
+        #: ``revenue:platform_fee`` instead of being folded into revenue.
+        self.platform_fee_fn = platform_fee_fn
+        #: The terms the owner agreed to, surfaced by /price and /help.
+        self.fee_disclosure = fee_disclosure
         self._multiplier = catalog.effective_multiplier(catalog.best_pack())
         self._books_opened = False
+
+    # -- white-label fees ------------------------------------------------
+    def platform_fee(self, gross: Money) -> Money:
+        """What the platform takes from a sale of ``gross``.
+
+        Zero when this engine is not white-labelled. Called in exactly one
+        place per sale, so the figure posted to the ledger and the figure
+        deducted from proceeds cannot disagree.
+        """
+        if self.platform_fee_fn is None:
+            return Money.zero()
+        fee = self.platform_fee_fn(gross)
+        if fee.is_negative:
+            raise EngineError(f"platform fee cannot be negative (got {fee})")
+        if fee.paise > gross.paise:
+            raise EngineError(f"platform fee {fee} exceeds the sale {gross}")
+        return fee
 
     # -- pricing ---------------------------------------------------------
     def quote(self, service: str) -> tuple[Money, OrderEconomics]:
@@ -216,8 +251,14 @@ class BotEngine:
 
         gateway_fee = self.fees.gross_fee(gross)
         gst = self.fees.output_gst(gross)
-        proceeds = self.fees.net_proceeds(gross)
-        self.ledger.record_sale(gross, gateway_fee, gst, ref=ref, memo=f"{service} order")
+        proceeds = self.fees.net_proceeds(gross) - self.platform_fee(gross)
+        if self.platform_fee_fn is None:
+            self.ledger.record_sale(gross, gateway_fee, gst, ref=ref, memo=f"{service} order")
+        else:
+            self.ledger.record_sale_split(
+                gross, gateway_fee, gst, self.platform_fee(gross),
+                ref=ref, memo=f"{service} order (white-label)",
+            )
         order.transition(OrderState.PAID)
 
         result = FulfilResult(order=order, success=False, _proceeds=proceeds)

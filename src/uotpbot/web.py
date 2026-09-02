@@ -78,11 +78,17 @@ class HealthServer:
         port: Optional[int] = None,
         poller: Optional[Callable[[], None]] = None,
         cache_seconds: float = 30.0,
+        subbots: Optional[Any] = None,
     ) -> None:
         self.engine = engine
         self.ledger = ledger
         self.port = port if port is not None else int(os.environ.get(PORT_ENV, DEFAULT_PORT))
         self._poller = poller
+        #: White-label sub-bot manager. Reported by /readyz and /metrics but
+        #: deliberately never allowed to flip readiness: one sub-bot with a
+        #: revoked token must not cause the platform to restart this process
+        #: and drop the main bot mid-order.
+        self._subbots = subbots
         self._cache_seconds = cache_seconds
         self._cache = _CachedCheck()
         self._lock = threading.Lock()
@@ -101,7 +107,16 @@ class HealthServer:
             )
             if self._poller is not None
             else None,
+            "subbots_running": (
+                self._subbots.running() if self._subbots is not None else None
+            ),
         }
+
+    def subbot_health(self) -> Optional[dict[str, Any]]:
+        """Sub-bot poller state, or None when white-label is disabled."""
+        if self._subbots is None:
+            return None
+        return self._subbots.health()
 
     def readiness(self) -> tuple[int, dict[str, Any]]:
         """200 only when the provider answers and the ledger balances."""
@@ -132,6 +147,11 @@ class HealthServer:
             ok = False
             detail["pnl_error"] = str(exc)
 
+        health = self.subbot_health()
+        if health is not None:
+            # Informational: a dead sub-bot is reported, not fatal.
+            detail["subbots"] = health
+
         detail["status"] = "ready" if ok else "not_ready"
         with self._lock:
             self._cache = _CachedCheck(ok=ok, detail=detail, at=time.monotonic())
@@ -144,6 +164,9 @@ class HealthServer:
         except LedgerError as exc:
             return 503, {"error": str(exc)}
         body["uptime_seconds"] = round(time.monotonic() - self._started, 1)
+        health = self.subbot_health()
+        if health is not None:
+            body["subbots"] = health
         return 200, body
 
     # -- HTTP ------------------------------------------------------------

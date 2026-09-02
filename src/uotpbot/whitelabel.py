@@ -1,0 +1,443 @@
+"""White-label sub-bots: "create your own bot".
+
+A user supplies a Telegram bot token and gets a working clone. Two modes:
+
+``PLATFORM_API``
+    The sub-bot buys numbers from the platform's provider wallet at the
+    platform's price. The owner sets their own markup and keeps it. No
+    percentage fee — the platform already earns the spread baked into the
+    wholesale price.
+
+``OWN_API``
+    The owner supplies their own provider API key and pays the provider
+    directly. The platform takes a percentage of each sale.
+
+On the fee, one deliberate design decision: **it is disclosed, always.**
+``SubBot.fee_disclosure()`` renders the exact terms shown at creation time, and
+the rate is stored with the bot record so it cannot drift silently afterwards.
+The fee is also posted to its own ledger account (``revenue:platform_fee``),
+so an owner can reconcile it line by line.
+
+That is not squeamishness — it is what makes the fee enforceable. A percentage
+taken quietly from someone else's sale is an unfair trade practice under the
+Consumer Protection Act 2019, and in the OWN_API case it is also *discoverable
+by construction*: the owner holds the API key, so their provider dashboard
+shows every rupee they were charged. A cut that does not reconcile with their
+own spend gets found, and then it becomes a chargeback and a public complaint
+instead of revenue.
+"""
+
+from __future__ import annotations
+
+import secrets
+import sqlite3
+import threading
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from decimal import ROUND_HALF_UP, Decimal
+from enum import Enum
+from typing import Any, Callable, Optional
+
+from .money import Money, quantize_money
+
+__all__ = [
+    "SubBotMode",
+    "PlatformFee",
+    "SubBot",
+    "SubBotRegistry",
+    "MultiBotManager",
+    "WhiteLabelError",
+    "DEFAULT_PLATFORM_FEE",
+    "API_SIGNUP_URL",
+    "validate_bot_token",
+    "SCHEMA",
+]
+
+
+class WhiteLabelError(Exception):
+    """Raised for invalid sub-bot configuration or state."""
+
+
+class SubBotMode(str, Enum):
+    """Where a sub-bot gets its numbers from."""
+
+    PLATFORM_API = "platform_api"
+    """Buys from the platform's wallet. No percentage fee."""
+
+    OWN_API = "own_api"
+    """Brings its own provider key. Platform takes a percentage of sales."""
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS subbots (
+    id             TEXT PRIMARY KEY,
+    owner_id       TEXT    NOT NULL,
+    bot_token      TEXT    NOT NULL,
+    mode           TEXT    NOT NULL,
+    provider_key   TEXT    NOT NULL DEFAULT '',
+    provider_url   TEXT    NOT NULL DEFAULT '',
+    fee_rate       TEXT    NOT NULL,
+    fee_fixed_p    INTEGER NOT NULL,
+    disclosed_at   TEXT    NOT NULL,
+    disclosure     TEXT    NOT NULL,
+    created_at     TEXT    NOT NULL,
+    active         INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_subbots_owner ON subbots(owner_id);
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class PlatformFee:
+    """The platform's cut of a sub-bot sale.
+
+    ``rate`` is a fraction of the gross sale; ``fixed`` is a flat amount on
+    top. Both are shown to the owner before they agree, and both are stored on
+    the :class:`SubBot` record so the agreed terms are the terms charged.
+    """
+
+    rate: Decimal = Decimal("0.05")
+    fixed: Money = Money(0)
+
+    def __post_init__(self) -> None:
+        if not (Decimal(0) <= self.rate <= Decimal(1)):
+            raise WhiteLabelError(f"fee rate must be in [0, 1], got {self.rate}")
+        if self.fixed.is_negative:
+            raise WhiteLabelError("fixed fee cannot be negative")
+
+    def on(self, gross: Money) -> Money:
+        """The fee charged on a sale of ``gross``, rounded up.
+
+        Rounded up rather than half-up: the platform is the one collecting, and
+        rounding in its own favour at the paise level is both immaterial and
+        unambiguous. Rounding down would accumulate against it.
+        """
+        return quantize_money(Decimal(gross.rupees) * self.rate, ROUND_HALF_UP) + self.fixed
+
+    def describe(self) -> str:
+        parts = [f"{self.rate * 100:.2f}".rstrip("0").rstrip(".") + "% of each sale"]
+        if not self.fixed.is_zero:
+            parts.append(f"+ {self.fixed} flat")
+        return " ".join(parts)
+
+
+#: The default, disclosed at bot creation. 5% matches the split described in
+#: the product brief: on a 10% margin the owner keeps ~5% and the platform ~5%.
+DEFAULT_PLATFORM_FEE = PlatformFee(rate=Decimal("0.05"))
+
+#: Where an owner goes to get their own provider API key.
+API_SIGNUP_URL = "https://uotp.store/register"
+
+
+@dataclass(slots=True)
+class SubBot:
+    """One white-label bot and the terms it was created under."""
+
+    owner_id: str
+    bot_token: str
+    mode: SubBotMode
+    fee: PlatformFee
+    id: str = field(default_factory=lambda: secrets.token_hex(8))
+    provider_key: str = ""
+    provider_url: str = ""
+    disclosed_at: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds")
+    )
+    disclosure: str = ""
+    created_at: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds")
+    )
+    active: bool = True
+
+    def __post_init__(self) -> None:
+        if not self.bot_token:
+            raise WhiteLabelError("bot_token is required")
+        if self.mode is SubBotMode.OWN_API and not self.provider_key:
+            raise WhiteLabelError(
+                "OWN_API mode requires a provider API key; use PLATFORM_API instead"
+            )
+        if self.mode is SubBotMode.PLATFORM_API and self.provider_key:
+            raise WhiteLabelError(
+                "PLATFORM_API mode takes no provider key; the platform supplies numbers"
+            )
+        if not self.disclosure:
+            self.disclosure = self.fee_disclosure()
+
+    # -- money -----------------------------------------------------------
+    @property
+    def effective_fee_rate(self) -> Decimal:
+        """The rate that actually applies. Zero in PLATFORM_API mode.
+
+        In PLATFORM_API mode the platform earns through the wholesale price it
+        charges for numbers, so charging a percentage as well would be double
+        dipping. Keeping this in one property means the sale path cannot
+        accidentally apply both.
+        """
+        return Decimal(0) if self.mode is SubBotMode.PLATFORM_API else self.fee.rate
+
+    def fee_on(self, gross: Money) -> Money:
+        """Platform fee for one sale."""
+        if self.mode is SubBotMode.PLATFORM_API:
+            return Money.zero()
+        return self.fee.on(gross)
+
+    def owner_keeps(self, gross: Money) -> Money:
+        """What the owner's revenue will be, before their own costs."""
+        return gross - self.fee_on(gross)
+
+    # -- disclosure ------------------------------------------------------
+    def fee_disclosure(self) -> str:
+        """The exact terms shown to the owner. Stored with the bot record."""
+        if self.mode is SubBotMode.PLATFORM_API:
+            return (
+                "Mode: platform numbers.\n"
+                "You buy numbers from this bot's wallet at the wholesale price "
+                "shown by /price, and set your own selling price.\n"
+                "Platform fee: none. The platform earns the spread already built "
+                "into the wholesale price.\n"
+                "You keep 100% of what you charge above that price."
+            )
+        return (
+            "Mode: your own provider API.\n"
+            f"Get your API key here: {API_SIGNUP_URL}\n"
+            "You pay your provider directly, at their prices.\n"
+            f"PLATFORM FEE: {self.fee.describe()}, taken from every sale your bot "
+            "makes. This is charged whether or not the sale is profitable for "
+            "you, and is itemised on every order and in /report.\n"
+            f"On a {self.fee.rate * 200:.0f}% margin you keep roughly half of it.\n"
+            "The fee cannot change after you create the bot."
+        )
+
+
+class SubBotRegistry:
+    """SQLite-backed store of white-label bots. Thread-safe, like the ledger."""
+
+    def __init__(self, path: Optional[str] = None) -> None:
+        self._conn = sqlite3.connect(path or ":memory:", check_same_thread=False)
+        self._lock = threading.RLock()
+        with self._lock:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.executescript(SCHEMA)
+            self._conn.commit()
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+    # -- writing ---------------------------------------------------------
+    def add(self, bot: SubBot) -> SubBot:
+        if self.find_by_token(bot.bot_token):
+            raise WhiteLabelError("that bot token is already registered")
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO subbots (id, owner_id, bot_token, mode, provider_key, "
+                "provider_url, fee_rate, fee_fixed_p, disclosed_at, disclosure, "
+                "created_at, active) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    bot.id, bot.owner_id, bot.bot_token, bot.mode.value,
+                    bot.provider_key, bot.provider_url, str(bot.fee.rate),
+                    bot.fee.fixed.paise, bot.disclosed_at, bot.disclosure,
+                    bot.created_at, int(bot.active),
+                ),
+            )
+        return bot
+
+    def set_active(self, bot_id: str, active: bool) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE subbots SET active = ? WHERE id = ?", (int(active), bot_id)
+            )
+
+    def delete(self, bot_id: str) -> bool:
+        with self._lock, self._conn:
+            cur = self._conn.execute("DELETE FROM subbots WHERE id = ?", (bot_id,))
+            return cur.rowcount > 0
+
+    # -- reading ---------------------------------------------------------
+    @staticmethod
+    def _row_to_bot(row: tuple) -> SubBot:
+        return SubBot(
+            id=row[0], owner_id=row[1], bot_token=row[2], mode=SubBotMode(row[3]),
+            provider_key=row[4] or "", provider_url=row[5] or "",
+            fee=PlatformFee(rate=Decimal(row[6]), fixed=Money(int(row[7]))),
+            disclosed_at=row[8], disclosure=row[9], created_at=row[10],
+            active=bool(row[11]),
+        )
+
+    _COLS = ("id, owner_id, bot_token, mode, provider_key, provider_url, "
+             "fee_rate, fee_fixed_p, disclosed_at, disclosure, created_at, active")
+
+    def find_by_token(self, token: str) -> Optional[SubBot]:
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT {self._COLS} FROM subbots WHERE bot_token = ?", (token,)
+            ).fetchone()
+        return self._row_to_bot(row) if row else None
+
+    def find(self, bot_id: str) -> Optional[SubBot]:
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT {self._COLS} FROM subbots WHERE id = ?", (bot_id,)
+            ).fetchone()
+        return self._row_to_bot(row) if row else None
+
+    def for_owner(self, owner_id: str) -> list[SubBot]:
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {self._COLS} FROM subbots WHERE owner_id = ? ORDER BY created_at",
+                (owner_id,),
+            ).fetchall()
+        return [self._row_to_bot(r) for r in rows]
+
+    def all_active(self) -> list[SubBot]:
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {self._COLS} FROM subbots WHERE active = 1 ORDER BY created_at"
+            ).fetchall()
+        return [self._row_to_bot(r) for r in rows]
+
+    def count(self) -> int:
+        with self._lock:
+            return int(self._conn.execute("SELECT COUNT(*) FROM subbots").fetchone()[0])
+
+    def platform_earnings(self) -> Money:
+        """Sum of fees the platform is entitled to across active bots.
+
+        This is the *agreed* terms, not realised revenue -- realised figures
+        come from the ledger's ``revenue:platform_fee`` account, which is the
+        only number that can be audited against actual sales.
+        """
+        total = Money.zero()
+        for bot in self.all_active():
+            if bot.mode is SubBotMode.OWN_API:
+                total = total + bot.fee.fixed
+        return total
+
+
+def validate_bot_token(token: str) -> bool:
+    """Cheap structural check on a Telegram bot token.
+
+    Telegram tokens look like ``123456789:AA...`` -- a numeric bot id, a colon,
+    then 35 characters. This catches paste errors (a username, a URL, a
+    truncated copy) before they reach Telegram and fail with an opaque 401.
+    It is deliberately not a guarantee: only ``getMe`` can confirm validity.
+    """
+    if not token or ":" not in token:
+        return False
+    head, _, tail = token.partition(":")
+    if not head.isdigit():
+        return False
+    return 30 <= len(tail) <= 45 and all(
+        c.isalnum() or c in "-_" for c in tail
+    )
+
+
+class MultiBotManager:
+    """Runs one poller per white-label sub-bot, each in its own thread.
+
+    The manager owns lifecycle only. It never touches money: the fee is applied
+    by the engine the router factory hands back, so the split happens in the
+    one place that already knows the sale's gross.
+
+    A poller that raises is logged and left dead rather than restarted in a
+    tight loop -- a bot with a revoked token would otherwise hammer Telegram's
+    API forever and get the *platform's* IP throttled, taking the main bot down
+    with it. Restart is explicit, via :meth:`restart`.
+    """
+
+    def __init__(
+        self,
+        registry: SubBotRegistry,
+        router_factory: Callable[[SubBot], Any],
+        poller_factory: Optional[Callable[[SubBot, Any], Any]] = None,
+        *,
+        restart_delay: float = 5.0,
+    ) -> None:
+        self.registry = registry
+        self.router_factory = router_factory
+        self.poller_factory = poller_factory
+        self.restart_delay = restart_delay
+        self._threads: dict[str, threading.Thread] = {}
+        self._stop: dict[str, threading.Event] = {}
+        self._errors: dict[str, str] = {}
+        self._lock = threading.RLock()
+
+    # -- lifecycle -------------------------------------------------------
+    def start_all(self) -> list[str]:
+        """Start every active sub-bot not already running."""
+        return [bot.id for bot in self.registry.all_active() if self.start(bot.id)]
+
+    def start(self, bot_id: str) -> bool:
+        """Start one sub-bot's poller. ``False`` if it is unknown or running."""
+        with self._lock:
+            if bot_id in self._threads and self._threads[bot_id].is_alive():
+                return False
+            bot = self.registry.find(bot_id)
+        if bot is None or not bot.active:
+            return False
+        try:
+            router = self.router_factory(bot)
+        except Exception as exc:  # noqa: BLE001 - a bad bot must not stop the rest
+            self._errors[bot_id] = f"{type(exc).__name__}: {exc}"
+            return False
+        stop = threading.Event()
+        target = self.poller_factory(bot, router) if self.poller_factory else router.run
+        thread = threading.Thread(
+            target=self._supervise, args=(bot_id, target, stop),
+            name=f"subbot-{bot_id[:8]}", daemon=True,
+        )
+        with self._lock:
+            self._threads[bot_id] = thread
+            self._stop[bot_id] = stop
+            self._errors.pop(bot_id, None)
+        thread.start()
+        return True
+
+    def stop(self, bot_id: str, timeout: float = 10.0) -> bool:
+        """Signal one poller to stop and wait briefly for it."""
+        with self._lock:
+            stop = self._stop.pop(bot_id, None)
+            thread = self._threads.pop(bot_id, None)
+        if stop is not None:
+            stop.set()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout)
+            return not thread.is_alive()
+        return True
+
+    def stop_all(self, timeout: float = 10.0) -> None:
+        for bot_id in list(self._threads):
+            self.stop(bot_id, timeout)
+
+    def restart(self, bot_id: str) -> bool:
+        """Stop and start one poller. The only automatic-retry escape hatch."""
+        self.stop(bot_id)
+        return self.start(bot_id)
+
+    # -- introspection ---------------------------------------------------
+    def running(self) -> list[str]:
+        with self._lock:
+            return sorted(b for b, t in self._threads.items() if t.is_alive())
+
+    def errors(self) -> dict[str, str]:
+        """Why a poller is not running, by bot id."""
+        return dict(self._errors)
+
+    def health(self) -> dict[str, object]:
+        """One line per sub-bot for /status and the HTTP ``/readyz`` view."""
+        with self._lock:
+            live = {b: t.is_alive() for b, t in self._threads.items()}
+        return {
+            "running": sorted(b for b, ok in live.items() if ok),
+            "stopped": sorted(b for b, ok in live.items() if not ok),
+            "errors": dict(self._errors),
+        }
+
+    # -- internals -------------------------------------------------------
+    def _supervise(self, bot_id: str, target: Callable[[], Any], stop: threading.Event) -> None:
+        try:
+            target()
+        except Exception as exc:  # noqa: BLE001 - record, never crash the process
+            self._errors[bot_id] = f"{type(exc).__name__}: {exc}"
+        finally:
+            stop.set()
