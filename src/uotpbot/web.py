@@ -193,6 +193,13 @@ class HealthServer:
                         code, payload = server.readiness()
                     elif path == "/metrics":
                         code, payload = server.metrics()
+                    elif path == "/versionz":
+                        code, payload = 200, {
+                            # Render injects these; unknown in local/dev runs.
+                            "git_commit": os.environ.get("RENDER_GIT_COMMIT", "unknown"),
+                            "git_branch": os.environ.get("RENDER_GIT_BRANCH", "unknown"),
+                            "service": os.environ.get("RENDER_SERVICE_NAME", "uotpbot"),
+                        }
                     elif path == "/":
                         code, payload = 200, {
                             "service": "uotpbot",
