@@ -276,7 +276,14 @@ class MenuUI:
             rows=tuple(rows),
         )
 
-    def service_card(self, user_id: str, slug: str) -> Reply:
+    def service_card(self, user_id: str, slug: str, page: int = 0) -> Reply:
+        """Service screen = the server picker.
+
+        The provider stocks every service from several SIM-bank servers --
+        same app, different price/stock/success-quality. Customers see all
+        of them (cheapest first, provider-recommended starred) and buy from
+        the one they tapped; the charge is computed on THAT server's price.
+        """
         if not self.catalog.has(slug):
             return Reply(
                 "That service just left the catalogue. Here is the current list:",
@@ -286,24 +293,71 @@ class MenuUI:
         cost = self.catalog.get(slug)
         advice = self.pricer.price(cost)
         balance = self.router.balance_of(user_id)
-        short = advice.gross_price - balance
+        options = self.catalog.servers_for(slug)
+
+        if not options:
+            # Flat catalogue (tests/dev): single buy button as before.
+            short = advice.gross_price - balance
+            warn = (
+                f"\n\n⚠️ Your balance is {balance} — you'll need {short} more."
+                if balance.paise < advice.gross_price.paise
+                else f"\n\n💰 Your balance covers it ({balance})."
+            )
+            rows = (
+                ((f"✅ Buy now · {advice.gross_price}", f"y:{slug}"),),
+                (("◀️ Back to services", "l"), ("🏠 Menu", "m")),
+            )
+            return Reply(
+                f"{_emoji(slug)} {cost.name}\n\n"
+                f"Price: {advice.gross_price} (all-in, no hidden fees)\n"
+                f"Country: 🇮🇳 India · Number yours for {_VALIDITY}\n"
+                f"🛟 No OTP in ~5 min = automatic full refund.{warn}",
+                rows=rows,
+            )
+
+        live = [o for o in options if o.stock > 0] or list(options)
+        per = 8
+        pages = max(1, (len(live) + per - 1) // per)
+        page = max(0, min(page, pages - 1))
+        window = live[page * per: (page + 1) * per]
+        rows: list[tuple[tuple[str, str], ...]] = []
+        for opt in window:
+            opt_price = self.pricer.price(
+                cost.with_overrides(list_price=opt.price)
+            ).gross_price
+            star = "⭐ " if opt.is_best else ""
+            stock_txt = f"{opt.stock:,} left" if opt.stock else "restocking"
+            rows.append((
+                (f"{star}Server {opt.server_id} · {opt_price}", f"y:{slug}:{opt.server_id}"),
+                ("📦 " + stock_txt, "nop"),
+            ))
+        if pages > 1:
+            nav: list[tuple[str, str]] = []
+            if page > 0:
+                nav.append(("◀️ Prev", f"s:{slug}:{page - 1}"))
+            nav.append((f"{page + 1}/{pages}", "nop"))
+            if page < pages - 1:
+                nav.append(("Next ▶️", f"s:{slug}:{page + 1}"))
+            rows.append(tuple(nav))
+        rows.append((("◀️ Back to services", "l"), ("🏠 Menu", "m")))
+
+        cheapest = live[0]
+        cheapest_price = self.pricer.price(
+            cost.with_overrides(list_price=cheapest.price)
+        ).gross_price
+        short = cheapest_price - balance
         warn = (
-            f"\n\n⚠️ Your balance is {balance} — you'll need {short} more."
-            if balance.paise < advice.gross_price.paise
-            else f"\n\n💰 Your balance covers it ({balance})."
-        )
-        rows = (
-            ((f"✅ Buy now · {advice.gross_price}", f"y:{slug}"),),
-            (("◀️ Back to services", "l"), ("🏠 Menu", "m")),
+            f"⚠️ Balance {balance} — top up {short} to buy."
+            if balance.paise < cheapest_price.paise
+            else f"💰 Your balance: {balance} ✅"
         )
         return Reply(
-            f"{_emoji(slug)} {cost.name}\n\n"
-            f"Price: {advice.gross_price} (all-in, no hidden fees)\n"
-            f"Country: 🇮🇳 India · Operator: any\n"
-            f"Number yours for {_VALIDITY}; OTP delivered here.\n"
-            f"🛟 No OTP in ~5 min = automatic full refund."
-            f"{warn}",
-            rows=rows,
+            f"{_emoji(slug)} {cost.name}\n"
+            f"🇮🇳 India · {len(live)} server(s) live · from {cheapest_price}\n\n"
+            "Pick a server — price shown is your final price:\n"
+            "⭐ = provider's best-rated · 📦 = numbers in stock\n\n"
+            f"🛟 No OTP in ~5 min = automatic full refund.\n{warn}",
+            rows=tuple(rows),
         )
 
     def wallet_card(self, user_id: str) -> Reply:
@@ -594,8 +648,9 @@ class MenuUI:
         if kind == "c":
             cat_page = _int(parts[2], 0) if len(parts) == 3 else 0
             return self.services_grid(user_id, parts[1], cat_page) if len(parts) >= 2 else self._badtap()
-        if kind == "s" and len(parts) == 2:
-            return self.service_card(user_id, parts[1])
+        if kind == "s" and len(parts) >= 2:
+            return self.service_card(user_id, parts[1],
+                                     _int(parts[2], 0) if len(parts) == 3 else 0)
         if kind == "w":
             return self.wallet_card(user_id)
         if kind == "o":
@@ -611,33 +666,42 @@ class MenuUI:
             return self.router.handle(user_id, "/createbot")
         if kind == "nop":
             return Reply("Already handled.", rows=((("🏠 Menu", "m"),),))
-        if kind == "y" and len(parts) == 2:
-            return self._begin_purchase(user_id, parts[1])
+        if kind == "y" and len(parts) >= 2:
+            server = parts[2] if len(parts) == 3 else ""
+            return self._begin_purchase(user_id, parts[1], server)
         # Unknown: menus advance; they never rotate an old menu back.
         return Reply("That menu moved on. Fresh one:", ok=False,
                      rows=((("🏠 Menu", "m"),),))
 
     # -- purchase --------------------------------------------------------
-    def _begin_purchase(self, user_id: str, slug: str) -> Reply:
-        """Answer the ✅ Buy now tap instantly; the real work runs deferred.
+    def _begin_purchase(self, user_id: str, slug: str, server: str = "") -> Reply:
+        """Answer the ✅ Buy tap instantly; the real work runs deferred.
 
         ``deferred`` is the transport's contract: edit the placeholder,
         run this callable off the event loop, edit the message again with
-        its Reply. Spending happens inside the command path, nowhere else.
+        its Reply. Spending happens inside ``router.purchase`` -- the one
+        and only money path -- never re-implemented here.
         """
         if not self.catalog.has(slug):
             return Reply("That service just left the catalogue. Refreshed list:",
                          ok=False, rows=((("🛒 Browse", "l"),),))
+        opt = self.catalog.server_option(slug, server) if server else None
+        if server and opt is None:
+            return Reply("That server just sold out. Refreshed list:",
+                         ok=False, rows=((("◀️ Back", f"s:{slug}"),),))
         cost = self.catalog.get(slug)
-        price = self.pricer.price(cost).gross_price
+        price = self.pricer.price(
+            cost.with_overrides(list_price=opt.price) if opt else cost
+        ).gross_price
+        where = f" · server {server}" if server else ""
 
         def job(uid: str) -> Reply:
-            reply = self.router.handle(uid, f"/buy {slug}")
+            reply = self.router.purchase(uid, slug, server=server)
             self._record(uid, slug, reply)
             return self._outcome(slug, reply)
 
         return Reply(
-            f"⏳ Buying {cost.name} for {price}…\n\n"
+            f"⏳ Buying {cost.name}{where} for {price}…\n\n"
             "Reserving a number now; the OTP will be edited into THIS message.\n"
             "Usually under a minute; automatic refund if nothing arrives.",
             deferred=job,
