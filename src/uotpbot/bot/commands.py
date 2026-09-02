@@ -76,6 +76,7 @@ class CommandRouter:
         owner_id: str = "",
         allowed_users: tuple[str, ...] = (),
         balances: Optional[dict[str, Money]] = None,
+        wallets: Optional[object] = None,
         subbots: Optional[SubBotRegistry] = None,
         platform_fee: Optional[PlatformFee] = None,
     ) -> None:
@@ -85,8 +86,12 @@ class CommandRouter:
         self.ledger = ledger
         self.owner_id = owner_id
         self.allowed_users = allowed_users
-        #: Customer wallets. A real deployment backs this with the database;
-        #: keeping it injected means the router stays testable.
+        #: Customer wallets. A real deployment passes ``wallets`` (a
+        #: WalletStore on Postgres/sqlite) so balances survive redeploys;
+        #: ``balances`` stays as the plain-dict fallback for tests.
+        if wallets is not None and balances is not None:
+            raise ValueError("pass wallets OR balances, not both")
+        self.wallets = wallets
         self.balances: dict[str, Money] = balances if balances is not None else {}
         #: White-label sub-bots. ``None`` disables /createbot entirely rather
         #: than silently running it against an in-memory store that loses every
@@ -101,13 +106,26 @@ class CommandRouter:
 
     # -- helpers ---------------------------------------------------------
     def balance_of(self, user_id: str) -> Money:
+        if self.wallets is not None:
+            return self.wallets.balance(user_id)
         return self.balances.get(user_id, Money.zero())
 
     def credit(self, user_id: str, amount: Money) -> Money:
         """Add funds to a customer wallet (called after a payment confirms)."""
         if amount.is_negative or amount.is_zero:
             raise ValueError("credit amount must be positive")
+        if self.wallets is not None:
+            return self.wallets.adjust(user_id, amount)
         self.balances[user_id] = self.balance_of(user_id) + amount
+        return self.balances[user_id]
+
+    def _debit(self, user_id: str, amount: Money) -> Money:
+        """Take funds off a customer wallet for a purchase."""
+        if amount.is_negative or amount.is_zero:
+            raise ValueError("debit amount must be positive")
+        if self.wallets is not None:
+            return self.wallets.adjust(user_id, Money(-amount.paise))
+        self.balances[user_id] = self.balance_of(user_id) - amount
         return self.balances[user_id]
 
     def _authorised(self, user_id: str) -> bool:
@@ -237,7 +255,7 @@ class CommandRouter:
             )
 
         # Debit first: if the purchase then fails, the refund path restores it.
-        self.balances[user_id] = balance - price
+        self._debit(user_id, price)
         result = self.engine.fulfil(user_id, slug)
         if result.success:
             return Reply(
@@ -245,7 +263,8 @@ class CommandRouter:
                 f"Charged {price}. Remaining balance {self.balance_of(user_id)}."
             )
         # Failed: put the money back so the customer is never out of pocket.
-        self.balances[user_id] = self.balance_of(user_id) + result.refunded
+        if result.refunded.paise > 0:
+            self.credit(user_id, result.refunded)
         return Reply(
             f"No OTP arrived for {slug}. Refunded {result.refunded}; "
             f"balance {self.balance_of(user_id)}.",

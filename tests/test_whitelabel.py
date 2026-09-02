@@ -590,7 +590,9 @@ def test_make_whitelabel_returns_none_when_disabled():
     settings = from_environment()
     ledger = Ledger()
     catalog = load_catalog()
-    assert _make_whitelabel(settings, catalog, ledger, Pricer(catalog)) is None
+    from uotpbot.wallets import SqliteWallets
+    assert _make_whitelabel(settings, catalog, ledger, Pricer(catalog),
+                            SqliteWallets(":memory:")) is None
     ledger.close()
 
 
@@ -605,7 +607,9 @@ def test_make_whitelabel_builds_a_manager_when_enabled(monkeypatch, tmp_path):
     settings = from_environment()
     ledger = Ledger()
     catalog = load_catalog()
-    wl = _make_whitelabel(settings, catalog, ledger, Pricer(catalog))
+    from uotpbot.wallets import SqliteWallets
+    wl = _make_whitelabel(settings, catalog, ledger, Pricer(catalog),
+                          SqliteWallets(":memory:"))
     try:
         assert wl is not None
         assert wl.registry.count() == 0
