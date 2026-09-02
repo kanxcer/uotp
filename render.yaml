@@ -52,6 +52,23 @@ services:
         sync: false
       - key: TELEGRAM_ALLOWED_USERS
         sync: false
+      # --- white-label sub-bots -----------------------------------------
+      # Off by default. Set to true once you have decided to let owners run
+      # their own clones of this bot.
+      - key: WHITELABEL_ENABLED
+        value: "false"
+      # MUST be on the persistent disk, not the container filesystem. A
+      # registry that survives a redeploy while the ledger does not would
+      # keep charging owners fees it can no longer account for.
+      - key: SUBBOTS_PATH
+        value: /var/data/subbots.db
+      # The platform's cut of an own-API sub-bot sale, as a fraction of
+      # gross. This is what owners are shown at creation time and what is
+      # recorded against their bot; it is not something that can be changed
+      # quietly afterwards, because the agreed rate is stored per sub-bot.
+      # Out-of-range values fail at startup rather than mid-sale.
+      - key: PLATFORM_FEE_RATE
+        value: "0.05"
       # Only set this once you have confirmed reselling is permitted for the
       # account. See docs/RESEARCH.md -- uotp.in's terms prohibit reselling.
       - key: FEE_GATEWAY_RATE
