@@ -43,7 +43,7 @@ The live service catalogue at `uotp.in/services` says otherwise:
 | Facebook | ₹5 | **₹13** | Binance | ₹22 |
 
 Nothing on the page is below ₹10. The full transcribed table is in
-[`src/uotpbot/data/uotp_prices.csv`](../data/uotp_prices.csv).
+[`src/uotpbot/data/uotp_prices.csv`](../src/uotpbot/data/uotp_prices.csv).
 
 ### Why this matters arithmetically
 
