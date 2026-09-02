@@ -1,0 +1,84 @@
+# Render blueprint.
+#
+#   render up          # create/update everything from this file
+#
+# The bot is a long-polling Telegram client: it makes an outbound connection
+# and never needs inbound traffic. That makes a **Background Worker** the
+# natural fit. But a Web Service works too, because `serve` also binds $PORT
+# and answers /healthz and /readyz -- use whichever your plan allows.
+#
+# IMPORTANT -- the ledger is SQLite. Render's container filesystem is wiped on
+# every deploy, so without a persistent disk the entire audit trail (and any
+# order that was mid-flight) disappears on the next release. `disk` below
+# mounts one at /var/data; note that persistent disks are not available on the
+# free plan. If you cannot mount one, move the ledger to a managed database
+# rather than accepting silent data loss.
+
+services:
+  # --- Option A: Web Service (what you asked for) ------------------------
+  - type: web
+    name: uotpbot
+    runtime: python
+    plan: starter
+    region: singapore
+    pythonVersion: 3.11.9
+    # `.[telegram]` matters: python-telegram-bot is an optional extra, and a
+    # bare `pip install .` starts an HTTP server that accepts no orders.
+    buildCommand: pip install --upgrade pip && pip install ".[telegram]"
+    startCommand: python -m uotpbot serve
+    # Liveness, not readiness: a provider outage must not get the process
+    # killed and restarted, because a restart mid-order is how you charge a
+    # customer and deliver nothing. /readyz reports the outage instead.
+    healthCheckPath: /healthz
+    disk:
+      name: uotpbot-ledger
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: PORT
+        value: "8080"
+      # On ephemeral storage this is wiped every deploy -- hence the disk above.
+      - key: LEDGER_PATH
+        value: /var/data/ledger.db
+      - key: UOTP_API_KEY
+        sync: false          # set once in the dashboard; never commit a key
+      - key: UOTP_BASE_URL
+        value: https://uotp.store/api/stubs/handler_api.php
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_OWNER_ID
+        sync: false
+      - key: TELEGRAM_ALLOWED_USERS
+        sync: false
+      # Only set this once you have confirmed reselling is permitted for the
+      # account. See docs/RESEARCH.md -- uotp.in's terms prohibit reselling.
+      - key: FEE_GATEWAY_RATE
+        value: "0.02"
+      - key: ENGINE_RETRY_CAP
+        value: "3"
+
+  # --- Option B: Background Worker (usually the better fit) --------------
+  # Uncomment this and comment out the web service above. No port, no health
+  # check path -- the platform just keeps the process alive.
+  #
+  # - type: worker
+  #   name: uotpbot-worker
+  #   runtime: python
+  #   plan: starter
+  #   region: singapore
+  #   pythonVersion: 3.11.9
+  #   buildCommand: pip install --upgrade pip && pip install ".[telegram]"
+  #   startCommand: python -m uotpbot serve
+  #   disk:
+  #     name: uotpbot-ledger
+  #     mountPath: /var/data
+  #     sizeGB: 1
+  #   envVars:
+  #     - key: LEDGER_PATH
+  #       value: /var/data/ledger.db
+  #     - key: UOTP_API_KEY
+  #       sync: false
+  #     - key: TELEGRAM_BOT_TOKEN
+  #       sync: false

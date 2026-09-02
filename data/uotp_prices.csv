@@ -1,0 +1,54 @@
+# UOTP provider cost catalogue
+#
+# list_price_inr  -- transcribed from https://uotp.in/services on 2026-09-01.
+#                    These are the real checkout prices. The homepage's
+#                    "from Rs.2" teaser and its "Telegram Rs.2 / WhatsApp Rs.5
+#                    / Google Rs.8" table are marketing and are NOT what you
+#                    get charged. Lowest real price here is Rs.10.
+#
+# success_rate    -- P(a purchased number yields a usable OTP).
+# burn_rate       -- P(a freshly allocated number is already registered /
+#                    rejected by the target service). Charged, rarely refunded.
+# refund_share    -- fraction of a failed charge credited back to your wallet.
+#
+# The three rate columns are ENGINEERING PRIORS, not measured truth. They are
+# set from how aggressively each platform blocks VoIP/virtual ranges: Google,
+# Apple, Meta, Binance, Coinbase and PayPal are the worst offenders, plain
+# messaging apps the best. Replace them with your own measured values -- run
+#   python -m uotpbot.cli calibrate --service whatsapp
+# after you have real order history, and the numbers below get overwritten by
+# observed frequencies. Do not price off priors for long.
+#
+slug,name,category,list_price_inr,success_rate,burn_rate,refund_share
+telegram,Telegram,messaging,10,0.94,0.04,0.95
+discord,Discord,messaging,10,0.94,0.04,0.95
+line,Line,messaging,10,0.93,0.04,0.95
+wechat,WeChat,messaging,14,0.85,0.08,0.90
+whatsapp,WhatsApp,messaging,12,0.90,0.06,0.90
+okcupid,OkCupid,dating,11,0.92,0.05,0.90
+twitter,Twitter/X,social,11,0.91,0.05,0.90
+bolt,Bolt,transport,11,0.92,0.05,0.90
+snapchat,Snapchat,social,12,0.88,0.07,0.90
+steam,Steam,gaming,12,0.93,0.04,0.90
+tinder,Tinder,dating,12,0.91,0.05,0.90
+bumble,Bumble,dating,12,0.91,0.05,0.90
+deliveroo,Deliveroo,food,12,0.91,0.05,0.90
+facebook,Facebook,social,13,0.84,0.09,0.85
+tiktok,TikTok,social,13,0.88,0.07,0.90
+doordash,DoorDash,food,13,0.90,0.06,0.90
+grab,Grab,transport,12,0.91,0.05,0.90
+instagram,Instagram,social,14,0.82,0.10,0.85
+uber,Uber,transport,14,0.89,0.07,0.90
+booking,Booking.com,travel,14,0.90,0.06,0.90
+spotify,Spotify,entertainment,14,0.92,0.05,0.90
+google,Google,tech,15,0.78,0.12,0.80
+microsoft,Microsoft,tech,15,0.86,0.08,0.85
+airbnb,Airbnb,travel,15,0.89,0.07,0.90
+linkedin,LinkedIn,professional,16,0.85,0.09,0.85
+netflix,Netflix,entertainment,16,0.88,0.07,0.90
+amazon,Amazon,shopping,18,0.87,0.08,0.85
+apple,Apple,tech,18,0.76,0.13,0.80
+kraken,Kraken,crypto,18,0.80,0.11,0.80
+paypal,PayPal,finance,20,0.75,0.13,0.80
+coinbase,Coinbase,crypto,20,0.77,0.12,0.80
+binance,Binance,crypto,22,0.74,0.14,0.80
