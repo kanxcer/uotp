@@ -212,9 +212,12 @@ class MenuUI:
             rows.append((("🤖 Run your own bot", "cb"),))
         if self.router._is_owner(user_id):
             rows.append((("📊 Owner: profit & health", "a"),))
+        count = len(self.catalog)
         return Reply(
-            f"✳️ UOTP Numbers\n\n💰 Your balance: {balance}\n\n"
-            "What would you like to do?",
+            "✳️ UOTP Numbers\n\n"
+            f"⚡ {count:,} services · 🇮🇳 real SIMs · 🛟 auto-refund if no OTP\n"
+            f"💰 Your balance: {balance}\n\n"
+            "What would you like to do? (or just type a service name)",
             rows=tuple(rows),
         )
 
@@ -488,11 +491,27 @@ class MenuUI:
         )
 
     def history_card(self, user_id: str) -> Reply:
+        store = self._store
+        get_orders = getattr(store, "recent_orders", None)
+        if callable(get_orders):
+            entries = get_orders(user_id=user_id, limit=8)
+            if entries:
+                lines = ["🧾 Your orders (saved — survive restarts):"]
+                for o in entries:
+                    when = time.strftime("%d %b %H:%M", time.localtime(o.ts))
+                    name = self.catalog.get(o.slug).name if self.catalog.has(o.slug) else o.slug
+                    if o.success:
+                        lines.append(f"\n✅ {when} — {name} · {o.gross}"
+                                     f"\n    📱 {o.phone} · OTP {o.otp}")
+                    else:
+                        lines.append(f"\n♻️ {when} — {name} · refunded {o.gross}")
+                return Reply("\n".join(lines),
+                             rows=((("🛒 Buy again", "l"), ("🏠 Menu", "m")),))
         entries = self._history.get(user_id, [])
         if not entries:
             return Reply(
-                "🧾 No numbers this session.\n\n"
-                "Bought ones are listed here with the OTP that arrived.",
+                "🧾 No orders yet.\n\n"
+                "Bought numbers are listed here with the OTP that arrived.",
                 rows=((("🛒 Buy a number", "l"), ("🏠 Menu", "m")),),
             )
         lines = ["🧾 This session's numbers (newest first):"]
@@ -511,21 +530,56 @@ class MenuUI:
         pnl = status["pnl"]
         pending = self._pending_topups()
         qr_state = "set ✅" if self._qr_file_id() else "not set ❌"
+        fs = self._float_stats()
+        float_line = ""
+        if fs:
+            float_line = f"\n👥 Customers: {fs['users']} · float held: {fs['float']}"
         return Reply(
             "📊 Owner panel\n\n"
             f"🏦 Provider wallet: {status['provider_wallet']}\n"
             f"📒 Ledger wallet:    {status['ledger_wallet']}\n"
             f"💹 Revenue: {pnl['revenue']} · Costs: {pnl['cogs']}\n"
-            f"📈 Net profit: {pnl['net_profit']}\n"
+            f"📈 Net profit: {pnl['net_profit']}"
+            f"{float_line}\n"
             f"💳 Payments waiting: {len(pending)}\n"
             f"🖼 Payment QR: {qr_state}\n\n"
             "Full P&L: /report · Health: /status",
             rows=(
                 ((f"🧾 Top-ups ({len(pending)} pending)", "a:t"),),
-                (("🖼 Payment QR", "a:qr"),),
-                (("🏠 Menu", "m"),),
+                (("📦 Orders & per-order profit", "a:o"),),
+                (("🖼 Payment QR", "a:qr"), ("🏠 Menu", "m")),
             ),
         )
+
+    def _float_stats(self):
+        store = self._store
+        fn = getattr(store, "float_stats", None)
+        return fn() if callable(fn) else None
+
+    def orders_screen(self, user_id: str) -> Reply:
+        """Owner's per-order P&L: every sale with the profit it made."""
+        if not self.router._is_owner(user_id):
+            return Reply("Owner only.", ok=False, rows=((("🏠 Menu", "m"),),))
+        store = self._store
+        fn = getattr(store, "recent_orders", None)
+        orders = fn(limit=10) if callable(fn) else []
+        if not orders:
+            return Reply("📦 No orders yet.", rows=((("◀️ Owner panel", "a"),),))
+        lines = ["📦 Recent orders (newest first):"]
+        tot_g = tot_p = 0
+        n = 0
+        for o in orders:
+            when = time.strftime("%d %b %H:%M", time.localtime(o.ts))
+            if o.success:
+                ratio = o.profit_ratio
+                pct = f" ({ratio:.0%})" if ratio is not None else ""
+                lines.append(f"\n✅ {when} · {o.slug} · {o.gross} → profit {o.profit}{pct}")
+                tot_g += o.gross.paise; tot_p += o.profit.paise; n += 1
+            else:
+                lines.append(f"\n♻️ {when} · {o.slug} · refunded")
+        if n:
+            lines.append(f"\n—— shown sales margin: {tot_p / tot_g:.0%}")
+        return Reply("\n".join(lines), rows=((("◀️ Owner panel", "a"),),))
 
     def _pending_topups(self) -> list:
         store = self._store
@@ -642,6 +696,8 @@ class MenuUI:
                 return self.topups_screen(user_id)
             if parts[1] == "qr":
                 return self.qr_screen(user_id)
+            if parts[1] == "o":
+                return self.orders_screen(user_id)
             return self._badtap()
         if kind == "l":
             return self.services_grid(user_id, page=_int(parts[1], 0) if len(parts) == 2 else 0)

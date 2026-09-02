@@ -939,6 +939,10 @@ def test_build_from_settings_registers_callback_handler(monkeypatch):
         def token(self, tok):
             return self
 
+        def post_init(self, fn):  # the command menu is registered here
+            self._post_init = fn
+            return self
+
         def build(self):
             return FakeApp()
 

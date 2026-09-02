@@ -218,6 +218,21 @@ class TelegramFrontend:
             pass
 
 
+async def _post_init(app: Any) -> None:  # pragma: no cover - network call
+    """Register Telegram's built-in command menu next to the text box."""
+    try:
+        await app.bot.set_my_commands([
+            ("start", "🏠 Open the menu"),
+            ("buy", "🛒 Buy a number"),
+            ("list", "📋 All services"),
+            ("wallet", "💰 Balance & add money"),
+            ("help", "❓ How it works"),
+        ])
+        log.info("telegram command menu registered")
+    except Exception:
+        log.warning("could not set the command menu", exc_info=True)
+
+
 def build_from_settings(settings: Settings, router_factory: Any) -> Any:
     """Construct the PTB application from settings.
 
@@ -234,7 +249,12 @@ def build_from_settings(settings: Settings, router_factory: Any) -> Any:
         support_contact=getattr(settings, "support_contact", ""),
         pay_upi_id=getattr(settings, "pay_upi_id", ""),
     )
-    app = Application.builder().token(settings.require_telegram()).build()
+    app = (
+        Application.builder()
+        .token(settings.require_telegram())
+        .post_init(_post_init)
+        .build()
+    )
     app.add_handler(CallbackQueryHandler(frontend.on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, frontend.on_message))
     app.add_handler(MessageHandler(filters.COMMAND, frontend.on_message))
