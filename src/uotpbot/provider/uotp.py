@@ -187,9 +187,16 @@ class UotpConfig:
     #: was down, so operator ids' meaning is still unconfirmed).
     prices_country: str = "0"
     prices_operator: str = "2"
-    #: Maps this bot's service slug to the provider's. ``whatsapp`` was
-    #: rejected with BAD_SERVICE, so the provider uses its own vocabulary.
+    #: Maps this bot's service slug to the provider's. Union stock table and
+    #: operator preferences land in ``handler_vocab.json`` (regenerate with
+    #: scripts/refresh_handler_vocab.py); an explicit map overrides it.
     service_map: Mapping[str, str] = field(default_factory=dict)
+    #: getNumber requires an ``operator`` (validated live: ids 2..10 pass,
+    #: names/any/0/1 are BAD_OPERATOR). ``operator`` forces one id; otherwise
+    #: the provider walks ``operator_order``, usually the harvested
+    #: cheapest-first list for that service.
+    operator: str = ""
+    operator_order: Sequence[str] = ("3", "4", "5", "7", "2", "8")
     balance_divisor: Decimal = Decimal(1)
     timeout: float = 30.0
     max_retries: int = 2
@@ -224,6 +231,44 @@ class UotpProvider:
         # Injectable so tests can supply a fake transport without touching
         # urllib or the network.
         self._opener = opener or urllib.request
+        # Vocabulary dump harvested from the live getPrices endpoint: which
+        # handler codes exist (cats pre-validate getNumber with BAD_SERVICE)
+        # and which operator ids carry stock, cheapest first. Lives in the
+        # package so the bot boots with zero extra network calls.
+        self._handler_map: dict[str, str] = {}
+        self._handler_ops: dict[str, list[str]] = {}
+        try:
+            import json as _json
+            from pathlib import Path as _Path
+            vocab = _json.loads((_Path(__file__).resolve().parent.parent
+                                 / "data" / "handler_vocab.json").read_text())
+            self._handler_map = {k.lower(): v for k, v in vocab.get("map", {}).items()}
+            self._handler_ops = {
+                k.lower(): [str(o) for o in v] for k, v in vocab.get("op_order", {}).items()
+            }
+        except Exception:  # pragma: no cover - defensive: map-less = try raw slugs
+            pass
+        for k, v in self.config.service_map.items():
+            self._handler_map[str(k).lower()] = str(v)
+
+    def can_serve(self, service: str) -> bool:
+        """Whether the fulfilment rail knows this service at all.
+
+        The site's 1047 product codes include ~250 that handler_api rejects
+        with BAD_SERVICE (unavailable upstream). Listing them as buyable
+        would sell guaranteed-instant-refund orders, so the picker consults
+        this. Map-less (offline/first run) => optimistically True.
+        """
+        if not self._handler_map:
+            return True
+        return self._resolve(service) is not None
+
+    def _resolve(self, service: str) -> Optional[str]:
+        key = service.lower()
+        code = self._handler_map.get(key)
+        if code is not None:
+            return code
+        return service if service in self._handler_ops else None
 
     # -- transport -------------------------------------------------------
     def _call(self, action: str, **params: Any) -> str:
@@ -387,8 +432,12 @@ class UotpProvider:
                     return UotpProvider._extract_price(nested)
         return None
 
+    # handler_api accepts numeric country ids only ("22" is India); the
+    # engine's generic default used to send "in" and eat BAD_COUNTRY.
+    _COUNTRY_ALIASES = {"in": "22", "india": "22", "ind": "22"}
+
     def buy_number(
-        self, service: str, country: str = "in", *,
+        self, service: str, country: str = "22", *,
         idempotency_key: Optional[str] = None, server: str = "",
     ) -> NumberAllocation:
         """Allocate a number via ``getNumber``.
@@ -410,16 +459,53 @@ class UotpProvider:
         the caller reconciles instead of buying a second number.
         """
         c = self.config
-        # The provider rejected "whatsapp" with BAD_SERVICE, so it uses its own
-        # slug vocabulary. Translate through service_map when one is supplied.
-        slug = c.service_map.get(service, service)
+        # Translate through the harvested handler vocabulary first
+        # ("instagram" -> "Instagram"), then the caller's explicit map,
+        # then the raw slug -- validation will still BAD_SERVICE unknowns.
+        slug = self._resolve(service) or service
+        country = self._COUNTRY_ALIASES.get(str(country).lower(), country)
         params: dict[str, Any] = {"service": slug, "country": country}
         if server:
-            # Stock and price live per SIM-bank server on uotp.store.
+            # Stock and price live per SIM-bank server on uotp.store. The
+            # handler currently ignores it (server number comes from the
+            # operator's pool) -- harmless to send, cheap to verify later.
             params[c.server_param] = server
         if idempotency_key:
             params["order"] = idempotency_key
-        parsed = self._request(c.action_get_number, **params)
+
+        # ``operator`` is REQUIRED (BAD_OPERATOR without it, verified live).
+        # Operator ids are stock pools; a "no stock" answer on one says
+        # nothing about the others, so one tap may try several. Ordered by
+        # the harvested per-service price table, cheapest first; an explicit
+        # config override is tried ahead of the list. CRITICAL: the walk
+        # stops on PurchaseTimedOut -- a timed-out request may already hold
+        # the charge, and trying the next operator could buy two numbers.
+        ops = list(self._handler_ops.get(slug.lower(), []))
+        if c.operator:
+            ops = [c.operator] + [o for o in ops if o != c.operator]
+        if not ops:
+            ops = list(c.operator_order)
+        if c.operator and c.operator not in ops:
+            ops.insert(0, c.operator)
+
+        last: Optional[ProviderError] = None
+        for op in dict.fromkeys(ops):
+            try:
+                parsed = self._request(c.action_get_number, operator=op, **params)
+            except PurchaseTimedOut:
+                raise  # maybe charged -- engine reconciles, never blind-retries
+            except (NumberUnavailable, InsufficientBalance) as exc:
+                last = exc
+                continue
+            except ProviderError as exc:
+                # BAD_OPERATOR: this id does not exist here; try the next.
+                if "BAD_OPERATOR" in str(exc):
+                    last = exc
+                    continue
+                raise
+            break
+        else:
+            raise last or NumberUnavailable(f"no stock for {service}")
 
         if parsed.status == c.cancel_prefix:
             # Charged and immediately useless. Record it as an allocation so
@@ -435,7 +521,9 @@ class UotpProvider:
                 f"expected {c.number_prefix!r} but got {parsed.status!r} "
                 f"(raw: {parsed.raw!r}). Set number_prefix to match."
             )
-        return self._allocation(parsed, service, country)
+        alloc = self._allocation(parsed, service, country)
+        alloc = replace(alloc, charged=alloc.charged, order_id=alloc.order_id)
+        return alloc
 
     def _allocation(
         self, parsed: ApiResponse, service: str, country: str

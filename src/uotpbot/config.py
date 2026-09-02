@@ -201,7 +201,7 @@ def from_environment(env_file: Optional[Path | str] = None) -> Settings:
         poll_interval=float(_get("ENGINE_POLL_INTERVAL", "3")),
         auto_refund=_bool("ENGINE_AUTO_REFUND", True),
         topup_headroom=_decimal("ENGINE_TOPUP_HEADROOM", "5"),
-        default_country=_get("ENGINE_DEFAULT_COUNTRY", "in"),
+        default_country=_get("ENGINE_DEFAULT_COUNTRY", "22")  # uotp.store handler_api: India,
     )
     allowed = tuple(
         u.strip() for u in _get("TELEGRAM_ALLOWED_USERS", "").split(",") if u.strip()

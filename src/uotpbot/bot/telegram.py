@@ -84,6 +84,9 @@ class TelegramFrontend:
         self.ui = ui or MenuUI(
             router, support_contact=support_contact, pay_upi_id=pay_upi_id
         )
+        # /buy (typed) and button buys must agree on maintenance mode:
+        # the flag lives in the UI's store; the router just consults it.
+        self.router.maintenance_fn = self.ui.maintenance_on
 
     async def on_message(self, update: Any, context: Any = None) -> None:
         """Handle any incoming message and reply with the UI's answer.

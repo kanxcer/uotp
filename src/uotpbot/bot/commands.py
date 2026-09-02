@@ -21,7 +21,7 @@ from ..whitelabel import PlatformFee, SubBotRegistry
 
 __all__ = ["CommandRouter", "HELP_TEXT"]
 
-HELP_TEXT = """UOTP bot
+HELP_TEXT = """YCOTP bot
 
 /buy <service>        Buy a number and wait for the OTP
 /price <service>      Price and margin for one service
@@ -90,8 +90,12 @@ class CommandRouter:
         wallets: Optional[object] = None,
         subbots: Optional[SubBotRegistry] = None,
         platform_fee: Optional[PlatformFee] = None,
+        maintenance_fn: Optional[Callable[[], bool]] = None,
     ) -> None:
         self.engine = engine
+        # Owner panel sets this to pause buying during provider incidents:
+        # returns True while purchases/maintenance are in effect.
+        self.maintenance_fn = maintenance_fn
         self.catalog = catalog
         self.pricer = pricer
         self.ledger = ledger
@@ -263,6 +267,23 @@ class CommandRouter:
         if not self.catalog.has(slug):
             return Reply(f"Unknown service {slug!r}. Try /list.", ok=False)
 
+        if (self.maintenance_fn and self.maintenance_fn()
+                and not self._is_owner(user_id)):
+            return Reply(
+                "🛠 Maintenance in progress — purchases are paused for a few "
+                "minutes. Your balance is safe; please try again shortly.",
+                ok=False,
+            )
+
+        serve = getattr(self.engine.provider, "can_serve", None)
+        if callable(serve) and not serve(slug) and not self._is_owner(user_id):
+            return Reply(
+                f"😔 {self.catalog.get(slug).name} numbers are temporarily "
+                "unavailable from our supplier. Nothing was charged — pick "
+                "another service, or try again later.",
+                ok=False,
+            )
+
         price, _ = self.engine.quote(slug, server=server or None)
         balance = self.balance_of(user_id)
         if balance.paise < price.paise:
@@ -287,9 +308,11 @@ class CommandRouter:
         # Failed: put the money back so the customer is never out of pocket.
         if result.refunded.paise > 0:
             self.credit(user_id, result.refunded)
+        reason = getattr(result, "message", "") or ""
+        detail = f"\n\nWhy: {reason}" if reason else ""
         return Reply(
-            f"⚠️ No OTP arrived for {slug}. Refunded {result.refunded} in full; "
-            f"balance {self.balance_of(user_id)}.",
+            f"⚠️ Couldn't deliver {slug}. Refunded {result.refunded} in full; "
+            f"balance {self.balance_of(user_id)}.{detail}",
             ok=False,
         )
 

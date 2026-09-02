@@ -330,13 +330,14 @@ def test_buy_number_missing_phone_raises():
 
 
 def test_buy_number_out_of_stock():
-    p, _ = make("ERROR_NO_NUMBERS")
+    # Every operator pool is walked before concluding "no stock".
+    p, _ = make(*(["ERROR_NO_NUMBERS"] * 6))
     with pytest.raises(NumberUnavailable):
         p.buy_number("telegram")
 
 
 def test_buy_number_insufficient_funds():
-    p, _ = make("ERROR_NO_BALANCE")
+    p, _ = make(*(["ERROR_NO_BALANCE"] * 6))
     with pytest.raises(InsufficientBalance):
         p.buy_number("telegram")
 

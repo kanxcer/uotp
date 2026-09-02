@@ -34,7 +34,7 @@ def test_defaults_are_sane(monkeypatch):
     assert s.fees.gst_rate == Decimal(0)
     assert s.fees.gst_inclusive is True
     assert s.engine.retry_cap == 3
-    assert s.engine.default_country == "in"
+    assert s.engine.default_country == "22"  # uotp.store handler_api: India
     assert not s.has_telegram
 
 

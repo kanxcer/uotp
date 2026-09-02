@@ -28,7 +28,7 @@ from .commands import CommandRouter, Reply
 
 __all__ = ["MenuUI", "WELCOME"]
 
-WELCOME = """👋 Welcome to UOTP numbers.
+WELCOME = """👋 Welcome to YCOTP numbers.
 
 Get a real phone number, receive your OTP in Telegram, pay only on success.
 Prices include everything — no hidden fees, and a failed order refunds itself
@@ -120,6 +120,7 @@ class MenuUI:
         #: set by the owner from inside the bot and persisted in the wallet
         #: store's kv table -- it survives redeploys, unlike disk files.
         self.pay_upi_id = pay_upi_id.strip()
+        self._maintenance_memory = False  # in-memory fallback if no kv store
         #: user_id -> [(timestamp, slug, ok, one-line summary)].
         #: Session-scoped by design; say that on the screen.
         self._history: dict[str, list[tuple[float, str, bool, str]]] = {}
@@ -135,6 +136,29 @@ class MenuUI:
     def _store(self):
         """The wallet store backing top-ups, or None in dict-mode (tests/dev)."""
         return getattr(self.router, "wallets", None)
+
+    def maintenance_on(self) -> bool:
+        """True while the owner has paused buying (admin panel toggle)."""
+        store = self._store_for_kv()
+        if store is not None:
+            return (store.kv_get("maintenance") or "0") == "1"
+        return self._maintenance_memory
+
+    def _toggle_maintenance(self) -> bool:
+        """Flip the flag; returns the new state. Persisted across redeploys."""
+        new = not self.maintenance_on()
+        store = self._store_for_kv()
+        if store is not None:
+            store.kv_set("maintenance", "1" if new else "0")
+        self._maintenance_memory = new
+        return new
+
+    def _store_for_kv(self):
+        store = self._store
+        if store is not None and callable(getattr(store, "kv_get", None)) \
+                and callable(getattr(store, "kv_set", None)):
+            return store
+        return None
 
     def _qr_file_id(self) -> Optional[str]:
         store = self._store
@@ -213,8 +237,14 @@ class MenuUI:
         if self.router._is_owner(user_id):
             rows.append((("📊 Owner: profit & health", "a"),))
         count = len(self.catalog)
+        banner = (
+            "🛠 Maintenance in progress — buying is paused, everything else is open.\n\n"
+            if self.maintenance_on() and not self.router._is_owner(user_id)
+            else ""
+        )
         return Reply(
-            "✳️ UOTP Numbers\n\n"
+            f"{banner}"
+            "✳️ YCOTP Numbers\n\n"
             f"⚡ {count:,} services · 🇮🇳 real SIMs · 🛟 auto-refund if no OTP\n"
             f"💰 Your balance: {balance}\n\n"
             "What would you like to do? (or just type a service name)",
@@ -294,9 +324,20 @@ class MenuUI:
                 rows=((("🛒 Browse", "l"),),),
             )
         cost = self.catalog.get(slug)
-        advice = self.pricer.price(cost)
         balance = self.router.balance_of(user_id)
         options = self.catalog.servers_for(slug)
+
+        serve = getattr(self.router.engine.provider, "can_serve", None)
+        if callable(serve) and not serve(slug) and not self.router._is_owner(user_id):
+            return Reply(
+                f"😔 {cost.name} numbers are temporarily unavailable from our "
+                "supplier — this one isn't listed as buyable, so you never pay "
+                "for a number that can't arrive.",
+                ok=False,
+                rows=((("🛒 Browse services", "l"), ("🏠 Menu", "m")),),
+            )
+
+        advice = self.pricer.price(cost)
 
         if not options:
             # Flat catalogue (tests/dev): single buy button as before.
@@ -542,12 +583,14 @@ class MenuUI:
             f"📈 Net profit: {pnl['net_profit']}"
             f"{float_line}\n"
             f"💳 Payments waiting: {len(pending)}\n"
-            f"🖼 Payment QR: {qr_state}\n\n"
+            f"🖼 Payment QR: {qr_state}\n"
+            f"🛠 Maintenance: {'🟢 ON — buying paused for customers' if self.maintenance_on() else '⚪ off'}\n\n"
             "Full P&L: /report · Health: /status",
             rows=(
                 ((f"🧾 Top-ups ({len(pending)} pending)", "a:t"),),
                 (("📦 Orders & per-order profit", "a:o"),),
-                (("🖼 Payment QR", "a:qr"), ("🏠 Menu", "m")),
+                (("🛠 Toggle maintenance", "a:mm"), ("🖼 Payment QR", "a:qr")),
+                (("🏠 Menu", "m"),),
             ),
         )
 
@@ -698,6 +741,17 @@ class MenuUI:
                 return self.qr_screen(user_id)
             if parts[1] == "o":
                 return self.orders_screen(user_id)
+            if parts[1] == "mm":
+                if not self.router._is_owner(user_id):
+                    return Reply("Owner only.", ok=False, rows=((("🏠 Menu", "m"),),))
+                on = self._toggle_maintenance()
+                text = (
+                    "🛠 Maintenance ON — customers see the paused banner and "
+                    "can't buy. You (owner) still can, to test."
+                    if on else
+                    "✅ Maintenance OFF — buying is live again."
+                )
+                return Reply(text, rows=((("◀️ Owner panel", "a"),),))
             return self._badtap()
         if kind == "l":
             return self.services_grid(user_id, page=_int(parts[1], 0) if len(parts) == 2 else 0)
@@ -741,6 +795,14 @@ class MenuUI:
         if not self.catalog.has(slug):
             return Reply("That service just left the catalogue. Refreshed list:",
                          ok=False, rows=((("🛒 Browse", "l"),),))
+        if self.maintenance_on() and not self.router._is_owner(user_id):
+            # Gate the tap itself: no placeholder, no debit, no confusion.
+            return Reply(
+                "🛠 Maintenance in progress — purchases are paused for a few "
+                "minutes. Nothing was charged; please try again shortly.",
+                ok=False,
+                rows=((("🏠 Menu", "m"),),),
+            )
         opt = self.catalog.server_option(slug, server) if server else None
         if server and opt is None:
             return Reply("That server just sold out. Refreshed list:",

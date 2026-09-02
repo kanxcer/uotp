@@ -864,7 +864,7 @@ def test_cancel_from_midflow_works_through_the_router():
         assert "Cancelled" in reply.text
         assert registry.count() == 0
         # and plain text after cancelling goes back to help, not into the flow
-        assert "UOTP bot" in router.handle("111", "random text").text
+        assert "YCOTP bot" in router.handle("111", "random text").text
     finally:
         ledger.close()
 
