@@ -66,14 +66,20 @@ def test_outsider_is_refused(rig):
 def test_list_shows_prices(rig):
     router, _, _ = rig
     reply = router.handle(USER, "/list")
-    assert "Telegram" in reply.text and "Binance" in reply.text
+    # /list renders the tappable shop grid: every service on a button,
+    # price printed on it. (Full menu-tree coverage lives in test_ui.py.)
+    labels = [label for row in reply.rows for label, _ in row]
+    assert any("Telegram" in label for label in labels)
+    assert any("Binance" in label for label in labels)
+    assert any("s:telegram" == data for row in reply.rows for _, data in row)
 
 
 def test_list_filters_by_category(rig):
     router, _, _ = rig
     reply = router.handle(USER, "/list crypto")
-    assert "Binance" in reply.text
-    assert "Telegram" not in reply.text
+    labels = [label for row in reply.rows for label, _ in row]
+    assert any("Binance" in label for label in labels)
+    assert not any("Telegram ·" in label for label in labels)
 
 
 def test_list_unknown_category(rig):

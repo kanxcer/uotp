@@ -43,13 +43,24 @@ class Reply:
     """A handler's response.
 
     ``buttons`` are ``(label, callback_data)`` pairs the transport renders as
-    an inline keyboard. Keeping them on the reply rather than in the transport
-    is what lets the whole createbot conversation be tested without Telegram.
+    an inline keyboard, one per row. ``rows`` is the same but pre-arranged
+    into rows (the menu grid puts two service buttons side by side); when
+    set it wins over ``buttons``. Keeping layout on the reply rather than in
+    the transport is what lets the whole conversation be tested without
+    Telegram.
+
+    ``deferred`` marks slow work: the transport edits in the placeholder
+    ``text`` immediately, then runs this callable off the event loop and
+    edits the message again with the returned reply. Purchases use it --
+    an OTP wait can run minutes, and blocking the poller for that long
+    freezes every other customer.
     """
 
     text: str
     ok: bool = True
     buttons: tuple[tuple[str, str], ...] = ()
+    rows: tuple[tuple[tuple[str, str], ...], ...] = ()
+    deferred: Optional[Callable[[str], "Reply"]] = None
 
 
 class CommandRouter:
@@ -185,15 +196,15 @@ class CommandRouter:
         return Reply(f"Balance: {self.balance_of(user_id)}")
 
     def cmd_list(self, user_id: str, args: list[str]) -> Reply:
+        """/list shows the tappable shop grid (it IS the list)."""
+        from .ui import MenuUI  # local: avoids an import cycle at module level
+
         category = args[0].lower() if args else None
-        rows = [
-            f"{s.name} - {self.pricer.price(s).gross_price}"
-            for s in self.catalog.services()
-            if category is None or s.category == category
-        ]
-        if not rows:
+        if category is not None and not any(
+            s.category == category for s in self.catalog.services()
+        ):
             return Reply(f"No services in category {category!r}.", ok=False)
-        return Reply("Available services:\n" + "\n".join(rows))
+        return MenuUI(self).services_grid(user_id, category)
 
     def cmd_price(self, user_id: str, args: list[str]) -> Reply:
         if not args:

@@ -231,10 +231,13 @@ def _run_subbot(bot, router, settings: Settings) -> None:
 
     if not HAS_TELEGRAM:
         raise RuntimeError("python-telegram-bot is not installed")
-    from telegram.ext import Application, MessageHandler, filters
+    from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filters
 
+    # Sub-bots get the same button UI; their router has subbots=None, so the
+    # nested "Run your own bot" entry hides itself automatically.
     frontend = TelegramFrontend(router)
     app = Application.builder().token(bot.bot_token).build()
+    app.add_handler(CallbackQueryHandler(frontend.on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, frontend.on_message))
     app.add_handler(MessageHandler(filters.COMMAND, frontend.on_message))
     # stop_signals=(): same reason as bot.telegram -- we run in a background
