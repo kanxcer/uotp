@@ -168,20 +168,29 @@ def test_empty_catalog_summary():
 # --------------------------------------------------------- bundled data file
 def test_bundled_catalog_loads_with_real_prices():
     catalog = load_catalog()
-    assert len(catalog) >= 30
-    # The real floor on uotp.in is Rs.10, not the advertised Rs.2.
-    assert catalog.cheapest_price() == INR(10)
-    assert catalog.get("telegram").list_price == INR(10)
-    assert catalog.get("whatsapp").list_price == INR(12)
-    assert catalog.get("google").list_price == INR(15)
-    assert catalog.get("binance").list_price == INR(22)
+    # The catalogue now mirrors the uotp.store dashboard inventory
+    # (1,047 service codes, live prices fetched 2026-09-02).
+    assert len(catalog) >= 1000
+    # Sub-Rs.10 charges are real in the current inventory (JustDial 2.79,
+    # Paytm 8.57), so the old Rs.10 floor is gone; prices are simply sane.
+    assert INR(1) < catalog.get("google").list_price <= INR(15)
+    assert catalog.cheapest_price().paise > 0
+    # Legacy uotp.in-only services (telegram/whatsapp/etc.) are NOT in the
+    # current sellable inventory; they must not be offered.
+    for gone in ("telegram", "whatsapp", "snapchat", "binance"):
+        assert not catalog.has(gone), gone
 
 
 def test_no_service_is_priced_at_the_advertised_two_rupees():
-    """The whole reason this catalogue exists."""
+    """The whole reason this catalogue exists: the teaser price is fiction.
+
+    Sub-Rs.10 charges are real in the live inventory (JustDial 2.79, Paytm
+    8.57), but the marketed "from Rs.2" never appears as an actual quote.
+    """
     catalog = load_catalog()
     for service in catalog.services():
-        assert service.list_price >= INR(10), f"{service.slug} priced below the Rs.10 floor"
+        assert service.list_price != INR(2), f"{service.slug} at the teaser price"
+        assert service.list_price >= catalog.min_charge, f"{service.slug} below the floor"
 
 
 def test_sticker_price_applies_the_minimum_charge():
@@ -200,6 +209,6 @@ def test_best_pack_is_the_pro_pack():
 
 def test_slug_lookup_is_forgiving():
     catalog = load_catalog()
-    assert catalog.get("WhatsApp").slug == "whatsapp"
-    assert catalog.get(" TWITTER ").slug == "twitter"
-    assert "whatsapp" in catalog
+    assert catalog.get("Google").slug == "google"
+    assert catalog.get(" IRCTC ").slug == "irctc"
+    assert "paytm" in catalog

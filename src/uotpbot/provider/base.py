@@ -169,7 +169,8 @@ class Provider(Protocol):
         ...
 
     def buy_number(
-        self, service: str, country: str = "in", *, idempotency_key: Optional[str] = None
+        self, service: str, country: str = "in", *,
+        idempotency_key: Optional[str] = None, server: str = "",
     ) -> NumberAllocation: ...
 
     def get_sms(self, order_id: str) -> Sequence[SmsMessage]: ...

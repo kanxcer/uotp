@@ -231,3 +231,37 @@ explicitly sell reseller and API access. **Confirm your account's terms
 actually permit automated resale before pointing it at UOTP in production.**
 Nothing in this repo is specific to UOTP beyond the price catalogue and the
 default endpoint paths.
+
+## 2026-09-02 — uotp.store dashboard catalogue (live export)
+
+The website's frontend API is not documented, but every call it makes is
+enumerable from its JS bundles. Using a spare account we verified:
+
+- `POST /api/auth/login` -> `{token: <JWT>}` (rate-limited aggressively;
+  ~2k rapid calls trips a 403 WAF for a while — go gently)
+- `GET  /api/product/getServices` (POST + Bearer) -> **1,047 service codes**
+- `GET  /api/product/getCountries?service=<code>` -> country list per service
+  (India = code `22`, dialcode 91); many India-market services are India-only
+- `GET  /api/product/getServers?service=<code>&country=22` -> live server rows
+  with `price` (INR), `stock`, `serverid`, plus a `score`/`isBest` quality rank
+
+Facts that replace the old uotp.in picture:
+
+1. **The sellable inventory is 1,047 service codes, not 32.** The earlier
+   `data/uotp_prices.csv` (from uotp.in/services, 2026-09-01) was that site's
+   curated marketing list. The real store sells hundreds of Indian-market
+   services (swiggy, zomato, irctc, phonepe, jio family, meesho, dream11
+   clones, and a very long tail of betting/gaming brands).
+2. **telegram / whatsapp / snapchat / steam / binance are NOT in the current
+   inventory at all** (present on uotp.in; absent from uotp.store's catalog —
+   `getCountries?service=telegram` -> "Invalid Service Code"). Be careful with
+   name collisions: code `telegraph` displays as "Telegram" (it is the
+   Telegraph app). Listing them anyway would sell numbers we cannot fulfil.
+3. Prices are **per (service, country, server)** with stock + a quality score.
+   Cheapest today: JustDial ₹2.79, Imo ₹3.29, Discord ₹7.14; the bulk sit at
+   ₹10. The advertised "from ₹2" is approached but nobody quotes flat ₹2.00.
+4. The legacy `handler_api.php` still answers `getBalance` (wallet ₹10 ✓, key
+   valid) but `getPrices` returns NO_CONNECTION for every country/operator
+   combination tried, and `getNumber` rejects the old slugs with BAD_SERVICE.
+   The dashboard's own `buyNumber` endpoint uses the code/serverid/country
+   vocabulary above — that is the purchase vocabulary going forward.

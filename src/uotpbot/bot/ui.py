@@ -74,7 +74,9 @@ _CATEGORY_EMOJI: dict[str, str] = {
     "messaging": "💬", "social": "🌐", "dating": "❤️", "transport": "🚗",
     "gaming": "🎮", "food": "🍔", "travel": "✈️", "entertainment": "🎬",
     "tech": "💻", "shopping": "🛍️", "crypto": "🪙", "finance": "🏦",
-    "professional": "💼", "other": "📦",
+    "professional": "💼", "other": "📦", "betting": "🎰", "payments": "💸",
+    "trading": "📈", "edtech": "📚", "govt": "🏛️", "jobs": "💼",
+    "health": "💊", "streaming": "📺",
 }
 
 # A number is live this long; mirrored from catalog constants so the UI
