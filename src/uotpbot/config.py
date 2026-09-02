@@ -125,6 +125,9 @@ class Settings:
     #: strategy). 0.10 = you keep ~10% of each sale after every cost. Deliberately
     #: an env var: this is a business decision, not a code constant.
     pricing_target_margin: Decimal = Decimal("0.35")
+    #: Who customers contact to add money to their wallet (e.g. "@you" or a
+    #: link). Shown on the balance screen; empty falls back to "the bot owner".
+    support_contact: str = ""
 
     @property
     def has_telegram(self) -> bool:
@@ -211,6 +214,7 @@ def from_environment(env_file: Optional[Path | str] = None) -> Settings:
         whitelabel_enabled=_bool("WHITELABEL_ENABLED", False),
         platform_fee_rate=_fee_rate(_get("PLATFORM_FEE_RATE", "0.05")),
         pricing_target_margin=_fraction("PRICING_TARGET_MARGIN", "0.35"),
+        support_contact=_get("SUPPORT_CONTACT", ""),
     )
 
 

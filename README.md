@@ -276,7 +276,7 @@ src/uotpbot/
   whitelabel.py  sub-bot records, the disclosed fee policy, poller manager
   createbot.py   the /createbot conversation, terms shown before creation
   provider/      base protocol, UOTP HTTP adapter, deterministic mock
-  bot/           transport-free command router + thin Telegram shell
+  bot/           command router, guided button UI (ui.py), thin Telegram shell
 src/uotpbot/data/uotp_prices.csv   real uotp.in prices (transcribed 2026-09-01)
 docs/RESEARCH.md       what the provider actually charges, with evidence
 ```
