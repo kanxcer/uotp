@@ -98,6 +98,15 @@ class Settings:
     allowed_users: tuple[str, ...] = ()
     owner_id: str = ""
     ledger_path: str = "ledger.db"
+    #: Postgres connection string. When set, BOTH the ledger and the sub-bot
+    #: registry live there instead of sqlite -- they must share one durability
+    #: story, because a registry that outlives the ledger keeps charging fees
+    #: against books that no longer exist. On Render's free tier (no disk)
+    #: this is the only configuration whose audit trail survives a deploy.
+    database_url: str = ""
+    #: Schema the app's tables live in. A dedicated schema keeps the ledger
+    #: off PostgREST's default surface and cleanly nameable in backups.
+    database_schema: str = "uotp"
     prices_path: Optional[str] = None
     #: Where white-label sub-bot records live. Must be on the same persistent
     #: disk as the ledger: a sub-bot registry that survives a redeploy but a
@@ -155,7 +164,10 @@ def from_environment(env_file: Optional[Path | str] = None) -> Settings:
         status_complete=_get("UOTP_STATUS_COMPLETE", "6"),
         status_cancel=_get("UOTP_STATUS_CANCEL", "8"),
         prices_country=_get("UOTP_PRICES_COUNTRY", "0"),
-        prices_operator=_get("UOTP_PRICES_OPERATOR", "any"),
+        # Numeric operator id, verified live: "any"/"0" are rejected with
+        # BAD_OPERATOR, ids >= 2 pass validation (the provider then answered
+        # NO_CONNECTION -- its own backend, not our parameters).
+        prices_operator=_get("UOTP_PRICES_OPERATOR", "2"),
         service_map=_parse_service_map(_get("UOTP_SERVICE_MAP", "")),
         balance_divisor=_decimal("UOTP_BALANCE_DIVISOR", "1"),
         timeout=float(_get("UOTP_TIMEOUT", "30")),
@@ -188,6 +200,8 @@ def from_environment(env_file: Optional[Path | str] = None) -> Settings:
         allowed_users=allowed,
         owner_id=_get("TELEGRAM_OWNER_ID", ""),
         ledger_path=_get("LEDGER_PATH", "ledger.db"),
+        database_url=_get("DATABASE_URL", ""),
+        database_schema=_get("DATABASE_SCHEMA", "uotp"),
         prices_path=_get("PRICES_PATH") or None,
         subbots_path=_get("SUBBOTS_PATH", "subbots.db"),
         whitelabel_enabled=_bool("WHITELABEL_ENABLED", False),
