@@ -237,7 +237,9 @@ def _run_subbot(bot, router, settings: Settings) -> None:
     app = Application.builder().token(bot.bot_token).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, frontend.on_message))
     app.add_handler(MessageHandler(filters.COMMAND, frontend.on_message))
-    app.run_polling()
+    # stop_signals=(): same reason as bot.telegram -- we run in a background
+    # thread, and PTB's default signal handlers only work in the main thread.
+    app.run_polling(stop_signals=())
 
 
 def _check(settings: Settings) -> int:
