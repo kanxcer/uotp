@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 from .cli import main as cli_main
 from .config import ConfigError, Settings, from_environment
 from .engine import BotEngine
+from .money import Rate
 from .provider.base import ProviderError, ServiceUnavailable
 from .pricing import Pricer
 from .store import backend_name, make_ledger, make_registry
@@ -64,7 +65,10 @@ def _build(settings: Settings):
     if not settings.database_url:
         # With Postgres the durability story is the database's, not the disk's.
         _warn_if_ephemeral(settings.ledger_path)
-    pricer = Pricer(catalog, fees=settings.fees)
+    pricer = Pricer(
+        catalog, fees=settings.fees,
+        target_margin=Rate(str(settings.pricing_target_margin)),
+    )
     engine = BotEngine(
         catalog, provider, ledger, pricer, fees=settings.fees, config=settings.engine
     )

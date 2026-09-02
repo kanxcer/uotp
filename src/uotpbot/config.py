@@ -121,6 +121,10 @@ class Settings:
     #: quietly change after the fact, because the agreed figure is stored per
     #: sub-bot in the registry.
     platform_fee_rate: Decimal = Decimal("0.05")
+    #: Your margin over true cost when pricing services (target-margin
+    #: strategy). 0.10 = you keep ~10% of each sale after every cost. Deliberately
+    #: an env var: this is a business decision, not a code constant.
+    pricing_target_margin: Decimal = Decimal("0.35")
 
     @property
     def has_telegram(self) -> bool:
@@ -206,7 +210,23 @@ def from_environment(env_file: Optional[Path | str] = None) -> Settings:
         subbots_path=_get("SUBBOTS_PATH", "subbots.db"),
         whitelabel_enabled=_bool("WHITELABEL_ENABLED", False),
         platform_fee_rate=_fee_rate(_get("PLATFORM_FEE_RATE", "0.05")),
+        pricing_target_margin=_fraction("PRICING_TARGET_MARGIN", "0.35"),
     )
+
+
+def _fraction(name: str, default: str) -> Decimal:
+    """Parse a (0, 1) fraction env var; reject nonsense at startup."""
+    raw = _get(name, default)
+    try:
+        value = Decimal(raw)
+    except ArithmeticError as exc:
+        raise ConfigError(f"{name}={raw!r} is not a valid decimal") from exc
+    if not (Decimal(0) < value < Decimal(1)):
+        raise ConfigError(
+            f"{name}={raw} must be a fraction strictly between 0 and 1 "
+            "(e.g. 0.10 for a 10% margin)"
+        )
+    return value
 
 
 def _fee_rate(raw: str) -> Decimal:
