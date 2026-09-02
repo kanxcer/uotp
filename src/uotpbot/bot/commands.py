@@ -251,36 +251,64 @@ class CommandRouter:
     def cmd_buy(self, user_id: str, args: list[str]) -> Reply:
         if not args:
             return Reply("Usage: /buy <service>", ok=False)
-        slug = args[0]
+        return self.purchase(user_id, args[0])
+
+    def purchase(self, user_id: str, slug: str, *, server: str = "") -> Reply:
+        """THE money path -- /buy and every ✅ Buy tap both end up here.
+
+        Single entry point on purpose: wallet guard, debit, fulfilment,
+        refund and the durable order record must never be able to disagree,
+        so there is exactly one implementation to test.
+        """
         if not self.catalog.has(slug):
             return Reply(f"Unknown service {slug!r}. Try /list.", ok=False)
 
-        price, _ = self.engine.quote(slug)
+        price, _ = self.engine.quote(slug, server=server or None)
         balance = self.balance_of(user_id)
         if balance.paise < price.paise:
             short = price - balance
             return Reply(
-                f"{slug} costs {price}; your balance is {balance}. "
-                f"Top up at least {short} more.",
+                f"That costs {price}; your balance is {balance}. "
+                f"Top up at least {short} more (💰 Balance → ➕ Add money).",
                 ok=False,
             )
 
         # Debit first: if the purchase then fails, the refund path restores it.
         self._debit(user_id, price)
-        result = self.engine.fulfil(user_id, slug)
+        result = self.engine.fulfil(user_id, slug, gross_price=price,
+                                    server=server or None)
+        self._record_order(user_id, slug, price, result)
         if result.success:
             return Reply(
-                f"OTP for {slug}: {result.otp}\nNumber: {result.phone}\n"
-                f"Charged {price}. Remaining balance {self.balance_of(user_id)}."
+                f"✅ OTP for {self.catalog.get(slug).name}: {result.otp}\n"
+                f"📱 Number: {result.phone}\n\n"
+                f"Charged {price} · Balance {self.balance_of(user_id)}"
             )
         # Failed: put the money back so the customer is never out of pocket.
         if result.refunded.paise > 0:
             self.credit(user_id, result.refunded)
         return Reply(
-            f"No OTP arrived for {slug}. Refunded {result.refunded}; "
+            f"⚠️ No OTP arrived for {slug}. Refunded {result.refunded} in full; "
             f"balance {self.balance_of(user_id)}.",
             ok=False,
         )
+
+    def _record_order(self, user_id: str, slug: str, price: Money, result) -> None:
+        """Persist a durable order row for history + per-order profit.
+
+        Display cache ONLY -- the ledger stays the source of truth for money;
+        this exists so /metrics, history and the owner panel can answer
+        "what happened per order" without parsing journal lines.
+        """
+        store = self.wallets
+        rec = getattr(store, "record_order", None)
+        if not callable(rec):
+            return
+        try:
+            rec(user_id=user_id, slug=slug, amount=price, phone=result.phone or "",
+                otp=result.otp or "", success=result.success, profit=result.profit)
+        except Exception:  # never let the receipt printer block a delivery
+            pass
 
     # -- white-label -----------------------------------------------------
     def cmd_createbot(self, user_id: str, args: list[str]) -> Reply:

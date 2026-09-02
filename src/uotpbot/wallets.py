@@ -26,7 +26,7 @@ from .money import Money
 
 __all__ = [
     "WalletStore", "SqliteWallets", "PostgresWallets", "ScopedWallets",
-    "WalletError", "Topup",
+    "WalletError", "Topup", "OrderRow",
 ]
 
 
@@ -98,6 +98,18 @@ class ScopedWallets(WalletStore):
     def kv_set(self, key, value):
         self._inner.kv_set(f"{self._scope}:{key}", value)
 
+    def record_order(self, *, user_id, slug, amount, phone="", otp="",
+                     success=False, profit=Money(0)):
+        self._inner.record_order(user_id=user_id, slug=slug, amount=amount,
+                                 phone=phone, otp=otp, success=success,
+                                 profit=profit, scope=self._scope)
+
+    def recent_orders(self, *, user_id: str = "", limit: int = 10):
+        return self._inner.recent_orders(scope=self._scope, user_id=user_id, limit=limit)
+
+    def float_stats(self):
+        return self._inner.float_stats(scope=self._scope)
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS {t} (
@@ -122,12 +134,53 @@ CREATE TABLE IF NOT EXISTS {t} (
 )
 """
 
+_ORDERS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS {t} (
+    {pk}
+    scope TEXT NOT NULL DEFAULT '',
+    user_id TEXT NOT NULL,
+    slug TEXT NOT NULL,
+    gross_paise INTEGER NOT NULL,
+    phone TEXT NOT NULL DEFAULT '',
+    otp TEXT NOT NULL DEFAULT '',
+    success INTEGER NOT NULL CHECK (success IN (0, 1)),
+    profit_paise INTEGER NOT NULL DEFAULT 0,
+    ts REAL NOT NULL
+)
+"""
+
 _KV_SCHEMA = """
 CREATE TABLE IF NOT EXISTS {t} (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 )
 """
+
+
+@dataclass(frozen=True, slots=True)
+class OrderRow:
+    """One customer order, for history and the owner's per-order P&L view.
+
+    Display cache only: the double-entry ledger remains the source of truth
+    for money. This table answers "what did each order earn" without mining
+    journal lines.
+    """
+
+    id: int
+    user_id: str
+    slug: str
+    gross: Money
+    phone: str
+    otp: str
+    success: bool
+    profit: Money
+    ts: float
+
+    @property
+    def profit_ratio(self) -> Optional[float]:
+        if self.gross.paise <= 0:
+            return None
+        return round(self.profit.paise / self.gross.paise, 3)
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,6 +214,9 @@ class SqliteWallets(WalletStore):
                 _TOPUPS_SCHEMA.format(t="topups", pk="id INTEGER PRIMARY KEY AUTOINCREMENT,")
             )
             self._conn.execute(_KV_SCHEMA.format(t="kv"))
+            self._conn.execute(
+                _ORDERS_SCHEMA.format(t="orders", pk="id INTEGER PRIMARY KEY AUTOINCREMENT,")
+            )
             self._conn.commit()
 
     # -- payment top-ups ---------------------------------------------------
@@ -230,6 +286,47 @@ class SqliteWallets(WalletStore):
                 (key, value),
             )
 
+    # -- orders + float stats ----------------------------------------------
+    def record_order(self, *, user_id: str, slug: str, amount: Money,
+                     phone: str = "", otp: str = "", success: bool = False,
+                     profit: Money = Money(0), scope: str = "") -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO orders(scope, user_id, slug, gross_paise, phone, otp,"
+                " success, profit_paise, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (scope, user_id, slug, amount.paise, phone, otp,
+                 1 if success else 0, profit.paise, time.time()),
+            )
+
+    def recent_orders(self, *, scope: str = "", user_id: str = "", limit: int = 10
+                      ) -> list[OrderRow]:
+        sql = ("SELECT id, user_id, slug, gross_paise, phone, otp, success,"
+               " profit_paise, ts FROM orders WHERE scope = ?")
+        params: list = [scope]
+        if user_id:
+            sql += " AND user_id = ?"
+            params.append(user_id)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [OrderRow(r[0], r[1], r[2], Money(r[3]), r[4], r[5], bool(r[6]),
+                         Money(r[7]), r[8]) for r in rows]
+
+    def float_stats(self, *, scope: str = "") -> dict[str, object]:
+        """Customer float: what we OWE users right now."""
+        like = (scope + ":%") if scope else None
+        with self._lock:
+            if like:
+                row = self._conn.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(balance_paise), 0) FROM wallets"
+                    " WHERE user_id LIKE ?", (like,)).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(balance_paise), 0) FROM wallets"
+                    " WHERE user_id NOT LIKE '%:%'").fetchone()
+        return {"users": int(row[0]), "float": Money(int(row[1]))}
+
     def balance(self, user_id: str) -> Money:
         with self._lock:
             row = self._conn.execute(
@@ -294,6 +391,9 @@ class PostgresWallets(WalletStore):
             self._conn.execute(_TOPUPS_SCHEMA.format(
                 t=self._tt, pk="id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"))
             self._conn.execute(_KV_SCHEMA.format(t=self._tk))
+            self._to = f"{schema}.orders"
+            self._conn.execute(_ORDERS_SCHEMA.format(
+                t=self._to, pk="id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"))
 
     # -- payment top-ups ---------------------------------------------------
     def create_topup(
@@ -361,6 +461,46 @@ class PostgresWallets(WalletStore):
                 "ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value",
                 (key, value),
             )
+
+    # -- orders + float stats ----------------------------------------------
+    def record_order(self, *, user_id: str, slug: str, amount: Money,
+                     phone: str = "", otp: str = "", success: bool = False,
+                     profit: Money = Money(0), scope: str = "") -> None:
+        with self._lock:
+            self._conn.execute(
+                f"INSERT INTO {self._to}(scope, user_id, slug, gross_paise, phone, otp,"
+                f" success, profit_paise, ts) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (scope, user_id, slug, amount.paise, phone, otp,
+                 success, profit.paise, time.time()),
+            )
+
+    def recent_orders(self, *, scope: str = "", user_id: str = "", limit: int = 10
+                      ) -> list[OrderRow]:
+        sql = (f"SELECT id, user_id, slug, gross_paise, phone, otp, success,"
+               f" profit_paise, ts FROM {self._to} WHERE scope = %s")
+        params: list = [scope]
+        if user_id:
+            sql += " AND user_id = %s"
+            params.append(user_id)
+        sql += " ORDER BY id DESC LIMIT %s"
+        params.append(limit)
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [OrderRow(r[0], r[1], r[2], Money(r[3]), r[4], r[5], bool(r[6]),
+                         Money(r[7]), r[8]) for r in rows]
+
+    def float_stats(self, *, scope: str = "") -> dict[str, object]:
+        like = (scope + ":%") if scope else None
+        with self._lock:
+            if like:
+                row = self._conn.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(balance_paise), 0) FROM"
+                    f" {self._t} WHERE user_id LIKE %s", (like,)).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(balance_paise), 0) FROM"
+                    f" {self._t} WHERE user_id NOT LIKE '%:%'").fetchone()
+        return {"users": int(row[0]), "float": Money(int(row[1]))}
 
     def balance(self, user_id: str) -> Money:
         with self._lock:
