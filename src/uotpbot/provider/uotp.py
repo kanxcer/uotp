@@ -1,19 +1,27 @@
-"""UOTP HTTP adapter.
+"""UOTP adapter for the ``handler_api.php`` protocol.
 
-UOTP does not publish API documentation, so rather than guess an endpoint
-shape and ship something that quietly breaks, this adapter takes three things
-from configuration:
+Verified against the live endpoint on 2026-09-02. This is **not** a JSON API.
+It is the SMS-Activate-family protocol:
 
-* **paths** -- where each operation lives,
-* **auth**    -- header name and whether the key needs a ``Bearer`` prefix,
-* **field map** -- which JSON keys hold balance, order id, phone, SMS body.
+* every call is a **GET** with the action and key in the query string;
+* responses are **plain text**, ``PREFIX:field:field``, one line, no JSON.
 
-Set them in ``.env`` / ``config.yaml`` against your real account and the
-adapter works without code edits. :meth:`UotpProvider.probe` hits the balance
-endpoint once at startup and raises a clear error if the shape does not match,
-so a wrong mapping fails loudly at boot instead of mid-order.
+Confirmed by a real request::
 
-Only the standard library is used, so there is no dependency to drift.
+    GET .../handler_api.php?action=getBalance&api_key=...
+    -> ACCESS_BALANCE:0
+
+Because a response body like ``ACCESS_NUMBER:12345:+919876543210`` carries
+colons *inside* the payload, parsing splits on the first colon only and then
+tokenises the remainder -- a naive ``split(":")`` into three fields would
+mangle any value that itself contains a colon (a UPI VPA, a URL, a code with
+a separator).
+
+Only ``getBalance`` is documented by the provider. The remaining actions
+follow the conventions of this protocol family and are therefore **inferred**;
+every action name and response prefix is configurable so a divergence is a
+config change, not a code change. :meth:`UotpProvider.probe` verifies the key
+and the balance prefix at startup.
 """
 
 from __future__ import annotations
@@ -23,13 +31,13 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Optional, Sequence
 
 from ..catalog import PROVIDER_VALIDITY_MINUTES
-from ..money import INR, Money, quantize_money
+from ..money import Money, quantize_money
 from .base import (
     AuthError,
     Balance,
@@ -43,402 +51,478 @@ from .base import (
     SmsMessage,
 )
 
-__all__ = ["UotpConfig", "UotpProvider", "ResponseShape", "DEFAULT_SHAPE"]
+__all__ = [
+    "UotpConfig",
+    "UotpProvider",
+    "ApiResponse",
+    "parse_response",
+    "ERROR_TOKENS",
+]
 
 JSON = dict[str, Any]
 
 
+# --------------------------------------------------------------- responses
 @dataclass(frozen=True, slots=True)
-class ResponseShape:
-    """Which JSON keys to read. Dotted paths supported (``data.balance``)."""
+class ApiResponse:
+    """A parsed ``PREFIX:a:b:c`` line.
 
-    balance: str = "balance"
-    balance_currency: str = "currency"
-    order_id: str = "id"
-    phone: str = "number"
-    charged: str = "price"
-    sms_list: str = "messages"
-    sms_text: str = "text"
-    sms_sender: str = "sender"
-    sms_time: str = "created_at"
-    prices: str = "prices"
-    #: Key the provider uses to signal failure, and the message beside it.
-    error: str = "error"
-    error_message: str = "message"
-    status: str = "status"
-    ok_value: str = "success"
+    ``status`` is the token before the first colon. ``fields`` are the
+    colon-separated tokens after it, in order. ``raw`` is kept for error
+    messages, because this protocol signals failure in the same shape as
+    success and the original text is often the only useful diagnostic.
+    """
 
+    status: str
+    fields: tuple[str, ...]
+    raw: str
 
-DEFAULT_SHAPE = ResponseShape()
+    @property
+    def is_error(self) -> bool:
+        return self.status in ERROR_TOKENS
 
-
-def _dig(payload: Any, dotted: str) -> Any:
-    """Fetch ``a.b.c`` out of nested dicts, returning None if absent."""
-    cur = payload
-    for part in dotted.split("."):
-        if isinstance(cur, Mapping) and part in cur:
-            cur = cur[part]
-        else:
-            return None
-    return cur
+    def field(self, index: int, default: str = "") -> str:
+        """The ``index``-th payload field, or ``default`` if absent."""
+        return self.fields[index] if 0 <= index < len(self.fields) else default
 
 
+def parse_response(text: str) -> ApiResponse:
+    """Parse one protocol line.
+
+    Splits on the *first* colon only, so payloads containing colons survive.
+    A body with no colon is a bare status token (``STATUS_WAIT_CODE``), which
+    is the common case for polling.
+    """
+    body = (text or "").strip()
+    # Some deployments wrap the line in HTML or trailing whitespace; take the
+    # first non-empty line and strip stray markup.
+    for line in body.splitlines():
+        candidate = line.strip().strip("<>").strip()
+        if candidate:
+            body = candidate
+            break
+    if not body:
+        raise ProviderError("provider returned an empty response")
+    if ":" in body:
+        status, _, rest = body.partition(":")
+        return ApiResponse(status.strip(), tuple(rest.split(":")), body)
+    return ApiResponse(body, (), body)
+
+
+#: Failure tokens in this protocol family, mapped to what they mean here.
+ERROR_TOKENS: frozenset[str] = frozenset({
+    "ERROR_SQL", "ERROR_KEY", "BAD_KEY", "BAD_ACTION", "BAD_STATUS",
+    "BAD_SERVICE", "ERROR_NO_NUMBERS", "ERROR_NO_BALANCE", "NO_ACTIVATION",
+    "ERROR_EMPTY_ACCOUNT", "ERROR_WRONG_ACTION", "ERROR_NO_FREE",
+    "ACCOUNT_INACTIVE", "ERROR_IP", "ERROR_NO_SERVICE",
+})
+
+#: Which exception each error token becomes.
+_FATAL_AUTH = frozenset({"ERROR_KEY", "BAD_KEY", "ERROR_IP", "ACCOUNT_INACTIVE"})
+_NO_STOCK = frozenset({"ERROR_NO_NUMBERS", "ERROR_NO_FREE", "ERROR_NO_SERVICE"})
+_NO_FUNDS = frozenset({"ERROR_NO_BALANCE", "ERROR_EMPTY_ACCOUNT"})
+_BAD_REQUEST = frozenset({"BAD_ACTION", "BAD_STATUS", "BAD_SERVICE",
+                          "NO_ACTIVATION", "ERROR_WRONG_ACTION"})
+
+
+# ------------------------------------------------------------------ config
 @dataclass(frozen=True, slots=True)
 class UotpConfig:
-    """Connection settings. Nothing here is secret except ``api_key``."""
+    """Endpoint, credentials and the protocol's vocabulary.
 
-    base_url: str = "https://uotp.store"
+    ``balance_divisor`` exists because this family of API is not consistent
+    about units: some deployments report rupees, others paise. UOTP's public
+    pricing is in rupees, so rupees is the default -- but if ``getBalance``
+    returns ``100000`` where the dashboard shows Rs.1000, set it to ``100``
+    rather than editing code. Getting this wrong is a 100x error, which is why
+    it is a named setting and not a guess buried in a function.
+    """
+
+    base_url: str = "https://uotp.store/api/stubs/handler_api.php"
     api_key: str = ""
-    #: Header the key goes in, and whether it needs a scheme prefix.
-    auth_header: str = "Authorization"
-    auth_scheme: str = "Bearer"
-    balance_path: str = "/api/v1/balance"
-    prices_path: str = "/api/v1/prices"
-    buy_path: str = "/api/v1/number"
-    sms_path: str = "/api/v1/sms"
-    cancel_path: str = "/api/v1/cancel"
-    timeout: float = 20.0
-    #: Never retry a purchase more than this. Each retry can cost real money.
+    #: The key travels as a query parameter in this protocol, not a header.
+    key_param: str = "api_key"
+    action_param: str = "action"
+    action_balance: str = "getBalance"
+    action_prices: str = "getPrices"
+    action_get_number: str = "getNumber"
+    action_get_status: str = "getStatus"
+    action_set_status: str = "setStatus"
+    action_active: str = "getActiveActivations"
+    #: Response prefixes.
+    balance_prefix: str = "ACCESS_BALANCE"
+    number_prefix: str = "ACCESS_NUMBER"
+    #: getNumber uses this prefix when it hands back a number that is already
+    #: registered on the target service -- you paid, it will not work, and it
+    #: must be treated as a burned attempt rather than a usable number.
+    cancel_prefix: str = "ACCESS_CANCEL"
+    ok_prefix: str = "STATUS_OK"
+    wait_prefix: str = "STATUS_WAIT_CODE"
+    resend_prefix: str = "STATUS_WAIT_RESEND"
+    canceled_prefix: str = "STATUS_CANCEL"
+    #: setStatus codes: 1 ready, 3 request another SMS, 6 complete, 8 cancel.
+    status_complete: str = "6"
+    status_cancel: str = "8"
+    balance_divisor: Decimal = Decimal(1)
+    timeout: float = 30.0
     max_retries: int = 2
     backoff: float = 1.5
-    shape: ResponseShape = DEFAULT_SHAPE
-    user_agent: str = "uotpbot/1.0"
     validity_minutes: int = PROVIDER_VALIDITY_MINUTES
+    user_agent: str = "uotpbot/1.1"
+    #: Extra fixed query params, e.g. a version or a partner id.
+    extra_params: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.base_url:
             raise ValueError("base_url is required")
-        object.__setattr__(self, "base_url", self.base_url.rstrip("/"))
         if self.max_retries < 0:
             raise ValueError("max_retries cannot be negative")
+        if self.balance_divisor <= 0:
+            raise ValueError(f"balance_divisor must be positive, got {self.balance_divisor}")
 
     def with_key(self, api_key: str) -> "UotpConfig":
         return replace(self, api_key=api_key)
 
 
+# ---------------------------------------------------------------- provider
 class UotpProvider:
-    """Talks to UOTP over HTTP/JSON."""
+    """Talks to UOTP's ``handler_api.php`` endpoint."""
 
     name = "uotp"
 
     def __init__(self, config: Optional[UotpConfig] = None, *, opener: Any = None) -> None:
         self.config = config or UotpConfig()
-        # ``opener`` is injectable purely so tests can supply a fake transport
-        # without monkeypatching urllib.
+        # Injectable so tests can supply a fake transport without touching
+        # urllib or the network.
         self._opener = opener or urllib.request
 
     # -- transport -------------------------------------------------------
-    def _url(self, path: str) -> str:
-        if path.startswith(("http://", "https://")):
-            return path
-        return f"{self.config.base_url}/{path.lstrip('/')}"
-
-    def _headers(self) -> dict[str, str]:
+    def _call(self, action: str, **params: Any) -> str:
+        """Issue one GET and return the raw response text."""
         c = self.config
-        headers = {
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "User-Agent": c.user_agent,
-        }
-        if c.api_key:
-            value = f"{c.auth_scheme} {c.api_key}".strip() if c.auth_scheme else c.api_key
-            headers[c.auth_header] = value
-        return headers
-
-    def _request(
-        self,
-        path: str,
-        *,
-        method: str = "GET",
-        params: Optional[Mapping[str, Any]] = None,
-        body: Optional[Mapping[str, Any]] = None,
-        extra_headers: Optional[Mapping[str, str]] = None,
-    ) -> JSON:
-        url = self._url(path)
-        if params:
-            url = f"{url}?{urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})}"
-        data = json.dumps(body).encode() if body is not None else None
-        headers = {**self._headers(), **(extra_headers or {})}
-        req = urllib.request.Request(url, data=data, headers=headers, method=method)
-
+        query: dict[str, str] = {c.action_param: action, c.key_param: c.api_key}
+        query.update({k: str(v) for k, v in c.extra_params.items()})
+        query.update(
+            {k: str(v) for k, v in params.items() if v is not None}
+        )
+        url = f"{c.base_url}?{urllib.parse.urlencode(query)}"
+        req = urllib.request.Request(
+            url, headers={"User-Agent": c.user_agent, "Accept": "text/plain"}, method="GET"
+        )
         attempt = 0
         while True:
             try:
-                with self._opener.urlopen(req, timeout=self.config.timeout) as resp:
-                    raw = resp.read().decode("utf-8", errors="replace")
-                    return self._parse(raw, resp.status)
+                with self._opener.urlopen(req, timeout=c.timeout) as resp:
+                    return resp.read().decode("utf-8", errors="replace")
             except urllib.error.HTTPError as exc:
-                raw = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
-                raise self._map_http_error(exc.code, raw) from None
-            except urllib.error.URLError as exc:
-                # Network-level failure. Safe to retry for reads; for a
-                # purchase the caller must reconcile via idempotency key.
+                body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+                raise self._map_http_error(exc.code, body) from None
+            except (urllib.error.URLError, TimeoutError) as exc:
                 attempt += 1
-                if attempt > self.config.max_retries or method == "POST":
+                reason = getattr(exc, "reason", exc)
+                if attempt > c.max_retries:
+                    # For getNumber this is the dangerous case: the number may
+                    # already be allocated and charged. Callers must reconcile
+                    # rather than retry blindly.
                     raise PurchaseTimedOut(
-                        f"{method} {path} failed after {attempt} attempt(s): {exc.reason}. "
+                        f"action={action} failed after {attempt} attempt(s): {reason}. "
                         "The request may have been processed -- reconcile before retrying."
                     ) from None
-                time.sleep(self.config.backoff**attempt)
-            except TimeoutError as exc:
-                raise PurchaseTimedOut(f"{method} {path} timed out: {exc}") from None
+                time.sleep(c.backoff**attempt)
 
-    def _parse(self, raw: str, status: int) -> JSON:
-        if not raw.strip():
-            if 200 <= status < 300:
-                return {}
-            raise ProviderError(f"empty response body with HTTP {status}")
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise ProviderError(
-                f"provider returned non-JSON (HTTP {status}): {raw[:200]!r}"
-            ) from exc
-        if not isinstance(payload, Mapping):
-            raise ProviderError(f"expected a JSON object, got {type(payload).__name__}")
-        shape = self.config.shape
-        err = _dig(payload, shape.error)
-        if err not in (None, False, "", 0):
-            message = str(_dig(payload, shape.error_message) or err)
-            low = message.lower()
-            if "balance" in low or "insufficient" in low or "funds" in low:
-                raise InsufficientBalance(message)
-            if "stock" in low or "no number" in low or "unavailable" in low:
-                raise NumberUnavailable(message)
-            if "auth" in low or "key" in low or "token" in low:
-                raise AuthError(message)
-            raise ProviderError(message)
-        return dict(payload)
-
-    def _map_http_error(self, code: int, raw: str) -> ProviderError:
-        detail = ""
-        try:
-            payload = json.loads(raw)
-            if isinstance(payload, Mapping):
-                detail = str(
-                    _dig(payload, self.config.shape.error_message)
-                    or _dig(payload, self.config.shape.error)
-                    or raw[:200]
-                )
-        except json.JSONDecodeError:
-            detail = raw[:200]
+    def _mapped_http_error(self, code: int, body: str) -> ProviderError:
+        detail = body.strip()[:200] or "no body"
         if code in (401, 403):
-            return AuthError(f"HTTP {code}: {detail or 'credentials rejected'}")
+            return AuthError(f"HTTP {code}: {detail}")
         if code == 402:
-            return InsufficientBalance(f"HTTP 402: {detail or 'insufficient balance'}")
-        if code == 404:
-            return ServiceUnavailable(f"HTTP 404: {detail or 'not found'}")
+            return InsufficientBalance(f"HTTP 402: {detail}")
         if code in (408, 425, 504):
-            return PurchaseTimedOut(f"HTTP {code}: {detail or 'gateway timeout'}")
+            return PurchaseTimedOut(f"HTTP {code}: {detail}")
         if code == 429:
-            return ServiceUnavailable(f"HTTP 429: {detail or 'rate limited'}")
+            return ServiceUnavailable(f"HTTP 429: {detail}")
         if 500 <= code < 600:
-            return ServiceUnavailable(f"HTTP {code}: {detail or 'server error'}")
-        return ProviderError(f"HTTP {code}: {detail or 'request failed'}")
+            return ServiceUnavailable(f"HTTP {code}: {detail}")
+        return ProviderError(f"HTTP {code}: {detail}")
+
+    _map_http_error = _mapped_http_error
+
+    def _request(self, action: str, **params: Any) -> ApiResponse:
+        """Call an action and translate protocol errors into exceptions."""
+        parsed = parse_response(self._call(action, **params))
+        if parsed.is_error:
+            raise self._error_for(parsed, action)
+        return parsed
+
+    def _error_for(self, parsed: ApiResponse, action: str) -> ProviderError:
+        token = parsed.status
+        detail = ":".join(parsed.fields) or token
+        message = f"provider returned {token} for action={action}" + (
+            f" ({detail})" if detail != token else ""
+        )
+        if token in _FATAL_AUTH:
+            return AuthError(message)
+        if token in _NO_FUNDS:
+            return InsufficientBalance(message)
+        if token in _NO_STOCK:
+            return NumberUnavailable(message)
+        if token in _BAD_REQUEST:
+            # NO_ACTIVATION and friends are "that order id is gone", which the
+            # caller should see as a provider error, not a stock problem.
+            return ProviderError(message)
+        return ProviderError(message)
 
     # -- Provider implementation ----------------------------------------
     def get_balance(self) -> Balance:
-        shape = self.config.shape
-        payload = self._request(self.config.balance_path)
-        raw = _dig(payload, shape.balance)
-        if raw is None:
+        """Wallet balance, from ``ACCESS_BALANCE:<amount>``."""
+        c = self.config
+        parsed = self._request(c.action_balance)
+        if parsed.status != c.balance_prefix:
             raise ProviderError(
-                f"balance response has no {shape.balance!r} key; keys were "
-                f"{sorted(payload)}. Set shape.balance to the right path."
+                f"expected {c.balance_prefix!r} but got {parsed.status!r} "
+                f"(raw: {parsed.raw!r}). Set balance_prefix to match."
             )
-        return Balance(
-            credit=_as_money(raw),
-            currency=str(_dig(payload, shape.balance_currency) or "INR"),
-        )
+        return Balance(credit=self._to_money(parsed.field(0), raw=parsed.raw))
+
+    def _to_money(self, text: str, *, raw: str = "") -> Money:
+        """Parse a protocol amount, applying ``balance_divisor``."""
+        token = text.strip()
+        if not token:
+            raise ProviderError(f"no amount in response {raw!r}")
+        try:
+            value = Decimal(token)
+        except (InvalidOperation, ValueError) as exc:
+            raise ProviderError(f"cannot parse {token!r} as an amount (raw {raw!r})") from exc
+        if not value.is_finite():
+            raise ProviderError(f"amount {token!r} is not finite (raw {raw!r})")
+        return quantize_money(value / self.config.balance_divisor)
 
     def get_prices(self) -> Mapping[str, Money]:
-        shape = self.config.shape
-        payload = self._request(self.config.prices_path)
-        raw = _dig(payload, shape.prices)
-        if raw is None:
-            raise ProviderError(
-                f"price response has no {shape.prices!r} key; keys were {sorted(payload)}"
-            )
+        """Live prices. ``getPrices`` in this family returns JSON, not colon text.
+
+        Handles both shapes: a JSON object keyed by service, and a
+        ``{service: {country: price}}`` nest. Anything unparseable is skipped
+        rather than raising, so one odd entry cannot blind the whole book.
+        """
+        text = self._call(self.config.action_prices)
+        stripped = text.lstrip()
+        # Only attempt JSON when the body actually looks like JSON. Anything
+        # else is colon-text -- which includes bare error tokens like
+        # ERROR_KEY that contain no colon at all.
+        if not stripped.startswith(("{", "[")):
+            parsed = parse_response(text)
+            if parsed.is_error:
+                raise self._error_for(parsed, self.config.action_prices)
+            return {}
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            raise ProviderError(f"getPrices returned invalid JSON: {text[:200]!r}")
         out: dict[str, Money] = {}
-        if isinstance(raw, Mapping):
-            for slug, value in raw.items():
-                price = value.get("price") if isinstance(value, Mapping) else value
-                if price is None:
-                    continue
-                out[str(slug)] = _as_money(price)
-        elif isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
-            for item in raw:
-                if not isinstance(item, Mapping):
-                    continue
-                slug = item.get("service") or item.get("slug") or item.get("name")
-                price = item.get("price")
-                if slug is not None and price is not None:
-                    out[str(slug)] = _as_money(price)
+        if isinstance(payload, Mapping):
+            for service, value in payload.items():
+                price = self._extract_price(value)
+                if price is not None:
+                    out[str(service)] = price
         return out
+
+    @staticmethod
+    def _extract_price(value: Any) -> Optional[Money]:
+        if isinstance(value, (int, float, str)) and not isinstance(value, bool):
+            try:
+                return quantize_money(Decimal(str(value)))
+            except (InvalidOperation, ValueError):
+                return None
+        if isinstance(value, Mapping):
+            for key in ("price", "cost", "all"):
+                if key in value:
+                    nested = value[key]
+                    if isinstance(nested, Mapping):
+                        costs = [v for v in nested.values() if isinstance(v, (int, float))]
+                        return quantize_money(Decimal(str(min(costs)))) if costs else None
+                    return UotpProvider._extract_price(nested)
+        return None
 
     def buy_number(
         self, service: str, country: str = "in", *, idempotency_key: Optional[str] = None
     ) -> NumberAllocation:
-        """Allocate a number.
+        """Allocate a number via ``getNumber``.
 
-        ``idempotency_key`` is sent as ``Idempotency-Key``. If the provider
-        honours it, a network retry after a timeout returns the *same* number
-        instead of charging for a second one -- which is the difference between
-        a retried order costing 1x and 2x.
+        Two distinct outcomes are distinguished because they are economically
+        opposite:
+
+        ``ACCESS_NUMBER:<id>:<phone>``  a usable number
+        ``ACCESS_CANCEL:<id>:<phone>``  charged, but already registered on the
+                                       target service -- burned, no OTP will
+                                       ever arrive
+
+        Treating the second as a usable number would burn the full 20-minute
+        window waiting for an OTP that cannot come.
+
+        ``idempotency_key`` is not part of this protocol, so it is carried as
+        the ``order`` parameter where the provider supports it. Where it does
+        not, an ambiguous timeout is surfaced as :class:`PurchaseTimedOut` so
+        the caller reconciles instead of buying a second number.
         """
-        shape = self.config.shape
-        headers = {"Idempotency-Key": idempotency_key} if idempotency_key else None
-        payload = self._request(
-            self.config.buy_path,
-            method="POST",
-            body={"service": service, "country": country},
-            extra_headers=headers,
-        )
-        order_id = _dig(payload, shape.order_id)
-        phone = _dig(payload, shape.phone)
-        if order_id is None or phone is None:
-            raise ProviderError(
-                f"purchase response missing {shape.order_id!r}/{shape.phone!r}; "
-                f"got {payload}. Adjust ResponseShape to match your API."
+        c = self.config
+        params: dict[str, Any] = {"service": service, "country": country}
+        if idempotency_key:
+            params["order"] = idempotency_key
+        parsed = self._request(c.action_get_number, **params)
+
+        if parsed.status == c.cancel_prefix:
+            # Charged and immediately useless. Record it as an allocation so
+            # the charge is booked and the refund path can run.
+            alloc = self._allocation(parsed, service, country)
+            alloc = replace(alloc, order_id=f"{alloc.order_id}|burned")
+            raise NumberUnavailable(
+                f"number {alloc.phone} was already registered on {service}; "
+                f"charged and unusable (id={alloc.order_id})"
             )
-        charged_raw = _dig(payload, shape.charged)
+        if parsed.status != c.number_prefix:
+            raise ProviderError(
+                f"expected {c.number_prefix!r} but got {parsed.status!r} "
+                f"(raw: {parsed.raw!r}). Set number_prefix to match."
+            )
+        return self._allocation(parsed, service, country)
+
+    def _allocation(
+        self, parsed: ApiResponse, service: str, country: str
+    ) -> NumberAllocation:
+        order_id = parsed.field(0)
+        phone = parsed.field(1)
+        if not order_id:
+            raise ProviderError(f"no activation id in {parsed.raw!r}")
+        if not phone:
+            raise ProviderError(f"no phone number in {parsed.raw!r}")
+        charged = Money(0)
+        # Some deployments append the price; if present, use it.
+        if parsed.field(2):
+            try:
+                charged = self._to_money(parsed.field(2), raw=parsed.raw)
+            except ProviderError:
+                charged = Money(0)
         return NumberAllocation(
-            order_id=str(order_id),
-            phone=str(phone),
+            order_id=order_id,
+            phone=phone,
             service=service,
             country=country,
-            charged=_as_money(charged_raw) if charged_raw is not None else Money(0),
+            charged=charged,
             validity_minutes=self.config.validity_minutes,
         )
 
     def get_sms(self, order_id: str) -> Sequence[SmsMessage]:
-        shape = self.config.shape
-        payload = self._request(self.config.sms_path, params={"id": order_id})
-        raw = _dig(payload, shape.sms_list)
-        if raw is None:
-            # Some APIs return a bare list under a different key, or a single
-            # message object. Handle both rather than failing a live order.
-            if isinstance(payload.get("message"), Mapping):
-                raw = [payload["message"]]
-            else:
-                return []
-        if isinstance(raw, Mapping):
-            raw = [raw]
-        out: list[SmsMessage] = []
-        for item in raw:
-            if not isinstance(item, Mapping):
-                continue
-            text = _dig(item, shape.sms_text)
-            if text is None:
-                continue
-            out.append(
-                SmsMessage(
-                    sender=str(_dig(item, shape.sms_sender) or ""),
-                    text=str(text),
-                    received_at=str(_dig(item, shape.sms_time) or _now()),
-                )
-            )
-        return out
+        """Return the OTP if one has arrived, else nothing.
+
+        This protocol has no SMS inbox: ``getStatus`` returns ``STATUS_OK:<code>``
+        once a code has landed. The code is wrapped into a :class:`SmsMessage`
+        so the rest of the bot is agnostic.
+        """
+        c = self.config
+        activation = order_id.split("|")[0]  # strip the burned marker
+        try:
+            parsed = self._request(c.action_get_status, id=activation)
+        except ProviderError:
+            return []
+        if parsed.status == c.ok_prefix:
+            code = parsed.field(0)
+            if code:
+                return [
+                    SmsMessage(
+                        sender="",
+                        text=code,
+                        received_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    )
+                ]
+        return []
 
     def wait_for_otp(
         self,
         allocation: NumberAllocation,
         *,
-        timeout_seconds: float = 300.0,
+        timeout_seconds: float = 290.0,
         poll_interval: float = 3.0,
         expect: Optional[str] = None,
     ) -> OtpResult:
-        """Poll until an OTP appears or the number/timeout expires.
+        """Poll ``getStatus`` until a code arrives, the number is canceled, or
+        the lease expires.
 
-        ``expect`` optionally filters by sender, which matters when a number is
-        reused and carries messages from a previous tenant.
+        Returns early on ``STATUS_CANCEL`` -- the number is dead and continuing
+        to poll would waste the remaining window while forfeiting the refund.
         """
         if poll_interval <= 0:
             raise ValueError("poll_interval must be positive")
-        deadline = min(
-            time.monotonic() + timeout_seconds,
-            time.monotonic() + max(allocation.seconds_left(), 0.0),
-        )
+        c = self.config
+        activation = allocation.order_id.split("|")[0]
+        budget = min(timeout_seconds, max(allocation.seconds_left(), 0.0))
+        deadline = time.monotonic() + budget
         attempts = 0
         started = time.monotonic()
-        seen: set[str] = set()
         while True:
             attempts += 1
             try:
-                messages = self.get_sms(allocation.order_id)
-            except (ServiceUnavailable, ProviderError):
-                # A transient poll failure must not abort a paid-for number.
-                messages = []
-            for msg in messages:
-                key = f"{msg.sender}|{msg.text}"
-                if key in seen:
-                    continue
-                seen.add(key)
-                if expect and expect.lower() not in msg.sender.lower():
-                    continue
-                code = msg.extract_otp()
-                if code:
-                    return OtpResult(code, msg, attempts, time.monotonic() - started, False)
+                parsed = self._request(c.action_get_status, id=activation)
+            except ProviderError:
+                # A transient poll failure must not abandon a paid-for number.
+                parsed = None
+            if parsed is not None:
+                if parsed.status == c.ok_prefix and parsed.field(0):
+                    code = parsed.field(0)
+                    if not expect or expect.lower() in code.lower():
+                        return OtpResult(
+                            code,
+                            SmsMessage("", code, datetime.now(timezone.utc).isoformat()),
+                            attempts,
+                            time.monotonic() - started,
+                            False,
+                        )
+                if parsed.status == c.canceled_prefix:
+                    return OtpResult(None, None, attempts, time.monotonic() - started, True)
             if time.monotonic() >= deadline:
                 return OtpResult(None, None, attempts, time.monotonic() - started, True)
             time.sleep(min(poll_interval, max(deadline - time.monotonic(), 0.1)))
 
     def cancel(self, order_id: str) -> Money:
-        payload = self._request(
-            self.config.cancel_path, method="POST", body={"id": order_id}
-        )
-        for key in ("refund", "refunded", "amount", "credit"):
-            value = _dig(payload, key)
-            if value is not None:
-                return _as_money(value)
+        """Release a number (``setStatus`` with the cancel code).
+
+        The protocol does not report the refund amount, so this returns zero
+        and lets the caller reconcile from the next ``getBalance``. Inventing a
+        figure here would corrupt the ledger.
+        """
+        c = self.config
+        activation = order_id.split("|")[0]
+        try:
+            self._request(c.action_set_status, id=activation, status=c.status_cancel)
+        except ProviderError:
+            return Money(0)
         return Money(0)
+
+    def complete(self, order_id: str) -> None:
+        """Mark an activation finished so the number is freed."""
+        c = self.config
+        try:
+            self._request(
+                c.action_set_status, id=order_id.split("|")[0], status=c.status_complete
+            )
+        except ProviderError:
+            pass
+
+    def get_active(self) -> Sequence[Mapping[str, str]]:
+        """Open activations, for reconciling after a crash."""
+        try:
+            parsed = self._request(self.config.action_active)
+        except ProviderError:
+            return []
+        return [{"raw": parsed.raw, "status": parsed.status, "fields": list(parsed.fields)}]
 
     # -- diagnostics -----------------------------------------------------
     def probe(self) -> Balance:
-        """Verify credentials and response shape at startup. Fails loudly."""
+        """Verify the key and response shape at startup. Fails loudly."""
         if not self.config.api_key:
             raise AuthError(
-                "no API key configured; set UOTP_API_KEY. Refusing to run an "
-                "unauthenticated bot that would silently fail on first order."
+                "no API key configured; set UOTP_API_KEY. Refusing to start a "
+                "bot that would fail on its first order."
             )
         balance = self.get_balance()
         if balance.credit.is_negative:
             raise ProviderError(f"provider reported a negative balance: {balance.credit}")
         return balance
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def _as_money(value: Any) -> Money:
-    """Coerce a provider's price/balance field into exact paise.
-
-    Providers variously send rupees as a float, a string, or paise as an int.
-    Guessing wrong here is a 100x error, so anything ambiguous raises rather
-    than silently scaling.
-    """
-    if isinstance(value, Money):
-        return value
-    if isinstance(value, bool):
-        raise ProviderError(f"cannot interpret boolean {value!r} as money")
-    if isinstance(value, int):
-        # A bare int is rupees (₹12), not paise -- but ₹1200 as paise is a
-        # plausible-looking number too. Rupees is the overwhelmingly common
-        # convention; callers whose API sends paise should send a string.
-        return INR(value)
-    if isinstance(value, float):
-        return quantize_money(Decimal(repr(value)))
-    if isinstance(value, str):
-        text = value.strip().replace(",", "")
-        # Indian providers variously prefix with Rs., Rs, INR or the rupee sign.
-        for token in ("Rs.", "Rs", "INR", "\u20b9"):
-            if text.startswith(token):
-                text = text[len(token):]
-                break
-        text = text.strip()
-        try:
-            return quantize_money(Decimal(text))
-        except (InvalidOperation, ValueError) as exc:
-            raise ProviderError(f"cannot parse {value!r} as a money amount") from exc
-    raise ProviderError(f"cannot interpret {type(value).__name__} as money")

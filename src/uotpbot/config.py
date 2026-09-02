@@ -16,7 +16,7 @@ from typing import Optional
 from .economics import FeeModel
 from .engine import EngineConfig
 from .money import INR
-from .provider.uotp import ResponseShape, UotpConfig
+from .provider.uotp import UotpConfig
 
 __all__ = ["Settings", "ConfigError", "load_env_file", "from_environment"]
 
@@ -101,29 +101,30 @@ def from_environment(env_file: Optional[Path | str] = None) -> Settings:
     """
     load_env_file(env_file)
 
-    shape = ResponseShape(
-        balance=_get("UOTP_FIELD_BALANCE", "balance"),
-        order_id=_get("UOTP_FIELD_ORDER_ID", "id"),
-        phone=_get("UOTP_FIELD_PHONE", "number"),
-        charged=_get("UOTP_FIELD_PRICE", "price"),
-        sms_list=_get("UOTP_FIELD_SMS_LIST", "messages"),
-        sms_text=_get("UOTP_FIELD_SMS_TEXT", "text"),
-        sms_sender=_get("UOTP_FIELD_SMS_SENDER", "sender"),
-        sms_time=_get("UOTP_FIELD_SMS_TIME", "created_at"),
-        prices=_get("UOTP_FIELD_PRICES", "prices"),
-    )
     uotp = UotpConfig(
-        base_url=_get("UOTP_BASE_URL", "https://uotp.store"),
+        base_url=_get(
+            "UOTP_BASE_URL", "https://uotp.store/api/stubs/handler_api.php"
+        ),
         api_key=_get("UOTP_API_KEY", required=True),
-        auth_header=_get("UOTP_AUTH_HEADER", "Authorization"),
-        auth_scheme=_get("UOTP_AUTH_SCHEME", "Bearer"),
-        balance_path=_get("UOTP_BALANCE_PATH", "/api/v1/balance"),
-        prices_path=_get("UOTP_PRICES_PATH", "/api/v1/prices"),
-        buy_path=_get("UOTP_BUY_PATH", "/api/v1/number"),
-        sms_path=_get("UOTP_SMS_PATH", "/api/v1/sms"),
-        cancel_path=_get("UOTP_CANCEL_PATH", "/api/v1/cancel"),
-        timeout=float(_get("UOTP_TIMEOUT", "20")),
-        shape=shape,
+        key_param=_get("UOTP_KEY_PARAM", "api_key"),
+        action_param=_get("UOTP_ACTION_PARAM", "action"),
+        action_balance=_get("UOTP_ACTION_BALANCE", "getBalance"),
+        action_prices=_get("UOTP_ACTION_PRICES", "getPrices"),
+        action_get_number=_get("UOTP_ACTION_GET_NUMBER", "getNumber"),
+        action_get_status=_get("UOTP_ACTION_GET_STATUS", "getStatus"),
+        action_set_status=_get("UOTP_ACTION_SET_STATUS", "setStatus"),
+        action_active=_get("UOTP_ACTION_ACTIVE", "getActiveActivations"),
+        balance_prefix=_get("UOTP_PREFIX_BALANCE", "ACCESS_BALANCE"),
+        number_prefix=_get("UOTP_PREFIX_NUMBER", "ACCESS_NUMBER"),
+        cancel_prefix=_get("UOTP_PREFIX_CANCEL", "ACCESS_CANCEL"),
+        ok_prefix=_get("UOTP_PREFIX_OK", "STATUS_OK"),
+        wait_prefix=_get("UOTP_PREFIX_WAIT", "STATUS_WAIT_CODE"),
+        resend_prefix=_get("UOTP_PREFIX_RESEND", "STATUS_WAIT_RESEND"),
+        canceled_prefix=_get("UOTP_PREFIX_CANCELED", "STATUS_CANCEL"),
+        status_complete=_get("UOTP_STATUS_COMPLETE", "6"),
+        status_cancel=_get("UOTP_STATUS_CANCEL", "8"),
+        balance_divisor=_decimal("UOTP_BALANCE_DIVISOR", "1"),
+        timeout=float(_get("UOTP_TIMEOUT", "30")),
     )
 
     fees = FeeModel(

@@ -103,23 +103,58 @@ Coinbase, PayPal worst; plain messaging apps best). They are not measured
 truth. Run `python -m uotpbot.cli calibrate` with real order history to
 replace them.
 
-## API
+## API — verified 2026-09-02
 
-**There is no public API documentation.** "API access" is listed as a feature
-of the ₹200 pack and "Full API access" on the ₹1000 pack, but `uotp.in/api`,
-`/docs`, `uotp.store/api`, `/api-docs`, `/docs`, `/developer`, `/swagger` and
-`/openapi.json` return nothing, and a web search turns up no UOTP API
-reference. The API is gated behind an authenticated account.
+There is no public API documentation page (`uotp.in/api`, `/docs`,
+`uotp.store/api`, `/swagger`, `/openapi.json` all return nothing), but the
+endpoint itself is reachable and its behaviour was confirmed by a live call:
 
-Consequence for the code: `UotpProvider` does **not** hard-code an endpoint
-shape it cannot verify. Base URL, paths, auth header, auth scheme and JSON key
-names all come from configuration (see `.env.example`). `UotpProvider.probe()`
-calls the balance endpoint at startup and raises an error naming the exact key
-it could not find, so a wrong mapping fails at boot instead of mid-order.
+```
+GET https://uotp.store/api/stubs/handler_api.php?action=getBalance&api_key=<KEY>
+-> ACCESS_BALANCE:0
+```
 
-Purchases send an `Idempotency-Key` header. If the provider honours it, a
-network retry after an ambiguous timeout returns the same number instead of
-charging for a second one.
+So this is **not** a JSON API. It is the SMS-Activate-family protocol:
+
+| Property | Reality |
+|---|---|
+| Method | **GET** (no POST, no request body) |
+| Auth | `api_key` as a **query parameter**, not an `Authorization` header |
+| Response | **plain text**, `PREFIX:field:field`, one line |
+| Errors | the same shape: a bare token like `ERROR_KEY`, `ERROR_NO_BALANCE` |
+
+Two consequences the adapter has to get right:
+
+1. **Colons inside the payload.** `ACCESS_NUMBER:12345:+919876543210` must be
+   split on the *first* colon only. A naive three-way `split(":")` mangles any
+   value that itself contains a colon.
+2. **Errors look like successes.** A failure is a bare token with no colon, so
+   detection has to happen before any attempt at field extraction.
+
+Only `getBalance` is documented by the provider. The remaining actions
+(`getNumber`, `getStatus`, `setStatus`, `getPrices`, `getActiveActivations`)
+follow this protocol family's conventions and are **inferred** — every action
+name and response prefix is configurable in `.env`, so a divergence is a
+config change rather than a code change. `UotpProvider.probe()` verifies the
+key and the balance prefix at startup.
+
+The path segment `/api/stubs/` suggests this may be a stub or sandbox
+endpoint; the returned balance of `0` is consistent with either an empty
+wallet or a stub. Worth confirming before funding a real account against it.
+
+Purchases carry an `order` parameter where the provider supports it. Where it
+does not, an ambiguous timeout surfaces as `PurchaseTimedOut` so the caller
+reconciles against `getBalance` instead of buying a second number.
+
+`setStatus` with code `8` cancels an activation, but the protocol reports no
+refund amount — so `cancel()` returns zero and the caller reconciles from the
+next balance read. Inventing a figure would corrupt the ledger.
+
+### Keep the key out of the repository
+
+The API key belongs in `.env` (gitignored), never in source or in a commit. A
+key that reaches a public repository should be treated as compromised and
+rotated.
 
 ## Terms — read before automating
 

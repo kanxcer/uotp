@@ -26,7 +26,10 @@ def test_defaults_are_sane(monkeypatch):
     monkeypatch.setenv("UOTP_API_KEY", "secret")
     s = from_environment(env_file="/nonexistent/.env")
     assert s.uotp.api_key == "secret"
-    assert s.uotp.base_url == "https://uotp.store"
+    assert s.uotp.base_url == "https://uotp.store/api/stubs/handler_api.php"
+    assert s.uotp.action_balance == "getBalance"
+    assert s.uotp.balance_prefix == "ACCESS_BALANCE"
+    assert s.uotp.balance_divisor == Decimal(1)
     assert s.fees.gateway_rate == Decimal("0.02")
     assert s.fees.gst_rate == Decimal(0)
     assert s.fees.gst_inclusive is True
@@ -58,17 +61,26 @@ def test_overrides_apply(monkeypatch):
     assert s.allowed_users == ("1", "2", "3")
 
 
-def test_field_mapping_is_configurable(monkeypatch):
+def test_protocol_vocabulary_is_configurable(monkeypatch):
+    """Action names and response prefixes are config, not code."""
     monkeypatch.setenv("UOTP_API_KEY", "k")
-    monkeypatch.setenv("UOTP_FIELD_BALANCE", "data.wallet.balance")
-    monkeypatch.setenv("UOTP_BUY_PATH", "/v2/getNumber")
-    monkeypatch.setenv("UOTP_AUTH_SCHEME", "")
-    monkeypatch.setenv("UOTP_AUTH_HEADER", "X-Api-Key")
+    monkeypatch.setenv("UOTP_BASE_URL", "https://example.test/api.php")
+    monkeypatch.setenv("UOTP_ACTION_BALANCE", "balance")
+    monkeypatch.setenv("UOTP_PREFIX_BALANCE", "WALLET_BALANCE")
+    monkeypatch.setenv("UOTP_ACTION_GET_NUMBER", "getNum")
+    monkeypatch.setenv("UOTP_PREFIX_NUMBER", "NUM")
+    monkeypatch.setenv("UOTP_STATUS_CANCEL", "9")
+    monkeypatch.setenv("UOTP_BALANCE_DIVISOR", "100")
+    monkeypatch.setenv("UOTP_KEY_PARAM", "key")
     s = from_environment(env_file="/nonexistent/.env")
-    assert s.uotp.shape.balance == "data.wallet.balance"
-    assert s.uotp.buy_path == "/v2/getNumber"
-    assert s.uotp.auth_scheme == ""
-    assert s.uotp.auth_header == "X-Api-Key"
+    assert s.uotp.base_url == "https://example.test/api.php"
+    assert s.uotp.action_balance == "balance"
+    assert s.uotp.balance_prefix == "WALLET_BALANCE"
+    assert s.uotp.action_get_number == "getNum"
+    assert s.uotp.number_prefix == "NUM"
+    assert s.uotp.status_cancel == "9"
+    assert s.uotp.balance_divisor == Decimal(100)
+    assert s.uotp.key_param == "key"
 
 
 def test_bad_decimal_is_reported(monkeypatch):

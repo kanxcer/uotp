@@ -97,11 +97,26 @@ client is `urllib`, storage is `sqlite3`.
 cp .env.example .env             # then fill in UOTP_API_KEY
 ```
 
-UOTP does not publish API documentation, so the adapter does not guess an
-endpoint shape. Paths, auth header, auth scheme and JSON key names are all
-configurable. `UotpProvider.probe()` runs at startup and raises an error
-naming the exact key it could not find, so a wrong mapping fails at boot
-rather than mid-order.
+UOTP's endpoint uses the **`handler_api.php` protocol**, verified live:
+
+```
+GET .../handler_api.php?action=getBalance&api_key=<KEY>
+-> ACCESS_BALANCE:0
+```
+
+GET requests, key in the query string, plain-text `PREFIX:field:field`
+responses — not JSON. The adapter parses accordingly, splitting on the first
+colon only so payloads containing colons survive, and detecting bare error
+tokens (`ERROR_KEY`, `ERROR_NO_BALANCE`) before any field extraction.
+
+Only `getBalance` is provider-documented; the other actions follow this
+protocol family's conventions, so every action name and response prefix is
+configurable in `.env`. `UotpProvider.probe()` verifies the key and the
+balance prefix at startup, so a wrong mapping fails at boot rather than
+mid-order.
+
+**Keep the key in `.env`, never in source.** It is gitignored; a key that
+reaches a public repo should be rotated.
 
 ## Commands
 
