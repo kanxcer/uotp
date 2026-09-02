@@ -126,3 +126,27 @@ def test_env_file_does_not_override_real_environment(tmp_path, monkeypatch):
 
 def test_missing_env_file_is_not_an_error():
     assert load_env_file("/definitely/not/here/.env") == {}
+
+
+def test_prices_params_and_service_map(monkeypatch):
+    monkeypatch.setenv("UOTP_API_KEY", "k")
+    monkeypatch.setenv("UOTP_PRICES_COUNTRY", "182")
+    monkeypatch.setenv("UOTP_PRICES_OPERATOR", "jiotel")
+    monkeypatch.setenv("UOTP_SERVICE_MAP", "whatsapp=wa, telegram=tg ,google=go")
+    s = from_environment(env_file="/nonexistent/.env")
+    assert s.uotp.prices_country == "182"
+    assert s.uotp.prices_operator == "jiotel"
+    assert s.uotp.service_map == {"whatsapp": "wa", "telegram": "tg", "google": "go"}
+
+
+def test_empty_service_map_parses_to_empty(monkeypatch):
+    monkeypatch.setenv("UOTP_API_KEY", "k")
+    s = from_environment(env_file="/nonexistent/.env")
+    assert s.uotp.service_map == {}
+
+
+def test_malformed_service_map_entries_are_skipped(monkeypatch):
+    monkeypatch.setenv("UOTP_API_KEY", "k")
+    monkeypatch.setenv("UOTP_SERVICE_MAP", "whatsapp=wa,broken,=tg,google=")
+    s = from_environment(env_file="/nonexistent/.env")
+    assert s.uotp.service_map == {"whatsapp": "wa"}

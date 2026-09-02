@@ -64,6 +64,24 @@ def _decimal(name: str, default: str) -> Decimal:
         raise ConfigError(f"{name}={raw!r} is not a valid decimal") from exc
 
 
+def _parse_service_map(raw: str) -> dict[str, str]:
+    """Parse ``local=provider,local=provider`` into a slug translation table.
+
+    The provider rejected our slug with BAD_SERVICE, so a mapping is needed
+    once the real vocabulary is known. Empty means pass slugs through.
+    """
+    out: dict[str, str] = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair or "=" not in pair:
+            continue
+        local, _, provider = pair.partition("=")
+        local, provider = local.strip(), provider.strip()
+        if local and provider:
+            out[local] = provider
+    return out
+
+
 def _bool(name: str, default: bool) -> bool:
     raw = _get(name, str(default)).strip().lower()
     return raw in ("1", "true", "yes", "on")
@@ -123,6 +141,9 @@ def from_environment(env_file: Optional[Path | str] = None) -> Settings:
         canceled_prefix=_get("UOTP_PREFIX_CANCELED", "STATUS_CANCEL"),
         status_complete=_get("UOTP_STATUS_COMPLETE", "6"),
         status_cancel=_get("UOTP_STATUS_CANCEL", "8"),
+        prices_country=_get("UOTP_PRICES_COUNTRY", "0"),
+        prices_operator=_get("UOTP_PRICES_OPERATOR", "any"),
+        service_map=_parse_service_map(_get("UOTP_SERVICE_MAP", "")),
         balance_divisor=_decimal("UOTP_BALANCE_DIVISOR", "1"),
         timeout=float(_get("UOTP_TIMEOUT", "30")),
     )

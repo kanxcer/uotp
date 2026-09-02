@@ -461,6 +461,83 @@ def test_get_prices_reports_a_protocol_error():
         p.get_prices()
 
 
+
+
+# ------------------------------------- responses observed on the live endpoint
+# Each of these bodies was returned by the real API on 2026-09-02. They are
+# pinned verbatim so a regression in the parser shows up against reality rather
+# than against another guess.
+def test_live_getbalance():
+    p, _ = make("ACCESS_BALANCE:0")
+    assert p.get_balance().credit == INR(0)
+
+
+def test_live_getprices_without_country_is_an_error_not_a_success():
+    """BAD_COUNTRY has no colon; unlisted it would parse as a success status."""
+    p, _ = make("BAD_COUNTRY")
+    with pytest.raises(ProviderError, match="BAD_COUNTRY"):
+        p.get_prices()
+
+
+def test_live_getprices_without_operator_is_an_error_not_a_success():
+    p, _ = make("BAD_OPERATOR")
+    with pytest.raises(ProviderError, match="BAD_OPERATOR"):
+        p.get_prices()
+
+
+def test_live_bad_action_for_an_unknown_action():
+    p, _ = make("BAD_ACTION")
+    with pytest.raises(ProviderError, match="BAD_ACTION"):
+        p.get_balance()
+
+
+def test_live_bad_service_on_getnumber():
+    p, _ = make("BAD_SERVICE")
+    with pytest.raises(ProviderError, match="BAD_SERVICE"):
+        p.buy_number("whatsapp")
+
+
+def test_bad_tokens_are_all_classified_as_errors():
+    for token in ("BAD_COUNTRY", "BAD_OPERATOR", "BAD_SERVICE", "BAD_ACTION",
+                  "BAD_STATUS", "BAD_KEY"):
+        assert parse_response(token).is_error, token
+
+
+def test_getprices_sends_country_and_operator():
+    """The endpoint demands both; omitting either yields BAD_COUNTRY/BAD_OPERATOR."""
+    p, opener = make('{"telegram": 10}')
+    p.get_prices()
+    url = opener.calls[0]["url"]
+    assert "action=getPrices" in url
+    assert "country=" in url
+    assert "operator=" in url
+
+
+def test_getprices_params_are_configurable():
+    p, opener = make('{"telegram": 10}', prices_country="182", prices_operator="jiotel")
+    p.get_prices()
+    url = opener.calls[0]["url"]
+    assert "country=182" in url and "operator=jiotel" in url
+
+
+def test_service_map_translates_the_slug_for_getnumber():
+    """The provider rejected 'whatsapp'; it uses its own vocabulary."""
+    p, opener = make("ACCESS_NUMBER:1:+919")
+    p.config = p.config.with_key("TESTKEY")
+    p2 = UotpProvider(
+        UotpConfig(api_key="TESTKEY", service_map={"whatsapp": "wa"}),
+        opener=opener,
+    )
+    p2.buy_number("whatsapp")
+    assert "service=wa" in opener.calls[0]["url"]
+
+
+def test_unmapped_service_passes_through_unchanged():
+    p, opener = make("ACCESS_NUMBER:1:+919", service_map={"whatsapp": "wa"})
+    p.buy_number("telegram")
+    assert "service=telegram" in opener.calls[0]["url"]
+
+
 # --------------------------------------------------- live integration (opt-in)
 @pytest.mark.skipif(
     os.environ.get("UOTP_LIVE_KEY") is None,

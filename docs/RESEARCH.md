@@ -131,12 +131,40 @@ Two consequences the adapter has to get right:
 2. **Errors look like successes.** A failure is a bare token with no colon, so
    detection has to happen before any attempt at field extraction.
 
+### Probed further on 2026-09-02
+
+| Request | Response | Meaning |
+|---|---|---|
+| `action=getBalance` | `ACCESS_BALANCE:0` | works; wallet empty |
+| `action=getPrices` | `BAD_COUNTRY` | action exists, needs `country` |
+| `action=getPrices&country=0` | `BAD_OPERATOR` | also needs `operator` |
+| `action=getTopCountriesByService&service=whatsapp` | `BAD_ACTION` | **action does not exist** |
+| `action=getNumber&service=whatsapp&country=0` | `BAD_SERVICE` | action exists, slug not recognised |
+
+Four things this establishes, all now encoded in the code:
+
+1. **`BAD_COUNTRY` and `BAD_OPERATOR` are real error tokens** and have no
+   colon. They were *not* in the initial error table, which meant they would
+   have parsed as a success status and been silently mis-handled. They are now
+   classified and pinned by tests against the verbatim bodies.
+2. **`BAD_ACTION` is the unknown-action response**, confirming the error
+   vocabulary — and that `getTopCountriesByService` is not available here.
+3. **`getPrices` needs both `country` and `operator`**, so both are sent and
+   both are configurable (`UOTP_PRICES_COUNTRY`, `UOTP_PRICES_OPERATOR`).
+4. **The provider's service slugs differ from ours** — `whatsapp` was rejected.
+   `UOTP_SERVICE_MAP` translates (`whatsapp=wa,telegram=tg`) once the real
+   vocabulary is known.
+
 Only `getBalance` is documented by the provider. The remaining actions
 (`getNumber`, `getStatus`, `setStatus`, `getPrices`, `getActiveActivations`)
 follow this protocol family's conventions and are **inferred** — every action
 name and response prefix is configurable in `.env`, so a divergence is a
 config change rather than a code change. `UotpProvider.probe()` verifies the
 key and the balance prefix at startup.
+
+The exact service slug list and the valid `country`/`operator` values are still
+unknown; `getPrices` will return them once both parameters are right, and that
+response should replace the transcribed table in `data/uotp_prices.csv`.
 
 The path segment `/api/stubs/` suggests this may be a stub or sandbox
 endpoint; the returned balance of `0` is consistent with either an empty

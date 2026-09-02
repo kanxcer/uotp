@@ -115,6 +115,11 @@ ERROR_TOKENS: frozenset[str] = frozenset({
     "BAD_SERVICE", "ERROR_NO_NUMBERS", "ERROR_NO_BALANCE", "NO_ACTIVATION",
     "ERROR_EMPTY_ACCOUNT", "ERROR_WRONG_ACTION", "ERROR_NO_FREE",
     "ACCOUNT_INACTIVE", "ERROR_IP", "ERROR_NO_SERVICE",
+    # Observed live on 2026-09-02: getPrices without a country returns
+    # BAD_COUNTRY, and with one but no operator returns BAD_OPERATOR. Both
+    # have no colon, so an unlisted token would parse as a *success* status
+    # and be mis-handled rather than raising.
+    "BAD_COUNTRY", "BAD_OPERATOR",
 })
 
 #: Which exception each error token becomes.
@@ -122,7 +127,8 @@ _FATAL_AUTH = frozenset({"ERROR_KEY", "BAD_KEY", "ERROR_IP", "ACCOUNT_INACTIVE"}
 _NO_STOCK = frozenset({"ERROR_NO_NUMBERS", "ERROR_NO_FREE", "ERROR_NO_SERVICE"})
 _NO_FUNDS = frozenset({"ERROR_NO_BALANCE", "ERROR_EMPTY_ACCOUNT"})
 _BAD_REQUEST = frozenset({"BAD_ACTION", "BAD_STATUS", "BAD_SERVICE",
-                          "NO_ACTIVATION", "ERROR_WRONG_ACTION"})
+                          "NO_ACTIVATION", "ERROR_WRONG_ACTION",
+                          "BAD_COUNTRY", "BAD_OPERATOR"})
 
 
 # ------------------------------------------------------------------ config
@@ -163,6 +169,13 @@ class UotpConfig:
     #: setStatus codes: 1 ready, 3 request another SMS, 6 complete, 8 cancel.
     status_complete: str = "6"
     status_cancel: str = "8"
+    #: getPrices was observed to require both of these. Their meaning is
+    #: provider-specific and undocumented, so both are settings.
+    prices_country: str = "0"
+    prices_operator: str = "any"
+    #: Maps this bot's service slug to the provider's. ``whatsapp`` was
+    #: rejected with BAD_SERVICE, so the provider uses its own vocabulary.
+    service_map: Mapping[str, str] = field(default_factory=dict)
     balance_divisor: Decimal = Decimal(1)
     timeout: float = 30.0
     max_retries: int = 2
@@ -299,11 +312,16 @@ class UotpProvider:
     def get_prices(self) -> Mapping[str, Money]:
         """Live prices. ``getPrices`` in this family returns JSON, not colon text.
 
-        Handles both shapes: a JSON object keyed by service, and a
+        The live endpoint rejects a bare call with ``BAD_COUNTRY`` and one with
+        only a country with ``BAD_OPERATOR``, so both are sent. Handles both
+        response shapes: a JSON object keyed by service, and a
         ``{service: {country: price}}`` nest. Anything unparseable is skipped
         rather than raising, so one odd entry cannot blind the whole book.
         """
-        text = self._call(self.config.action_prices)
+        c = self.config
+        text = self._call(
+            c.action_prices, country=c.prices_country, operator=c.prices_operator
+        )
         stripped = text.lstrip()
         # Only attempt JSON when the body actually looks like JSON. Anything
         # else is colon-text -- which includes bare error tokens like
@@ -364,7 +382,10 @@ class UotpProvider:
         the caller reconciles instead of buying a second number.
         """
         c = self.config
-        params: dict[str, Any] = {"service": service, "country": country}
+        # The provider rejected "whatsapp" with BAD_SERVICE, so it uses its own
+        # slug vocabulary. Translate through service_map when one is supplied.
+        slug = c.service_map.get(service, service)
+        params: dict[str, Any] = {"service": slug, "country": country}
         if idempotency_key:
             params["order"] = idempotency_key
         parsed = self._request(c.action_get_number, **params)
