@@ -40,10 +40,16 @@ refunded automatically."""
 
 @dataclass(slots=True)
 class Reply:
-    """A handler's response."""
+    """A handler's response.
+
+    ``buttons`` are ``(label, callback_data)`` pairs the transport renders as
+    an inline keyboard. Keeping them on the reply rather than in the transport
+    is what lets the whole createbot conversation be tested without Telegram.
+    """
 
     text: str
     ok: bool = True
+    buttons: tuple[tuple[str, str], ...] = ()
 
 
 class CommandRouter:
@@ -103,6 +109,19 @@ class CommandRouter:
     def handle(self, user_id: str, text: str) -> Reply:
         """Route one incoming message."""
         text = (text or "").strip()
+        # Plain text can be an answer to an in-progress /createbot: bot
+        # tokens, provider API keys and yes/no confirmations never start with
+        # a slash. This check MUST run before the slash test below -- without
+        # it the whole white-label flow is unreachable through the real bot,
+        # while every test that drives the flow directly stays green.
+        if (
+            not text.startswith("/")
+            and self._createbot_flow is not None
+            and self._createbot_flow.pending(user_id)
+        ):
+            if not self._authorised(user_id):
+                return Reply("You are not authorised to use this bot.", ok=False)
+            return self._createbot_reply(self._createbot_flow.on_text(user_id, text))
         if not text.startswith("/"):
             return Reply(HELP_TEXT, ok=False)
         parts = text.split()
@@ -136,10 +155,8 @@ class CommandRouter:
 
         handler = handlers.get(command)
         if handler is None:
-            # Not a command: it may be an answer to an in-progress /createbot.
-            pending_flow = self._createbot_flow
-            if pending_flow and pending_flow.pending(user_id):
-                return self._createbot_reply(pending_flow.on_text(user_id, text))
+            # An unknown slash command is never fed to the pending flow: a
+            # mistyped "/creatbot" must not be swallowed as a bot token.
             return Reply(f"Unknown command /{command}. Try /help.", ok=False)
         try:
             return handler(user_id, args)
@@ -147,6 +164,18 @@ class CommandRouter:
             return Reply(f"Cannot price that right now: {exc}", ok=False)
         except Exception as exc:  # never leak a stack trace into a chat
             return Reply(f"Something went wrong: {type(exc).__name__}: {exc}", ok=False)
+
+    def handle_callback(self, user_id: str, data: str) -> Reply:
+        """Route one inline-keyboard press from the transport.
+
+        Callback data can only advance or cancel a pending /createbot -- it
+        cannot invoke any other command, so a forged press is inert.
+        """
+        if not self._authorised(user_id):
+            return Reply("You are not authorised to use this bot.", ok=False)
+        if self._createbot_flow is None or not self._createbot_flow.pending(user_id):
+            return Reply("That menu has expired. Send /createbot to start again.", ok=False)
+        return self._createbot_reply(self._createbot_flow.on_button(user_id, data))
 
     # -- handlers --------------------------------------------------------
     def cmd_help(self, user_id: str, args: list[str]) -> Reply:
@@ -264,7 +293,7 @@ class CommandRouter:
                     f"did not start ({type(exc).__name__}). Use /restart to try again.",
                     ok=False,
                 )
-        return Reply(result.reply)
+        return Reply(result.reply, buttons=tuple(result.buttons))
 
     def cmd_report(self, user_id: str, args: list[str]) -> Reply:
         if not self._is_owner(user_id):

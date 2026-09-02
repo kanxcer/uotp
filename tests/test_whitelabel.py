@@ -330,9 +330,9 @@ def test_invalid_tokens_rejected(token):
 
 
 # ------------------------------------------------------------ createbot flow
-def make_flow() -> tuple[CreateBotFlow, SubBotRegistry]:
+def make_flow(fee=None) -> tuple[CreateBotFlow, SubBotRegistry]:
     reg = SubBotRegistry()
-    return CreateBotFlow(reg), reg
+    return CreateBotFlow(reg, fee=fee), reg
 
 
 def test_flow_starts_by_asking_for_a_token():
@@ -359,8 +359,19 @@ def test_flow_offers_both_modes_with_the_fee_named_up_front():
     assert result.buttons
     labels = " ".join(label for label, _ in result.buttons)
     assert "no % fee" in labels
-    assert "5% fee" in labels
+    assert "5%" in labels
     assert flow.pending("u1").step == Step.AWAIT_MODE
+
+
+def test_mode_button_label_follows_the_configured_fee():
+    """The label must not hardcode 5%: a configured 7% shown as 5% is a
+    misrepresentation that gets quoted back at you on the first dispute."""
+    fee = PlatformFee(rate=Decimal("0.07"))
+    flow, _ = make_flow(fee=fee)
+    flow.start("u1")
+    result = flow.on_text("u1", GOOD_TOKEN)
+    labels = " ".join(label for label, _ in result.buttons)
+    assert "7%" in labels and "5%" not in labels
 
 
 def test_platform_path_discloses_then_creates():
@@ -755,3 +766,209 @@ def test_non_numeric_fee_rate_fails_at_startup(monkeypatch):
     monkeypatch.setenv("PLATFORM_FEE_RATE", "five percent")
     with pytest.raises(ConfigError, match="PLATFORM_FEE_RATE"):
         from_environment()
+
+
+# ------------------------------------ regression: the ROUTER path, not the flow
+# The 2026-09-02 incident: handle() returned HELP_TEXT for any message that
+# did not start with "/", so pasted tokens and keys never reached the flow.
+# Every flow-level test stayed green while /createbot was unreachable through
+# the real bot. These tests drive router.handle() -- the only path a real
+# Telegram message takes.
+def _wl_router():
+    from uotpbot.bot.commands import CommandRouter
+    from uotpbot.catalog import Catalog, ServiceCost, WalletPack
+    from uotpbot.engine import BotEngine, EngineConfig
+    from uotpbot.ledger import Ledger
+    from uotpbot.money import INR
+    from uotpbot.pricing import Pricer
+    from uotpbot.provider.mock import MockProvider
+
+    catalog = Catalog({
+        "telegram": ServiceCost("telegram", "Telegram", "messaging", INR(10),
+                                Decimal("0.94"), Decimal("0.04"), Decimal("0.95")),
+    }, (WalletPack("Pro", INR(1000), INR(1150)),))
+    ledger = Ledger()
+    pricer = Pricer(catalog)
+    provider = MockProvider(
+        {s.slug: catalog.sticker_price(s.slug) for s in catalog.services()},
+        balance=INR(5000), seed=5,
+    )
+    engine = BotEngine(catalog, provider, ledger, pricer,
+                       config=EngineConfig(retry_cap=3, otp_timeout_seconds=1.0,
+                                           poll_interval=0.01))
+    registry = SubBotRegistry()
+    router = CommandRouter(engine, catalog, pricer, ledger, owner_id="111",
+                           allowed_users=("111",), subbots=registry)
+    return router, registry, ledger
+
+
+def test_pasting_a_token_through_the_router_advances_the_flow():
+    router, _, ledger = _wl_router()
+    try:
+        start = router.handle("111", "/createbot")
+        assert "token" in start.text.lower()
+        reply = router.handle("111", GOOD_TOKEN)
+        assert "UOTP bot" not in reply.text, "help text swallowed the token paste"
+        assert "Token received" in reply.text
+        assert len(reply.buttons) == 2  # Reply must CARRY the buttons
+        assert router.handle("111", "hello").buttons or True  # no crash on junk
+    finally:
+        ledger.close()
+
+
+def test_full_own_api_flow_through_the_router_with_typed_choices():
+    """End to end over handle() with text choices only -- proves the flow is
+    completable even on a transport that cannot render buttons."""
+    router, registry, ledger = _wl_router()
+    try:
+        router.handle("111", "/createbot")
+        router.handle("111", GOOD_TOKEN)
+        ask_key = router.handle("111", "2")
+        assert "API key" in ask_key.text and "uotp" in ask_key.text.lower()
+        disclosure = router.handle("111", "my-real-provider-key-9999")
+        assert "Read this before you confirm" in disclosure.text
+        assert "5%" in disclosure.text  # the fee is named in what they accept
+        created = router.handle("111", "yes")
+        assert "created" in created.text.lower()
+        assert registry.count() == 1
+        bot = registry.all_active()[0]
+        assert bot.mode is SubBotMode.OWN_API
+        assert bot.fee.rate == Decimal("0.05")
+        # /mybots must never echo the owner's provider key back into chat.
+        listing = router.handle("111", "/mybots")
+        assert "my-real-provider-key-9999" not in listing.text
+    finally:
+        ledger.close()
+
+
+def test_unknown_slash_command_is_not_swallowed_by_a_pending_flow():
+    router, _, ledger = _wl_router()
+    try:
+        router.handle("111", "/createbot")
+        reply = router.handle("111", "/frobnicate")
+        assert not reply.ok and "Unknown command" in reply.text
+    finally:
+        ledger.close()
+
+
+def test_cancel_from_midflow_works_through_the_router():
+    router, registry, ledger = _wl_router()
+    try:
+        router.handle("111", "/createbot")
+        router.handle("111", GOOD_TOKEN)
+        reply = router.handle("111", "/cancel")
+        assert "Cancelled" in reply.text
+        assert registry.count() == 0
+        # and plain text after cancelling goes back to help, not into the flow
+        assert "UOTP bot" in router.handle("111", "random text").text
+    finally:
+        ledger.close()
+
+
+def test_handle_callback_advances_the_flow_and_forced_presses_are_inert():
+    router, registry, ledger = _wl_router()
+    try:
+        router.handle("111", "/createbot")
+        router.handle("111", GOOD_TOKEN)
+        shown = router.handle_callback("111", CB_PLATFORM)
+        assert "Platform fee: none" in shown.text
+        done = router.handle_callback("111", CB_CONFIRM)
+        assert "created" in done.text.lower()
+        assert registry.count() == 1
+        # after the flow finishes, stale presses cannot do anything
+        stale = router.handle_callback("111", CB_CONFIRM)
+        assert not stale.ok and "expired" in stale.text.lower()
+        outsider = router.handle_callback("999", CB_PLATFORM)
+        assert not outsider.ok
+    finally:
+        ledger.close()
+
+
+def test_unauthorised_plain_text_cannot_advance_someone_elses_flow():
+    """The flow is keyed per user: an outsider's text must not touch the
+    owner's pending creation, no matter how valid it looks."""
+    router, registry, ledger = _wl_router()
+    try:
+        router.handle("111", "/createbot")
+        router.handle("111", GOOD_TOKEN)
+        router.handle("999", "888888888:AAFdeadbeefdeadbeefdeadbeefdead")
+        router.handle_callback("999", CB_CONFIRM)
+        assert registry.count() == 0
+        # owner's flow is untouched and still completes
+        assert "API key" in router.handle("111", "2").text
+    finally:
+        ledger.close()
+
+
+def test_unauthorised_user_cannot_start_a_flow_by_talking_to_another_one():
+    router, _, ledger = _wl_router()
+    try:
+        out = router.handle("999", "888888888:AAFdeadbeefdeadbeefdeadbeefdead")
+        assert not out.ok  # no pending flow -> help, and never a creation
+    finally:
+        ledger.close()
+
+
+# ------------------------------------------- transport wiring (needs PTB)
+def test_build_from_settings_registers_callback_handler(monkeypatch):
+    """The createbot menu is unreachable if the callback handler is not wired;
+    this pins the transport registration itself, not just the router method."""
+    pytest.importorskip("telegram")
+    from unittest.mock import MagicMock
+
+    from uotpbot.bot import telegram as tg
+    from uotpbot.config import from_environment
+
+    monkeypatch.setenv("UOTP_API_KEY", "k")
+    monkeypatch.setenv(
+        "TELEGRAM_BOT_TOKEN", "123456:AAtesttokenforwiringcheckxxxxxxxxxx"
+    )
+    settings = from_environment(env_file="/nonexistent/.env")
+
+    captured: list[str] = []
+
+    class FakeApp:
+        def add_handler(self, handler):
+            captured.append(type(handler).__name__)
+
+    class FakeBuilder:
+        def token(self, tok):
+            return self
+
+        def build(self):
+            return FakeApp()
+
+    real_application = tg.Application
+    tg.Application = MagicMock(builder=staticmethod(lambda: FakeBuilder()))
+    try:
+        tg.build_from_settings(settings, lambda: MagicMock())
+    finally:
+        tg.Application = real_application
+    assert "CallbackQueryHandler" in captured, (
+        "buttons would render but nothing answers the press"
+    )
+
+
+def test_on_callback_edits_message_and_answers_query():
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    from uotpbot.bot.telegram import TelegramFrontend
+
+    router = MagicMock()
+    router.handle_callback.return_value = type("R", (), {
+        "text": "done", "ok": True, "buttons": (),
+    })()
+    frontend = TelegramFrontend(router)
+    query = MagicMock()
+    query.from_user.id = 42
+    query.data = "cb:createbot:confirm"
+    query.message = MagicMock()
+    query.message.edit_text = AsyncMock()
+    query.answer = AsyncMock()
+    update = MagicMock()
+    update.callback_query = query
+    asyncio.run(frontend.on_callback(update, None))
+    router.handle_callback.assert_called_once_with("42", "cb:createbot:confirm")
+    query.message.edit_text.assert_awaited_once_with("done", reply_markup=None)
+    query.answer.assert_awaited_once_with("OK")
