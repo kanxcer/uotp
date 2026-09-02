@@ -54,6 +54,14 @@ class Reply:
     edits the message again with the returned reply. Purchases use it --
     an OTP wait can run minutes, and blocking the poller for that long
     freezes every other customer.
+
+    ``photo`` is a Telegram file_id the transport sends WITH this reply as
+    a photo message (payment QR codes; Telegram cannot edit a text message
+    into a photo, so the transport sends a fresh message).
+    ``notify`` is a list of ``(chat_id, text)`` the transport additionally
+    delivers as fresh messages -- used to alert the owner about payments.
+    ``forward_photo`` asks the transport to also forward the photo the
+    customer just sent to the owner (payment screenshots).
     """
 
     text: str
@@ -61,6 +69,9 @@ class Reply:
     buttons: tuple[tuple[str, str], ...] = ()
     rows: tuple[tuple[tuple[str, str], ...], ...] = ()
     deferred: Optional[Callable[[str], "Reply"]] = None
+    photo: Optional[str] = None
+    notify: tuple[tuple[str, str], ...] = ()
+    forward_photo: bool = False
 
 
 class CommandRouter:

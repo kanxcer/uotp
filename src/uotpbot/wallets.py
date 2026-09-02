@@ -15,12 +15,19 @@ raise loudly instead of being swallowed by a dict contract.
 
 from __future__ import annotations
 
+
 import sqlite3
 import threading
+import time
+from dataclasses import dataclass
+from typing import Optional
 
 from .money import Money
 
-__all__ = ["WalletStore", "SqliteWallets", "PostgresWallets", "WalletError"]
+__all__ = [
+    "WalletStore", "SqliteWallets", "PostgresWallets", "ScopedWallets",
+    "WalletError", "Topup",
+]
 
 
 class WalletError(Exception):
@@ -49,8 +56,9 @@ class ScopedWallets(WalletStore):
 
     White-label sub-bots share the platform's database, but a customer who
     pays the owner of bot A must not find that balance spendable on bot B.
-    Keys are namespaced ``<bot ID>:<user id>`` so wallets stay per-bot even
-    though the table is shared.
+    Wallets are key-namespaced ``<bot ID>:<user id>``; top-ups and the QR
+    carry the bot id in their ``scope`` column / key prefix, so a sub-bot
+    owner can never approve (or even see) another bot's payments.
     """
 
     def __init__(self, inner: WalletStore, scope: str) -> None:
@@ -69,6 +77,27 @@ class ScopedWallets(WalletStore):
     def adjust(self, user_id: str, delta: Money) -> Money:
         return self._inner.adjust(self._key(user_id), delta)
 
+    # Delegated with the explicit scope column/prefix --------------------
+    def create_topup(self, user_id, amount, *, note="", photo_file_id=""):
+        return self._inner.create_topup(user_id, amount, note=note,
+                                        photo_file_id=photo_file_id, scope=self._scope)
+
+    def get_topup(self, topup_id, **kw):
+        return self._inner.get_topup(topup_id, scope=self._scope)
+
+    def pending_topups(self):
+        return self._inner.pending_topups(scope=self._scope)
+
+    def decide_topup(self, topup_id, status, *, decided_by):
+        return self._inner.decide_topup(topup_id, status, decided_by=decided_by,
+                                        scope=self._scope)
+
+    def kv_get(self, key):
+        return self._inner.kv_get(f"{self._scope}:{key}")
+
+    def kv_set(self, key, value):
+        self._inner.kv_set(f"{self._scope}:{key}", value)
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS {t} (
@@ -76,6 +105,43 @@ CREATE TABLE IF NOT EXISTS {t} (
     balance_paise INTEGER NOT NULL CHECK (balance_paise >= 0)
 )
 """
+
+_TOPUPS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS {t} (
+    {pk}
+    scope TEXT NOT NULL DEFAULT '',
+    user_id TEXT NOT NULL,
+    amount_paise INTEGER NOT NULL CHECK (amount_paise > 0),
+    note TEXT NOT NULL DEFAULT '',
+    photo_file_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'approved', 'declined')),
+    created_ts REAL NOT NULL,
+    decided_ts REAL,
+    decided_by TEXT
+)
+"""
+
+_KV_SCHEMA = """
+CREATE TABLE IF NOT EXISTS {t} (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+)
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class Topup:
+    """One customer payment awaiting (or past) owner review."""
+
+    id: int
+    user_id: str
+    amount: Money
+    note: str = ""
+    photo_file_id: str = ""
+    status: str = "pending"
+    created_ts: float = 0.0
+    decided_by: str = ""
 
 
 class SqliteWallets(WalletStore):
@@ -91,7 +157,78 @@ class SqliteWallets(WalletStore):
         self._lock = threading.RLock()
         with self._lock:
             self._conn.execute(_SCHEMA.format(t="wallets"))
+            self._conn.execute(
+                _TOPUPS_SCHEMA.format(t="topups", pk="id INTEGER PRIMARY KEY AUTOINCREMENT,")
+            )
+            self._conn.execute(_KV_SCHEMA.format(t="kv"))
             self._conn.commit()
+
+    # -- payment top-ups ---------------------------------------------------
+    def create_topup(
+        self, user_id: str, amount: Money, *, note: str = "",
+        photo_file_id: str = "", scope: str = "",
+    ) -> int:
+        if amount.is_negative or amount.is_zero:
+            raise WalletError("top-up amount must be positive")
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO topups(scope, user_id, amount_paise, note, photo_file_id, created_ts)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (scope, user_id, amount.paise, note, photo_file_id, time.time()),
+            )
+            return int(cur.lastrowid or 0)
+
+    def get_topup(self, topup_id: int, *, scope: str = "") -> Optional[Topup]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, user_id, amount_paise, note, photo_file_id, status, created_ts,"
+                " COALESCE(decided_by, '') FROM topups WHERE id = ? AND scope = ?",
+                (topup_id, scope),
+            ).fetchone()
+        return self._topup_from(row) if row else None
+
+    def pending_topups(self, *, scope: str = "") -> list[Topup]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, user_id, amount_paise, note, photo_file_id, status, created_ts,"
+                " COALESCE(decided_by, '') FROM topups"
+                " WHERE scope = ? AND status = 'pending' ORDER BY id DESC",
+                (scope,),
+            ).fetchall()
+        return [self._topup_from(r) for r in rows]
+
+    def decide_topup(self, topup_id: int, status: str, *, decided_by: str,
+                     scope: str = "") -> bool:
+        """Move pending -> approved/declined. Returns False if already decided."""
+        if status not in ("approved", "declined"):
+            raise WalletError(f"bad topup status {status!r}")
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE topups SET status = ?, decided_ts = ?, decided_by = ?"
+                " WHERE id = ? AND scope = ? AND status = 'pending'",
+                (status, time.time(), decided_by, topup_id, scope),
+            )
+            return cur.rowcount == 1
+
+    @staticmethod
+    def _topup_from(row) -> Topup:
+        return Topup(id=row[0], user_id=row[1], amount=Money(row[2]), note=row[3],
+                     photo_file_id=row[4], status=row[5], created_ts=row[6],
+                     decided_by=row[7])
+
+    # -- small key/value (payment QR, etc.) --------------------------------
+    def kv_get(self, key: str) -> Optional[str]:
+        with self._lock:
+            row = self._conn.execute("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def kv_set(self, key: str, value: str) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO kv(key, value) VALUES(?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
 
     def balance(self, user_id: str) -> Money:
         with self._lock:
@@ -149,9 +286,81 @@ class PostgresWallets(WalletStore):
         self._lock = threading.RLock()
         self._conn = psycopg.connect(dsn, autocommit=True, prepare_threshold=None)
         self._t = f"{schema}.wallets"
+        self._tt = f"{schema}.topups"
+        self._tk = f"{schema}.kv"
         with self._lock:
             self._conn.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
             self._conn.execute(_SCHEMA.format(t=self._t))
+            self._conn.execute(_TOPUPS_SCHEMA.format(
+                t=self._tt, pk="id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"))
+            self._conn.execute(_KV_SCHEMA.format(t=self._tk))
+
+    # -- payment top-ups ---------------------------------------------------
+    def create_topup(
+        self, user_id: str, amount: Money, *, note: str = "",
+        photo_file_id: str = "", scope: str = "",
+    ) -> int:
+        if amount.is_negative or amount.is_zero:
+            raise WalletError("top-up amount must be positive")
+        with self._lock:
+            row = self._conn.execute(
+                f"INSERT INTO {self._tt}(scope, user_id, amount_paise, note, photo_file_id,"
+                f" created_ts) VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+                (scope, user_id, amount.paise, note, photo_file_id, time.time()),
+            ).fetchone()
+        return int(row[0])
+
+    def get_topup(self, topup_id: int, *, scope: str = "") -> Optional[Topup]:
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT id, user_id, amount_paise, note, photo_file_id, status, created_ts,"
+                f" COALESCE(decided_by, '') FROM {self._tt} WHERE id = %s AND scope = %s",
+                (topup_id, scope),
+            ).fetchone()
+        return self._topup_from(row) if row else None
+
+    def pending_topups(self, *, scope: str = "") -> list[Topup]:
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT id, user_id, amount_paise, note, photo_file_id, status, created_ts,"
+                f" COALESCE(decided_by, '') FROM {self._tt}"
+                " WHERE scope = %s AND status = 'pending' ORDER BY id DESC",
+                (scope,),
+            ).fetchall()
+        return [self._topup_from(r) for r in rows]
+
+    def decide_topup(self, topup_id: int, status: str, *, decided_by: str,
+                     scope: str = "") -> bool:
+        if status not in ("approved", "declined"):
+            raise WalletError(f"bad topup status {status!r}")
+        with self._lock:
+            cur = self._conn.execute(
+                f"UPDATE {self._tt} SET status = %s, decided_ts = %s, decided_by = %s"
+                " WHERE id = %s AND scope = %s AND status = 'pending'",
+                (status, time.time(), decided_by, topup_id, scope),
+            )
+            return cur.rowcount == 1
+
+    @staticmethod
+    def _topup_from(row) -> Topup:
+        return Topup(id=row[0], user_id=row[1], amount=Money(row[2]), note=row[3],
+                     photo_file_id=row[4], status=row[5], created_ts=row[6],
+                     decided_by=row[7])
+
+    # -- small key/value ---------------------------------------------------
+    def kv_get(self, key: str) -> Optional[str]:
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT value FROM {self._tk} WHERE key = %s", (key,)).fetchone()
+        return row[0] if row else None
+
+    def kv_set(self, key: str, value: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                f"INSERT INTO {self._tk}(key, value) VALUES(%s, %s) "
+                "ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value",
+                (key, value),
+            )
 
     def balance(self, user_id: str) -> Money:
         with self._lock:

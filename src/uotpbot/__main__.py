@@ -245,6 +245,7 @@ def _run_subbot(bot, router, settings: Settings) -> None:
     app.add_handler(CallbackQueryHandler(frontend.on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, frontend.on_message))
     app.add_handler(MessageHandler(filters.COMMAND, frontend.on_message))
+    app.add_handler(MessageHandler(filters.PHOTO, frontend.on_photo))  # payments/QR
     # stop_signals=(): same reason as bot.telegram -- we run in a background
     # thread, and PTB's default signal handlers only work in the main thread.
     app.run_polling(stop_signals=())
