@@ -113,8 +113,21 @@ def build_from_settings(settings: Settings, router_factory: Any) -> Any:
     return app
 
 
+def _start_polling(app: Any) -> None:
+    """Run the polling loop in whatever thread called us.
+
+    ``stop_signals=()`` is load-bearing: by default python-telegram-bot
+    registers UNIX signal handlers, which are only legal in the main thread --
+    in the background thread we run polling in, that raises ``RuntimeError:
+    set_wakeup_fd only works in main thread`` and the poller dies at startup
+    while the (health-gated) HTTP server keeps serving. Empty tuple registers
+    no handlers; shutdown is the process's SIGTERM, handled by the HTTP layer.
+    """
+    app.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=())
+
+
 def run_bot(settings: Settings, router_factory: Any) -> None:  # pragma: no cover
     """Start long-polling. Blocking; meant for a real deployment."""
     app = build_from_settings(settings, router_factory)
     log.info("bot starting")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    _start_polling(app)
