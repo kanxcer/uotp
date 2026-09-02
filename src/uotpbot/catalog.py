@@ -1,6 +1,6 @@
 """Provider cost catalogue.
 
-The numbers in ``data/uotp_prices.csv`` were read off uotp.in/services on
+The numbers in ``src/uotpbot/data/uotp_prices.csv`` were read off uotp.in/services on
 2026-09-01. That page is the *real* price list. The homepage's "from Rs.2"
 figure and its "Telegram Rs.2 / WhatsApp Rs.5 / Google Rs.8" table do not
 survive contact with the checkout -- see ``docs/RESEARCH.md``.
@@ -259,7 +259,13 @@ class Catalog:
         return max(cost.list_price, self.min_charge, key=lambda m: m.paise)
 
 
-_DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
+#: The bundled price book lives INSIDE the package. A previous layout pointed
+#: at ``<repo>/data`` via ``parent.parent.parent``, which only exists in a
+#: source checkout -- the built wheel never carried it (the old
+#: ``package-data`` rule referenced a path outside the package, which
+#: setuptools silently drops, so every clean install crashed at startup with
+#: "cost catalogue not found").
+_DATA_DIR = Path(__file__).resolve().parent / "data"
 
 #: uotp.in credit packs as advertised on the homepage.
 UOTP_PACKS: tuple[WalletPack, ...] = (

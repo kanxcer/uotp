@@ -277,13 +277,13 @@ src/uotpbot/
   createbot.py   the /createbot conversation, terms shown before creation
   provider/      base protocol, UOTP HTTP adapter, deterministic mock
   bot/           transport-free command router + thin Telegram shell
-data/uotp_prices.csv   real uotp.in prices (transcribed 2026-09-01)
+src/uotpbot/data/uotp_prices.csv   real uotp.in prices (transcribed 2026-09-01)
 docs/RESEARCH.md       what the provider actually charges, with evidence
 ```
 
 ## Cost calibration
 
-The success/burn/refund rates in `data/uotp_prices.csv` are **engineering
+The success/burn/refund rates in `src/uotpbot/data/uotp_prices.csv` are **engineering
 priors**, set by how hard each platform blocks VoIP ranges. They are not
 measured truth. Once you have order history:
 

@@ -23,7 +23,7 @@ uotpbot = "uotpbot.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-uotpbot = ["../../data/*.csv"]
+uotpbot = ["data/*.csv"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

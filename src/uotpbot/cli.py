@@ -385,7 +385,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="uotpbot", description="Virtual-number OTP reseller with auditable economics."
     )
-    p.add_argument("--prices", help="path to a cost CSV (default: bundled data/uotp_prices.csv)")
+    p.add_argument("--prices", help="path to a cost CSV (default: bundled src/uotpbot/data/uotp_prices.csv)")
     sub = p.add_subparsers(dest="command", required=True)
 
     def add_common(sp: argparse.ArgumentParser) -> None:
