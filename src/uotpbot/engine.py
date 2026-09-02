@@ -148,19 +148,22 @@ class BotEngine:
         and the charge must match the tap, not the catalogue minimum.
         """
         cost = self.catalog.get(service)
+        sticker = self.catalog.sticker_price(cost.slug)
         if server:
             opt = self.catalog.server_option(service, server)
             if opt is None:
                 raise EngineError(f"no server {server!r} for {service}")
             cost = cost.with_overrides(list_price=opt.price, server=opt.server_id)
-        advice = self.pricer.price(cost)
+            # The tapped server's price is the cost floor: never price below it.
+            sticker = max(sticker, opt.price, key=lambda m: m.paise)
+        advice = self.pricer.price(cost, sticker=sticker)
         econ = OrderEconomics.for_service(
             cost,
             advice.gross_price,
             fees=self.fees,
             wallet_multiplier=self._multiplier,
             retry_cap=self.config.retry_cap,
-            sticker_price=self.catalog.sticker_price(cost.slug),
+            sticker_price=sticker,
         )
         return advice.gross_price, econ
 
@@ -253,7 +256,7 @@ class BotEngine:
         refunds automatically if it failed.
         """
         cost = self.catalog.get(service)
-        price, econ = self.quote(service)
+        price, econ = self.quote(service, server=server)
         gross = gross_price if gross_price is not None else price
         order = Order(
             customer_id=customer_id,

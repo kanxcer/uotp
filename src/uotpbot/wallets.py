@@ -382,6 +382,7 @@ class PostgresWallets(WalletStore):
             raise WalletError(f"unsafe schema name {schema!r}")
         self._lock = threading.RLock()
         self._conn = psycopg.connect(dsn, autocommit=True, prepare_threshold=None)
+        self._integrity = psycopg.errors.IntegrityError
         self._t = f"{schema}.wallets"
         self._tt = f"{schema}.topups"
         self._tk = f"{schema}.kv"
@@ -470,8 +471,10 @@ class PostgresWallets(WalletStore):
             self._conn.execute(
                 f"INSERT INTO {self._to}(scope, user_id, slug, gross_paise, phone, otp,"
                 f" success, profit_paise, ts) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                # explicit int: psycopg binds Python bool as boolean, which the
+                # INTEGER CHECK column rejects (sqlite coerces booleans silently)
                 (scope, user_id, slug, amount.paise, phone, otp,
-                 success, profit.paise, time.time()),
+                 1 if success else 0, profit.paise, time.time()),
             )
 
     def recent_orders(self, *, scope: str = "", user_id: str = "", limit: int = 10
@@ -520,20 +523,35 @@ class PostgresWallets(WalletStore):
             )
 
     def adjust(self, user_id: str, delta: Money) -> Money:
-        # Single atomic statement: no lost updates even if two purchases land
-        # at the same moment. The CHECK constraint itself rejects an overdraft
-        # (a debit that would take the balance negative fails loudly as an
-        # IntegrityError instead of quietly flooring at zero).
+        # Two steps in one transaction, NOT a naive INSERT..ON CONFLICT..DO
+        # UPDATE with ``delta`` as the candidate balance: Postgres validates
+        # CHECK constraints on the INSERT candidate /before/ conflict
+        # resolution, so a debit candidate of -1500 fails the >=0 CHECK even
+        # when the existing row would update to a healthy 48500 (it broke a
+        # real purchase live; SQLite evaluates the CHECK on the final stored
+        # row instead, which is why the sqlite tests never caught it).
+        #
+        #   1. Upsert a zero row (candidate 0 is always CHECK-safe).
+        #   2. UPDATE the row to the new balance; the CHECK guards the FINAL
+        #      value, so a genuine overdraft still dies loudly at the DB.
         with self._lock:
-            row = self._conn.execute(
-                f"INSERT INTO {self._t}(user_id, balance_paise) VALUES(%s, %s) "
-                "ON CONFLICT(user_id) DO UPDATE SET balance_paise = "
-                f"{self._t}.balance_paise + %s "
-                "RETURNING balance_paise",
-                (user_id, delta.paise, delta.paise),
-            ).fetchone()
+            try:
+                with self._conn.transaction():
+                    self._conn.execute(
+                        f"INSERT INTO {self._t}(user_id, balance_paise) VALUES(%s, 0) "
+                        "ON CONFLICT(user_id) DO NOTHING",
+                        (user_id,),
+                    )
+                    row = self._conn.execute(
+                        f"UPDATE {self._t} SET balance_paise = {self._t}.balance_paise + %s "
+                        "WHERE user_id = %s RETURNING balance_paise",
+                        (delta.paise, user_id),
+                    ).fetchone()
+            except self._integrity as exc:
+                # The final-value CHECK fired: an overdraft, not a bug.
+                raise WalletError(f"balance cannot go negative for {user_id}") from exc
         new = Money(row[0])
-        if new.is_negative:  # pragma: no cover - the CHECK got there first
+        if new.is_negative:
             raise WalletError(f"balance cannot go negative for {user_id}")
         return new
 

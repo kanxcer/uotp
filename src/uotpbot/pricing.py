@@ -157,9 +157,16 @@ class Pricer:
             return quantize_money(Decimal(sticker.rupees) * self.peer_multiple, ROUND_CEILING)
         raise ValueError(f"unknown strategy {self.strategy!r}")
 
-    def price(self, cost: ServiceCost) -> PricingAdvice:
-        """Recommend a shelf price for one service."""
-        sticker = self.catalog.sticker_price(cost.slug)
+    def price(self, cost: ServiceCost, *, sticker: Optional[Money] = None) -> PricingAdvice:
+        """Recommend a shelf price for one service.
+
+        ``sticker`` overrides the default cost anchor (the catalogue minimum):
+        when a customer hand-picks a dearer SIM-bank server, the quote must
+        clear THAT server's price, not the cheapest one -- otherwise a tapped
+        ₹16.80 server priced off a ₹10.00 anchor sells at a loss.
+        """
+        if sticker is None:
+            sticker = self.catalog.sticker_price(cost.slug)
         probe = OrderEconomics.for_service(
             cost, Money(0), fees=self.fees, wallet_multiplier=self._multiplier,
             retry_cap=self.retry_cap, sticker_price=sticker,

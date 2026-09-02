@@ -23,6 +23,7 @@ from uotpbot.ledger import (
 )
 from uotpbot.money import INR, Money
 from uotpbot.pgstore import PostgresLedger, PostgresRegistry, StorageError
+from uotpbot.wallets import PostgresWallets, SqliteWallets, WalletError
 from uotpbot.whitelabel import (
     DEFAULT_PLATFORM_FEE, SubBot, SubBotMode, SubBotRegistry, WhiteLabelError,
 )
@@ -193,10 +194,48 @@ def _exercise_registry(registry: SubBotRegistry) -> None:
     assert registry.delete(own.id) is True
     assert registry.delete(own.id) is False
 
+def _exercise_wallets(wallets) -> None:
+    """Customer wallets end to end, including the debit path that broke live.
+
+    Postgres evaluates CHECK constraints on the INSERT candidate before
+    conflict resolution, so a one-statement upsert whose candidate is the
+    negative delta dies even for funded users. Only a real server proves the
+    two-statement adjustment still honours the overdraft CHECK for real.
+    """
+    assert wallets.balance("alice").is_zero
+    wallets.set_balance("alice", INR(100))
+    assert wallets.balance("alice") == INR(100)
+    assert wallets.adjust("alice", INR(50)) == INR(150)          # credit
+    assert wallets.adjust("alice", Money(-1500)) == INR(135)     # debit an existing user
+    with pytest.raises(WalletError):                              # overdraft refused
+        wallets.adjust("alice", Money(-1_000_000))
+    assert wallets.balance("alice") == INR(135)                  # unchanged after refusal
+    with pytest.raises(WalletError):                              # debit with no row at all
+        wallets.adjust("ghost", Money(-100))
+    tid = wallets.create_topup("alice", INR(200), photo_file_id="ph:1")
+    topup = wallets.get_topup(tid)
+    assert topup is not None and topup.status == "pending"
+    assert wallets.decide_topup(tid, "approved", decided_by="owner")
+    wallets.adjust("alice", topup.amount)          # in prod the router credits
+    assert wallets.balance("alice") == INR(135) + INR(200)
+    wallets.record_order(user_id="alice", slug="google", amount=INR(15),
+                         phone="919999999999", otp="424242", success=True,
+                         profit=INR(4))
+    recent = wallets.recent_orders(user_id="alice", limit=5)
+    assert recent and recent[0].success and recent[0].gross == INR(15)
+    fs = wallets.float_stats()
+    assert fs["users"] >= 1
+
+
 
 def test_conformance_sqlite(tmp_path):
     _exercise_ledger(Ledger(tmp_path / "l.db"))
     _exercise_registry(SubBotRegistry(str(tmp_path / "r.db")))
+    wallets = SqliteWallets(tmp_path / "w.db")
+    try:
+        _exercise_wallets(wallets)
+    finally:
+        wallets.close()
 
 
 PG_DSN = os.environ.get("UOTP_TEST_PG_DSN", "")
@@ -213,6 +252,11 @@ def test_conformance_postgres():
             _exercise_registry(registry)
         finally:
             registry.close()
+        wallets = PostgresWallets(PG_DSN, schema=SCHEMA)
+        try:
+            _exercise_wallets(wallets)
+        finally:
+            wallets.close()
         ledger.verify()
     finally:
         ledger.drop_schema(SCHEMA)
