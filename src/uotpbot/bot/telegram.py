@@ -78,9 +78,12 @@ class TelegramFrontend:
         *,
         ui: Optional[MenuUI] = None,
         support_contact: str = "",
+        pay_upi_id: str = "",
     ) -> None:
         self.router = router
-        self.ui = ui or MenuUI(router, support_contact=support_contact)
+        self.ui = ui or MenuUI(
+            router, support_contact=support_contact, pay_upi_id=pay_upi_id
+        )
 
     async def on_message(self, update: Any, context: Any = None) -> None:
         """Handle any incoming message and reply with the UI's answer.
@@ -98,6 +101,7 @@ class TelegramFrontend:
             return
         reply = await asyncio.to_thread(self.ui.text, user_id, message.text)
         await self._deliver_reply(message, reply)
+        await self._send_notifications(context, reply)
 
     async def on_callback(self, update: Any, context: Any = None) -> None:
         """Handle an inline-keyboard press.
@@ -132,6 +136,7 @@ class TelegramFrontend:
         deferred = getattr(reply, "deferred", None)
         if deferred is None:
             await self._safe_edit(message, reply)
+            await self._send_notifications(context, reply)
             return
         # Purchase (or any slow step): placeholder now, outcome when done.
         await self._safe_edit(message, reply)
@@ -149,9 +154,56 @@ class TelegramFrontend:
             return
         await self._safe_edit(message, final)
 
+    async def on_photo(self, update: Any, context: Any = None) -> None:
+        """A photo arrives: payment screenshot, owner's payment QR, or noise.
+
+        Payment flows are the only consumer, so a random photo gets a polite
+        pointer to ➕ Add money. When a top-up is created the screenshot is
+        forwarded to the owner so approval is one glance, not a guessing game.
+        """
+        message = getattr(update, "message", None)
+        photos = getattr(message, "photo", None) if message else None
+        if not message or not photos:
+            return
+        user = getattr(message, "from_user", None)
+        user_id = str(getattr(user, "id", "")) if user else ""
+        if not user_id:
+            return
+        file_id = photos[-1].file_id  # largest size Telegram offered
+        reply = await asyncio.to_thread(self.ui.photo, user_id, file_id)
+        await self._deliver_reply(message, reply)
+        if reply.forward_photo and self.router.owner_id and context is not None:
+            caption = reply.notify[0][1] if reply.notify else "Payment screenshot"
+            try:
+                await context.bot.send_photo(
+                    chat_id=int(self.router.owner_id), photo=file_id,
+                    caption=caption[:1024],
+                )
+            except Exception:  # owner blocked the bot? notify text still went
+                log.warning("could not forward payment screenshot to owner")
+        await self._send_notifications(context, reply)
+
     # -- send/edit plumbing -----------------------------------------------
     async def _deliver_reply(self, message: Any, reply) -> None:
+        """Text reply, or a photo message when the reply carries one (QR)."""
+        photo = getattr(reply, "photo", None)
+        if photo:
+            await message.reply_photo(
+                photo=photo, caption=reply.text[:1024],
+                reply_markup=_reply_markup(reply),
+            )
+            return
         await message.reply_text(reply.text, reply_markup=_reply_markup(reply))
+
+    async def _send_notifications(self, context: Any, reply) -> None:
+        """Deliver any (chat_id, text) notifications a reply carries."""
+        if context is None:
+            return
+        for chat_id, text in getattr(reply, "notify", ()) or ():
+            try:
+                await context.bot.send_message(chat_id=int(chat_id), text=text)
+            except Exception:
+                log.warning("notification to %s failed", chat_id, exc_info=True)
 
     async def _safe_edit(self, message: Any, reply) -> None:
         try:
@@ -178,12 +230,15 @@ def build_from_settings(settings: Settings, router_factory: Any) -> Any:
             "python-telegram-bot is not installed. Run: pip install 'uotpbot[telegram]'"
         )
     frontend = TelegramFrontend(
-        router_factory(), support_contact=getattr(settings, "support_contact", "")
+        router_factory(),
+        support_contact=getattr(settings, "support_contact", ""),
+        pay_upi_id=getattr(settings, "pay_upi_id", ""),
     )
     app = Application.builder().token(settings.require_telegram()).build()
     app.add_handler(CallbackQueryHandler(frontend.on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, frontend.on_message))
     app.add_handler(MessageHandler(filters.COMMAND, frontend.on_message))
+    app.add_handler(MessageHandler(filters.PHOTO, frontend.on_photo))  # payments/QR
     return app
 
 

@@ -45,7 +45,10 @@ class EngineConfig:
     #: Top the provider wallet up to this multiple of the order price when it
     #: runs dry, so a single order is never blocked by a Rs.2 shortfall.
     topup_headroom: Decimal = Decimal("5")
-    default_country: str = "in"
+    #: Country code in the provider's vocabulary. On uotp.store's dashboard
+    #: API India is code "22" (dial 91); the old sms-activate-style "in"
+    #: returns BAD_COUNTRY through the legacy handler.
+    default_country: str = "22"
 
 
 @dataclass(slots=True)
@@ -286,7 +289,9 @@ class BotEngine:
             order.transition(OrderState.PURCHASING)
             try:
                 alloc = self.provider.buy_number(
-                    service, order.country, idempotency_key=f"{ref}-{order.attempts + 1}"
+                    service, order.country,
+                    idempotency_key=f"{ref}-{order.attempts + 1}",
+                    server=getattr(cost, "server", ""),
                 )
             except InsufficientBalance as exc:
                 order.note(f"wallet short by {exc.shortfall}")

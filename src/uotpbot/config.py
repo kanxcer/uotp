@@ -131,6 +131,10 @@ class Settings:
     #: Who customers contact to add money to their wallet (e.g. "@you" or a
     #: link). Shown on the balance screen; empty falls back to "the bot owner".
     support_contact: str = ""
+    #: The UPI VPA customers pay into (e.g. "you@okaxis"). Shown on the
+    #: Add Money screen. The visual QR is set by the owner from inside the bot
+    #: (📊 Owner panel → 🖼 Payment QR) so it survives redeploys.
+    pay_upi_id: str = ""
 
     @property
     def has_telegram(self) -> bool:
@@ -219,6 +223,7 @@ def from_environment(env_file: Optional[Path | str] = None) -> Settings:
         platform_fee_rate=_fee_rate(_get("PLATFORM_FEE_RATE", "0.05")),
         pricing_target_margin=_fraction("PRICING_TARGET_MARGIN", "0.35"),
         support_contact=_get("SUPPORT_CONTACT", ""),
+        pay_upi_id=_get("PAY_UPI_ID", ""),
     )
 
 

@@ -22,6 +22,7 @@ from dataclasses import replace
 from typing import Callable, Optional
 
 from ..catalog import Catalog
+from ..money import Money
 from ..pricing import Pricer
 from .commands import CommandRouter, Reply
 
@@ -73,7 +74,9 @@ _CATEGORY_EMOJI: dict[str, str] = {
     "messaging": "💬", "social": "🌐", "dating": "❤️", "transport": "🚗",
     "gaming": "🎮", "food": "🍔", "travel": "✈️", "entertainment": "🎬",
     "tech": "💻", "shopping": "🛍️", "crypto": "🪙", "finance": "🏦",
-    "professional": "💼", "other": "📦",
+    "professional": "💼", "other": "📦", "betting": "🎰", "payments": "💸",
+    "trading": "📈", "edtech": "📚", "govt": "🏛️", "jobs": "💼",
+    "health": "💊", "streaming": "📺",
 }
 
 # A number is live this long; mirrored from catalog constants so the UI
@@ -83,6 +86,13 @@ _VALIDITY = "20 minutes"
 
 def _emoji(slug: str) -> str:
     return _EMOJI.get(slug, "🔹")
+
+
+def _int(text: str, default: int) -> int:
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        return default
 
 
 class MenuUI:
@@ -98,6 +108,7 @@ class MenuUI:
         router: CommandRouter,
         *,
         support_contact: str = "",
+        pay_upi_id: str = "",
         history_size: int = 20,
         now: Optional[Callable[[], float]] = None,
     ) -> None:
@@ -105,11 +116,32 @@ class MenuUI:
         self.catalog: Catalog = router.catalog
         self.pricer: Pricer = router.pricer
         self.support_contact = support_contact.strip()
+        #: UPI VPA customers pay to (owner sets PAY_UPI_ID). The QR image is
+        #: set by the owner from inside the bot and persisted in the wallet
+        #: store's kv table -- it survives redeploys, unlike disk files.
+        self.pay_upi_id = pay_upi_id.strip()
         #: user_id -> [(timestamp, slug, ok, one-line summary)].
         #: Session-scoped by design; say that on the screen.
         self._history: dict[str, list[tuple[float, str, bool, str]]] = {}
         self._history_size = history_size
         self._now = now or time.time
+        #: Active top-up / QR wizards. Session-scoped is fine: a restart
+        #: just makes the customer re-tap Add Money, it never loses money
+        #: (rows are written only after the screenshot lands).
+        self._wizard: dict[str, dict] = {}
+
+    # -- stores / small helpers -------------------------------------------
+    @property
+    def _store(self):
+        """The wallet store backing top-ups, or None in dict-mode (tests/dev)."""
+        return getattr(self.router, "wallets", None)
+
+    def _qr_file_id(self) -> Optional[str]:
+        store = self._store
+        if store is None:
+            return None
+        get = getattr(store, "kv_get", None)
+        return get("pay_qr_file_id") if callable(get) else None
 
     # -- text entry ------------------------------------------------------
     def text(self, user_id: str, body: str) -> Reply:
@@ -124,13 +156,49 @@ class MenuUI:
         body = (body or "").strip()
         low = body.lower()
         if low in ("/start", "/help"):
+            self._wizard.pop(user_id, None)
             return self.main_menu(user_id)
         flow = self.router._createbot_flow  # pending-token funnel lives there
         if flow is not None and flow.pending(user_id) and not body.startswith("/"):
             return self.router.handle(user_id, body)
+        wizard = self._wizard.get(user_id)
+        if wizard and not body.startswith("/"):
+            return self._wizard_text(user_id, body)
         if body.startswith("/"):
+            self._wizard.pop(user_id, None)
             return self.router.handle(user_id, body)
+        if len(body) >= 2:
+            # Plain text outside any wizard is a search: "zomato" should find
+            # Zomato without digging through fifty pages.
+            found = self.search(user_id, body)
+            if found is not None:
+                return found
         return self.main_menu(user_id)
+
+    # -- browsing ---------------------------------------------------------
+    _PAGE = 16  # services per shop page (8 rows of 2)
+
+    def search(self, user_id: str, query: str) -> Optional[Reply]:
+        """Substring match over name+slug; None when nothing matched."""
+        q = query.strip().lower()
+        matches = [
+            s for s in self.catalog.services()
+            if q in s.slug.lower() or q in s.name.lower()
+        ]
+        if not matches:
+            return None
+        matches = matches[:12]
+        rows = [
+            tuple(
+                (f"{_emoji(s.slug)} {s.name} · {self.pricer.price(s).gross_price}",
+                 f"s:{s.slug}")
+                for s in matches[i:i + 2]
+            )
+            for i in range(0, len(matches), 2)
+        ]
+        rows.append((("🏠 Menu", "m"),))
+        near = f" (showing first {len(matches)})" if len(matches) == 12 else ""
+        return Reply(f"🔍 “{query}”{near}:", rows=tuple(rows))
 
     # -- the menu tree ---------------------------------------------------
     def main_menu(self, user_id: str) -> Reply:
@@ -150,49 +218,63 @@ class MenuUI:
             rows=tuple(rows),
         )
 
-    def services_grid(self, user_id: str, category: Optional[str] = None) -> Reply:
-        """All services as tap-targets, price printed on each button.
+    def services_grid(
+        self, user_id: str, category: Optional[str] = None, page: int = 0
+    ) -> Reply:
+        """Paginated tap-grid, price printed on each button.
 
-        32 buttons sit fine on one screen as 2-column rows, so there is no
-        pagination to lose state in -- every callback carries its full
-        context, which also means a stale button can never double-charge:
-        the price is recomputed at confirm time, not trusted from an old
-        screen.
+        Every callback carries its full context (category + page), so a
+        stale button can never double-charge: the price is re-quoted at
+        confirm time, not trusted from an old screen. With a 1000+ service
+        catalogue, pagination and search are the only honest navigation.
         """
-        services = [
+        all_services = [
             s for s in self.catalog.services()
             if category is None or s.category == category
         ]
-        if not services:
+        if not all_services:
             return Reply(
                 f"No services in {category or 'the catalogue'} right now.",
                 ok=False,
-                buttons=(("🏠 Menu", "m"),),
+                rows=((("🛒 Browse", "l"),),),
             )
-        rows = []
-        for i in range(0, len(services), 2):
-            row = tuple(
+        pages = max(1, (len(all_services) + self._PAGE - 1) // self._PAGE)
+        page = max(0, min(page, pages - 1))
+        window = all_services[page * self._PAGE: (page + 1) * self._PAGE]
+        rows: list[tuple[tuple[str, str], ...]] = []
+        for i in range(0, len(window), 2):
+            rows.append(tuple(
                 (f"{_emoji(s.slug)} {s.name} · {self.pricer.price(s).gross_price}",
                  f"s:{s.slug}")
-                for s in services[i:i + 2]
-            )
-            rows.append(row)
-        cats = sorted({s.category for s in self.catalog.services()})
-        if category is None and len(cats) > 1:
-            chips = []
+                for s in window[i:i + 2]
+            ))
+        base = f"c:{category}" if category else "l"
+        nav: list[tuple[str, str]] = []
+        if page > 0:
+            nav.append(("◀️ Prev", f"{base}:{page - 1}"))
+        nav.append((f"{page + 1}/{pages}", "nop"))
+        if page < pages - 1:
+            nav.append(("Next ▶️", f"{base}:{page + 1}"))
+        if pages > 1:
+            rows.append(tuple(nav))
+        if category is None and page == 0:
+            cats = sorted({s.category for s in self.catalog.services()})
             for i in range(0, len(cats), 4):
-                chips.append(tuple(
+                rows.append(tuple(
                     (f"{_CATEGORY_EMOJI.get(c, '📦')} {c}", f"c:{c}")
                     for c in cats[i:i + 4]
                 ))
-            rows.extend(chips)
         rows.append((("🏠 Menu", "m"),))
         title = (
-            "🛒 Pick a service"
+            f"🛒 All services ({len(all_services)})"
             if category is None
-            else f"{_CATEGORY_EMOJI.get(category, '📦')} {category.title()}"
+            else f"{_CATEGORY_EMOJI.get(category, '📦')} {category.title()} ({len(all_services)})"
         )
-        return Reply(f"{title}\n\nPrice on each button is final — tap one:", rows=tuple(rows))
+        return Reply(
+            f"{title}\n\nPrice on each button is final "
+            "— or just type a name (e.g. zomato) to search:",
+            rows=tuple(rows),
+        )
 
     def service_card(self, user_id: str, slug: str) -> Reply:
         if not self.catalog.has(slug):
@@ -225,13 +307,130 @@ class MenuUI:
         )
 
     def wallet_card(self, user_id: str) -> Reply:
-        contact = self.support_contact or "the bot owner"
         return Reply(
-            f"💰 Balance: {self.router.balance_of(user_id)}\n\n"
-            f"To add money, message {contact} with your Telegram ID "
-            f"(yours: {user_id}) and the amount. Payments by UPI; your wallet "
-            f"here is credited as soon as the owner confirms.",
-            rows=((("🛒 Buy a number", "l"), ("🏠 Menu", "m")),),
+            f"💰 Your balance: {self.router.balance_of(user_id)}\n\n"
+            "Every successful top-up is credited here and never expires.\n"
+            "Refunds land here automatically.",
+            rows=(
+                (("➕ Add money", "t"), ("🛒 Buy a number", "l")),
+                (("🏠 Menu", "m"),),
+            ),
+        )
+
+    # -- top-ups ----------------------------------------------------------
+    # Flow: 💰 → ➕ Add money → pay by UPI → ✅ I've paid → amount →
+    # screenshot → owner gets a ping + the screenshot with approve/decline.
+    def topup_card(self, user_id: str) -> Reply:
+        if self._store is None:
+            return Reply(
+                "Top-ups are not enabled on this deployment yet.\n"
+                f"Message {self.support_contact or 'the bot owner'} to add money.",
+                ok=False, rows=((("🏠 Menu", "m"),),),
+            )
+        payee = (
+            f"UPI: `{self.pay_upi_id}`" if self.pay_upi_id
+            else "UPI ID: not configured yet — ask the owner"
+        )
+        qr = self._qr_file_id()
+        note = "" if qr else "\n\n(Owner hasn't uploaded a QR yet — pay to the UPI ID.)"
+        return Reply(
+            "➕ Add money\n\n"
+            f"1️⃣ Pay any amount (min ₹10) to:\n   {payee}{note}\n\n"
+            "2️⃣ Tap ✅ I've paid below and follow the steps.\n\n"
+            "⚡ Credited after a quick owner verification (usually minutes).\n"
+            "❌ Sending fake screenshots gets your account blocked.",
+            rows=(
+                (("✅ I've paid", "t:paid"),),
+                (("◀️ Back", "w"), ("🏠 Menu", "m")),
+            ),
+            photo=qr,
+        )
+
+    def topup_amount_prompt(self, user_id: str) -> Reply:
+        self._wizard[user_id] = {"flow": "topup", "step": "amount"}
+        return Reply(
+            "💳 How much did you pay?\n\n"
+            "Reply with just the amount in ₹ — e.g. 200\n"
+            "(minimum ₹10)",
+            rows=((("✖️ Cancel", "w"),),),
+        )
+
+    def _wizard_text(self, user_id: str, body: str) -> Reply:
+        wizard = self._wizard.get(user_id) or {}
+        if wizard.get("flow") != "topup" or wizard.get("step") != "amount":
+            self._wizard.pop(user_id, None)
+            return self.main_menu(user_id)
+        amount = self._parse_amount(body)
+        if amount is None:
+            return Reply(
+                "That doesn't look like an amount. Numbers only — e.g. 200 "
+                "(₹10 minimum, ₹1,00,000 maximum).\n\nTry again or tap ✖️ Cancel.",
+                ok=False, rows=((("✖️ Cancel", "w"),),),
+            )
+        self._wizard[user_id] = {"flow": "topup", "step": "screenshot", "amount": amount.paise}
+        return Reply(
+            f"Amount noted: {amount}\n\n"
+            "📸 Now send the payment screenshot as a photo — "
+            "it goes straight to the owner with approve/decline buttons.",
+            rows=((("✖️ Cancel", "w"),),),
+        )
+
+    @staticmethod
+    def _parse_amount(text: str) -> Optional[Money]:
+        raw = text.lower().replace("₹", "").replace("rs.", "").replace("rs", "")
+        raw = raw.replace("inr", "").replace(",", "").strip()
+        raw = raw.rstrip(".").strip()
+        digits = raw.split(".", 1)[0]
+        paise = ""
+        if not digits.isdigit():
+            return None
+        rupees = int(digits)
+        if "." in raw:
+            frac = raw.split(".", 1)[1]
+            if not (frac.isdigit() and len(frac) <= 2):
+                return None
+            paise = frac.ljust(2, "0")
+        if not (10 <= rupees <= 100_000):
+            return None
+        return Money(rupees * 100 + (int(paise) if paise else 0))
+
+    def photo(self, user_id: str, file_id: str) -> Reply:
+        """A photo message arrives: payment screenshot, QR, or confusion."""
+        wizard = self._wizard.get(user_id) or {}
+        flow, step = wizard.get("flow"), wizard.get("step")
+        if flow == "topup" and step == "screenshot":
+            store = self._store
+            if store is None:
+                self._wizard.pop(user_id, None)
+                return Reply("Top-ups are offline right now. Try later.", ok=False)
+            amount = Money(int(wizard["amount"]))
+            topup_id = store.create_topup(user_id, amount, photo_file_id=file_id)
+            self._wizard.pop(user_id, None)
+            owner = self.router.owner_id
+            return Reply(
+                f"✅ Payment of {amount} submitted (no. {topup_id}).\n\n"
+                "The owner is verifying it — your balance updates automatically "
+                "when approved. You'll get a message here either way.",
+                rows=((("💰 My balance", "w"), ("🏠 Menu", "m")),),
+                notify=((owner,
+                         f"💳 New top-up #{topup_id}: {amount} from user {user_id}.\n"
+                         "Screenshot follows. Review: 📊 panel → 🧾 Top-ups."),)
+                if owner else (),
+                forward_photo=bool(owner),
+            )
+        if flow == "qr" and self.router._is_owner(user_id):
+            if self._store is not None:
+                self._store.kv_set("pay_qr_file_id", file_id)
+            self._wizard.pop(user_id, None)
+            return Reply(
+                "🖼 Payment QR saved — customers now see it on the Add Money screen.",
+                rows=((("📊 Owner panel", "a"),),),
+            )
+        return Reply(
+            "I got a photo, but no payment is in progress.\n"
+            "If that was a payment screenshot: 💰 Balance → ➕ Add money first, "
+            "then send it when asked.",
+            ok=False, rows=((("💰 Balance", "w"), ("🏠 Menu", "m")),),
         )
 
     def history_card(self, user_id: str) -> Reply:
@@ -256,14 +455,105 @@ class MenuUI:
             return Reply("Owner only.", ok=False, buttons=(("🏠 Menu", "m"),))
         status = self.router.engine.status()
         pnl = status["pnl"]
+        pending = self._pending_topups()
+        qr_state = "set ✅" if self._qr_file_id() else "not set ❌"
         return Reply(
             "📊 Owner panel\n\n"
-            f"Provider wallet: {status['provider_wallet']}\n"
-            f"Ledger wallet:   {status['ledger_wallet']}\n"
-            f"Revenue: {pnl['revenue']} · Costs: {pnl['cogs']}\n"
-            f"Net profit: {pnl['net_profit']}\n\n"
+            f"🏦 Provider wallet: {status['provider_wallet']}\n"
+            f"📒 Ledger wallet:    {status['ledger_wallet']}\n"
+            f"💹 Revenue: {pnl['revenue']} · Costs: {pnl['cogs']}\n"
+            f"📈 Net profit: {pnl['net_profit']}\n"
+            f"💳 Payments waiting: {len(pending)}\n"
+            f"🖼 Payment QR: {qr_state}\n\n"
             "Full P&L: /report · Health: /status",
-            rows=((("🏠 Menu", "m"),),),
+            rows=(
+                ((f"🧾 Top-ups ({len(pending)} pending)", "a:t"),),
+                (("🖼 Payment QR", "a:qr"),),
+                (("🏠 Menu", "m"),),
+            ),
+        )
+
+    def _pending_topups(self) -> list:
+        store = self._store
+        if store is None or not callable(getattr(store, "pending_topups", None)):
+            return []
+        return list(store.pending_topups())
+
+    def topups_screen(self, user_id: str) -> Reply:
+        if not self.router._is_owner(user_id):
+            return Reply("Owner only.", ok=False, rows=((("🏠 Menu", "m"),),))
+        pending = self._pending_topups()[:10]
+        if not pending:
+            return Reply(
+                "💳 Payments\n\n✨ Nothing waiting. New top-ups ping you here "
+                "automatically (with the customer's screenshot).",
+                rows=((("◀️ Owner panel", "a"),),),
+            )
+        lines = ["💳 Waiting for your review (newest first):"]
+        rows: list[tuple[tuple[str, str], ...]] = []
+        for t in pending:
+            when = time.strftime("%d %b %H:%M", time.localtime(t.created_ts))
+            lines.append(f"\n#{t.id} · {t.amount} · user `{t.user_id}` · {when}")
+            rows.append((
+                (f"✅ Credit {t.amount} (#{t.id})", f"ap:{t.id}"),
+                (f"❌ Decline (#{t.id})", f"ad:{t.id}"),
+            ))
+        rows.append((("🔄 Refresh", "a:t"), ("◀️ Owner panel", "a")))
+        return Reply("\n".join(lines), rows=tuple(rows))
+
+    def decide_topup(self, user_id: str, topup_id_s: str, approve: bool) -> Reply:
+        """Owner tapped approve/decline on a payment."""
+        if not self.router._is_owner(user_id):
+            return Reply("Owner only.", ok=False)
+        store = self._store
+        if store is None:
+            return Reply("Payments are offline on this deployment.", ok=False)
+        try:
+            topup_id = int(topup_id_s)
+        except ValueError:
+            return Reply("Bad payment id.", ok=False)
+        topup = store.get_topup(topup_id)
+        if topup is None:
+            return Reply(f"No payment #{topup_id} here.", ok=False)
+        if topup.status != "pending":
+            return Reply(f"#{topup_id} was already {topup.status}.", ok=False,
+                         rows=((("🧾 Top-ups", "a:t"),),))
+        if not store.decide_topup(topup_id, "approved" if approve else "declined",
+                                  decided_by=user_id):
+            return Reply(f"#{topup_id} was already processed.", ok=False)
+        if approve:
+            self.router.credit(topup.user_id, topup.amount)
+            fresh = self.topups_screen(user_id)
+            return Reply(
+                f"✅ #{topup_id} approved — {topup.amount} credited to "
+                f"user `{topup.user_id}`.\n\n{fresh.text}",
+                rows=fresh.rows,
+                notify=((topup.user_id,
+                         f"🎉 Payment approved! {topup.amount} added to your "
+                         f"balance ({self.router.balance_of(topup.user_id)} now). "
+                         "Tap /start and buy away 🛒"),),
+            )
+        fresh = self.topups_screen(user_id)
+        return Reply(
+            f"❌ #{topup_id} declined — no money moved.\n\n{fresh.text}",
+            rows=fresh.rows,
+            notify=((topup.user_id,
+                     f"⚠️ Your payment of {topup.amount} (no. {topup_id}) could not "
+                     "be verified, so no balance was added. Paid by mistake? "
+                     "Contact the owner with the correct proof."),),
+        )
+
+    def qr_screen(self, user_id: str) -> Reply:
+        if not self.router._is_owner(user_id):
+            return Reply("Owner only.", ok=False, rows=((("🏠 Menu", "m"),),))
+        state = "a QR is live ✅" if self._qr_file_id() else "no QR uploaded yet ❌"
+        self._wizard[user_id] = {"flow": "qr", "step": "photo"}
+        return Reply(
+            f"🖼 Payment QR — {state}\n\n"
+            "Send the QR image to THIS chat as a photo and it becomes what "
+            "customers see on ➕ Add money. (Your UPI ID text comes from the "
+            "PAY_UPI_ID setting.)",
+            rows=((("✖️ Cancel", "a"),),),
         )
 
     # -- buttons ---------------------------------------------------------
@@ -279,12 +569,31 @@ class MenuUI:
                          rows=((("🏠 Menu", "m"),),))
         parts = data.split(":")
         kind = parts[0]
+        # Navigating away silently cancels any half-done top-up wizard; the
+        # payment itself only exists once the screenshot lands, so nothing is lost.
+        if kind not in {"t", "ap", "ad"} and user_id in self._wizard:
+            self._wizard.pop(user_id, None)
         if kind == "m":
             return self.main_menu(user_id)
+        if kind == "t":
+            if len(parts) == 2 and parts[1] == "paid":
+                return self.topup_amount_prompt(user_id)
+            return self.topup_card(user_id) if len(parts) == 1 else self._badtap()
+        if kind == "ap" and len(parts) == 2:
+            return self.decide_topup(user_id, parts[1], approve=True)
+        if kind == "ad" and len(parts) == 2:
+            return self.decide_topup(user_id, parts[1], approve=False)
+        if kind == "a" and len(parts) == 2:
+            if parts[1] == "t":
+                return self.topups_screen(user_id)
+            if parts[1] == "qr":
+                return self.qr_screen(user_id)
+            return self._badtap()
         if kind == "l":
-            return self.services_grid(user_id)
-        if kind == "c" and len(parts) == 2:
-            return self.services_grid(user_id, parts[1])
+            return self.services_grid(user_id, page=_int(parts[1], 0) if len(parts) == 2 else 0)
+        if kind == "c":
+            cat_page = _int(parts[2], 0) if len(parts) == 3 else 0
+            return self.services_grid(user_id, parts[1], cat_page) if len(parts) >= 2 else self._badtap()
         if kind == "s" and len(parts) == 2:
             return self.service_card(user_id, parts[1])
         if kind == "w":
@@ -349,3 +658,8 @@ class MenuUI:
 
     def _can_createbot(self) -> bool:
         return self.router.subbots is not None
+
+    @staticmethod
+    def _badtap() -> Reply:
+        return Reply("That button went stale. Fresh menu:", ok=False,
+                     rows=((("🏠 Menu", "m"),),))

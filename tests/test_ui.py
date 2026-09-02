@@ -203,14 +203,18 @@ def test_history_records_purchases_this_session(rig):
     assert "telegram" in history.text.lower() or "OTP" in history.text
 
 
-def test_wallet_card_names_the_support_contact(rig):
+def test_wallet_card_and_topup_disabled_fallback(rig):
     ui, router, *_ = rig
     router.credit(USER, INR(25))
     reply = ui.button(USER, "w")
     assert "₹25" in reply.text
-    assert "@support" in reply.text
+    assert "t" in datas(reply)  # ➕ Add money button present
+    # No wallet store behind this test rig -> top-ups explain the fallback.
+    blocked = ui.button(USER, "t")
+    assert not blocked.ok
+    assert "@support" in blocked.text
     ui_default = MenuUI(router)
-    assert "the bot owner" in ui_default.button(USER, "w").text
+    assert "the bot owner" in ui_default.button(USER, "t").text
 
 
 # -- owner ------------------------------------------------------------------

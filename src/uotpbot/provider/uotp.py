@@ -196,6 +196,8 @@ class UotpConfig:
     backoff: float = 1.5
     validity_minutes: int = PROVIDER_VALIDITY_MINUTES
     user_agent: str = "uotpbot/1.1"
+    #: Query parameter carrying the SIM-bank server id on getNumber.
+    server_param: str = "server"
     #: Extra fixed query params, e.g. a version or a partner id.
     extra_params: Mapping[str, str] = field(default_factory=dict)
 
@@ -386,7 +388,8 @@ class UotpProvider:
         return None
 
     def buy_number(
-        self, service: str, country: str = "in", *, idempotency_key: Optional[str] = None
+        self, service: str, country: str = "in", *,
+        idempotency_key: Optional[str] = None, server: str = "",
     ) -> NumberAllocation:
         """Allocate a number via ``getNumber``.
 
@@ -411,6 +414,9 @@ class UotpProvider:
         # slug vocabulary. Translate through service_map when one is supplied.
         slug = c.service_map.get(service, service)
         params: dict[str, Any] = {"service": slug, "country": country}
+        if server:
+            # Stock and price live per SIM-bank server on uotp.store.
+            params[c.server_param] = server
         if idempotency_key:
             params["order"] = idempotency_key
         parsed = self._request(c.action_get_number, **params)

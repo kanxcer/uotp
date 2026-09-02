@@ -33,11 +33,12 @@ __all__ = [
 
 _ONE = Decimal(1)
 
-#: Cheapest thing the provider will charge for one number, in INR. uotp.in's
-#: live price list floors at Rs.10 -- no service is actually sold below this,
-#: despite the "from Rs.2" marketing. Any pricing model that assumes Rs.2
-#: loses money on every single order.
-PROVIDER_MIN_CHARGE = INR(10)
+#: Cheapest thing the provider will charge for one number, in INR. The old
+#: uotp.in price list floored at Rs.10; the current uotp.store inventory
+#: (dashboard live export, 2026-09-02) genuinely charges less for some --
+#: e.g. JustDial at Rs.2.79. Keep the floor conservative so pricing never
+#: assumes the "from Rs.2" marketing, which no live server matches anyway.
+PROVIDER_MIN_CHARGE = INR(2)
 
 #: Each number stays live this long and can receive multiple OTPs for the same
 #: service inside the window.
@@ -72,6 +73,9 @@ class ServiceCost:
     burn_rate: Decimal = Decimal("0.05")
     #: Fraction of a failed charge the provider actually credits back.
     refund_share: Decimal = Decimal("0.90")
+    #: Provider SIM-bank server id that quotes this price (uotp.store model:
+    #: price/stock live per server). Empty means "let the provider choose".
+    server: str = ""
 
     def __post_init__(self) -> None:
         if not self.slug:
@@ -190,6 +194,7 @@ class Catalog:
                     otp_success_rate=Decimal((row.get("success_rate") or "").strip() or "0.90"),
                     burn_rate=Decimal((row.get("burn_rate") or "").strip() or "0.05"),
                     refund_share=Decimal((row.get("refund_share") or "").strip() or "0.90"),
+                    server=(row.get("server") or "").strip(),
                 )
             except (ValueError, ArithmeticError) as exc:
                 raise CatalogError(f"{slug}: line {lineno}: {exc}") from exc

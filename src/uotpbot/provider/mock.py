@@ -86,7 +86,8 @@ class MockProvider:
         return dict(self._prices)
 
     def buy_number(
-        self, service: str, country: str = "in", *, idempotency_key: Optional[str] = None
+        self, service: str, country: str = "in", *,
+        idempotency_key: Optional[str] = None, server: str = "",
     ) -> NumberAllocation:
         # Idempotency: same key returns the same allocation, no second charge.
         if idempotency_key:

@@ -117,7 +117,7 @@ def test_engine_stops_when_out_of_stock(stack):
     engine, ledger, provider, _ = stack
 
     class NoStock(MockProvider):
-        def buy_number(self, service, country="in", *, idempotency_key=None):
+        def buy_number(self, service, country="in", *, idempotency_key=None, server=""):
             raise NumberUnavailable("none left")
 
     engine.provider = NoStock({})
@@ -172,8 +172,10 @@ def test_bundled_catalog_runs_end_to_end():
         catalog, provider, ledger, pricer,
         config=EngineConfig(retry_cap=3, otp_timeout_seconds=1.0, poll_interval=0.01),
     )
+    # Services that exist in the CURRENT uotp.store inventory (the old
+    # uotp.in-only names like telegram/whatsapp are deliberately gone).
     results = [engine.fulfil(f"c{i}", slug) for i, slug in
-               enumerate(["telegram", "whatsapp", "google", "binance"])]
+               enumerate(["google", "facebook", "swiggy", "irctc"])]
     ledger.verify()
     assert any(r.success for r in results)
     ledger.close()

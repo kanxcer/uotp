@@ -1,54 +1,1065 @@
-# UOTP provider cost catalogue
+# UOTP provider cost catalogue — uotp.store DASHBOARD inventory
 #
-# list_price_inr  -- transcribed from https://uotp.in/services on 2026-09-01.
-#                    These are the real checkout prices. The homepage's
-#                    "from Rs.2" teaser and its "Telegram Rs.2 / WhatsApp Rs.5
-#                    / Google Rs.8" table are marketing and are NOT what you
-#                    get charged. Lowest real price here is Rs.10.
+# Exported live 2026-09-02 by logging into a customer dashboard account
+# (spare credentials supplied by the owner) and reading:
+#   POST /api/product/getServices          -> 1047 service codes
+#   GET  /api/product/getServers?service=.&country=22 -> live INR price + stock per SIM-bank server
 #
-# success_rate    -- P(a purchased number yields a usable OTP).
-# burn_rate       -- P(a freshly allocated number is already registered /
-#                    rejected by the target service). Charged, rarely refunded.
-# refund_share    -- fraction of a failed charge credited back to your wallet.
+# list_price_inr = the cheapest LIVE server price for India (country 22);
+# server         = that server's id, passed to getNumber as the server param.
 #
-# The three rate columns are ENGINEERING PRIORS, not measured truth. They are
-# set from how aggressively each platform blocks VoIP/virtual ranges: Google,
-# Apple, Meta, Binance, Coinbase and PayPal are the worst offenders, plain
-# messaging apps the best. Replace them with your own measured values -- run
-#   python -m uotpbot.cli calibrate --service whatsapp
-# after you have real order history, and the numbers below get overwritten by
-# observed frequencies. Do not price off priors for long.
+# WARNING — this replaces the old uotp.in 32-service list. telegram,
+# whatsapp, snapchat, steam, binance etc. are ABSENT from the current
+# sellable inventory (their codes do not exist on uotp.store, so they
+# were removed rather than sold unfulfillable). 'telegraph' is the
+# Telegraph app whose display name says 'Telegram' — not telegram.me.
 #
-slug,name,category,list_price_inr,success_rate,burn_rate,refund_share
-telegram,Telegram,messaging,10,0.94,0.04,0.95
-discord,Discord,messaging,10,0.94,0.04,0.95
-line,Line,messaging,10,0.93,0.04,0.95
-wechat,WeChat,messaging,14,0.85,0.08,0.90
-whatsapp,WhatsApp,messaging,12,0.90,0.06,0.90
-okcupid,OkCupid,dating,11,0.92,0.05,0.90
-twitter,Twitter/X,social,11,0.91,0.05,0.90
-bolt,Bolt,transport,11,0.92,0.05,0.90
-snapchat,Snapchat,social,12,0.88,0.07,0.90
-steam,Steam,gaming,12,0.93,0.04,0.90
-tinder,Tinder,dating,12,0.91,0.05,0.90
-bumble,Bumble,dating,12,0.91,0.05,0.90
-deliveroo,Deliveroo,food,12,0.91,0.05,0.90
-facebook,Facebook,social,13,0.84,0.09,0.85
-tiktok,TikTok,social,13,0.88,0.07,0.90
-doordash,DoorDash,food,13,0.90,0.06,0.90
-grab,Grab,transport,12,0.91,0.05,0.90
-instagram,Instagram,social,14,0.82,0.10,0.85
-uber,Uber,transport,14,0.89,0.07,0.90
-booking,Booking.com,travel,14,0.90,0.06,0.90
-spotify,Spotify,entertainment,14,0.92,0.05,0.90
-google,Google,tech,15,0.78,0.12,0.80
-microsoft,Microsoft,tech,15,0.86,0.08,0.85
-airbnb,Airbnb,travel,15,0.89,0.07,0.90
-linkedin,LinkedIn,professional,16,0.85,0.09,0.85
-netflix,Netflix,entertainment,16,0.88,0.07,0.90
-amazon,Amazon,shopping,18,0.87,0.08,0.85
-apple,Apple,tech,18,0.76,0.13,0.80
-kraken,Kraken,crypto,18,0.80,0.11,0.80
-paypal,PayPal,finance,20,0.75,0.13,0.80
-coinbase,Coinbase,crypto,20,0.77,0.12,0.80
-binance,Binance,crypto,22,0.74,0.14,0.80
+# success/burn/refund rates are PRIORS — calibrate with real orders.
+slug,name,category,list_price_inr,success_rate,burn_rate,refund_share,server
+lightning,Lightning Ai,other,80.00,0.88,0.07,0.90,2
+telegraph,Telegram,messaging,50.00,0.88,0.07,0.90,12
+pth,pth,other,21.00,0.88,0.07,0.90,2
+all,ALL (60 SEC MULTIPLE),other,15.00,0.88,0.07,0.90,6
+myjio,MyJio,other,13.00,0.88,0.07,0.90,12
+airindia,airindia,travel,12.00,0.88,0.07,0.90,3
+facebook,Facebook,social,10.00,0.88,0.07,0.90,3
+hpgas,HP Gas,other,10.00,0.88,0.07,0.90,2
+flipkart,Flipkart,shopping,10.00,0.88,0.07,0.90,5
+91club,91Club,betting,10.00,0.88,0.07,0.90,7
+swarail,Swarail (RailOne),other,10.00,0.88,0.07,0.90,11
+kamaikendra,Kamai Kendra,other,10.00,0.88,0.07,0.90,3
+flipkartold,Flipkart Old,shopping,10.00,0.88,0.07,0.90,11
+jiomart,JioMart,shopping,10.00,0.88,0.07,0.90,11
+ajio,AJIO,shopping,10.00,0.88,0.07,0.90,4
+acko,Acko,other,10.00,0.88,0.07,0.90,7
+angleone,AngelOne,trading,10.00,0.88,0.07,0.90,7
+bigbasket,BigBasket,food,10.00,0.88,0.07,0.90,4
+cleartip,Cleartrip,travel,10.00,0.88,0.07,0.90,11
+countrydelight,Country Delight,food,10.00,0.88,0.07,0.90,3
+dealshare,DealShare,other,10.00,0.88,0.07,0.90,7
+zomato,Zomato,food,10.00,0.88,0.07,0.90,4
+dominos,Dominos,food,10.00,0.88,0.07,0.90,11
+eatsure,EatSure,food,10.00,0.88,0.07,0.90,2
+storytv,Storytv,streaming,10.00,0.88,0.07,0.90,5
+pharmeasy,PharmEasy,health,10.00,0.88,0.07,0.90,5
+firstcry,FirstCry,shopping,10.00,0.88,0.07,0.90,2
+fino,Fino,payments,10.00,0.88,0.07,0.90,2
+99acres,99acres,other,10.00,0.88,0.07,0.90,3
+gromo,Gromo Partner,other,10.00,0.88,0.07,0.90,3
+instagram,Instagram,social,10.00,0.88,0.07,0.90,4
+teenpattistar,TeenPatti Star,betting,10.00,0.88,0.07,0.90,2
+inl,IndiaLends,other,10.00,0.88,0.07,0.90,5
+irctc,IRCTC,travel,10.00,0.88,0.07,0.90,7
+lotus365,Lotus 365,other,10.00,0.88,0.07,0.90,7
+moneycontrol,Money Control,trading,10.00,0.88,0.07,0.90,7
+meesho,Meesho,shopping,10.00,0.88,0.07,0.90,4
+magicpin,Magicpin,other,10.00,0.88,0.07,0.90,2
+nykaa,Nykaa,shopping,10.00,0.88,0.07,0.90,2
+tinder,Tinder,dating,10.00,0.88,0.07,0.90,2
+1mg,1mg,health,10.00,0.88,0.07,0.90,2
+yono777,Yo777,other,10.00,0.88,0.07,0.90,2
+panta,Pantastore,other,10.00,0.88,0.07,0.90,7
+pincode,Pincode,other,10.00,0.88,0.07,0.90,3
+dishtv,DishTV,other,10.00,0.88,0.07,0.90,3
+rapido,Rapido,travel,10.00,0.88,0.07,0.90,7
+rummyeast,Rummy East,betting,10.00,0.88,0.07,0.90,7
+rummygold,Rummy Gold,betting,10.00,0.88,0.07,0.90,11
+rummyperfect,Rummy perfect,betting,10.00,0.88,0.07,0.90,2
+timesprime,Times Prime,other,10.00,0.88,0.07,0.90,7
+rummywealth,Rummy Wealth,betting,10.00,0.88,0.07,0.90,2
+rooter,Rooter,other,10.00,0.88,0.07,0.90,11
+rummyglee,Rummy Glee,betting,10.00,0.88,0.07,0.90,2
+shopsy,Shopsy,shopping,10.00,0.88,0.07,0.90,3
+singham,Singam lottery,betting,10.00,0.88,0.07,0.90,7
+snapmint,Snapmint,tech,10.00,0.88,0.07,0.90,7
+stan,Stan,other,10.00,0.88,0.07,0.90,4
+tib,Tira Beauty,other,10.00,0.88,0.07,0.90,11
+blablacar,BlaBlaCar,other,10.00,0.88,0.07,0.90,11
+unacademy,Unacademy,edtech,10.00,0.88,0.07,0.90,5
+woohoo,Woohoo,other,10.00,0.88,0.07,0.90,2
+rummyola,RummyOla,betting,10.00,0.88,0.07,0.90,11
+airtel,Airtel,other,10.00,0.88,0.07,0.90,2
+51game,51game,other,10.00,0.88,0.07,0.90,5
+digihaat,Digihaat,other,10.00,0.88,0.07,0.90,7
+bonusbuddy,bonus buddy,other,10.00,0.88,0.07,0.90,7
+kgen,KGEN,other,10.00,0.88,0.07,0.90,11
+tataneu,Tata Neu,other,10.00,0.88,0.07,0.90,7
+swiggy,Swiggy,food,10.00,0.88,0.07,0.90,7
+amazon,Amazon,shopping,10.00,0.88,0.07,0.90,4
+myntra,Myntra,shopping,10.00,0.88,0.07,0.90,4
+zepto,Zepto,food,10.00,0.88,0.07,0.90,2
+royaljeet,Royaljeet,other,10.00,0.88,0.07,0.90,3
+jeetexch360,Jeetexch360,other,10.00,0.88,0.07,0.90,2
+microsoft,Microsoft,tech,10.00,0.88,0.07,0.90,7
+reddybook,ReddyBook,other,10.00,0.88,0.07,0.90,3
+rummyyes,Rummy Yes,betting,10.00,0.88,0.07,0.90,2
+naukari,Naukri,jobs,10.00,0.88,0.07,0.90,7
+qik,Spin777,other,10.00,0.88,0.07,0.90,2
+winclash,winclash,other,10.00,0.88,0.07,0.90,2
+bingo777,Bingo777,other,10.00,0.88,0.07,0.90,3
+nielsen,Nielsen,other,10.00,0.88,0.07,0.90,7
+innopay,innopay,other,10.00,0.88,0.07,0.90,11
+qco,V RUMMY,betting,10.00,0.88,0.07,0.90,2
+jeetwin,Jeetwin,other,10.00,0.88,0.07,0.90,7
+rummygood,Rummy Good,betting,10.00,0.88,0.07,0.90,11
+yonoarcade,YonoArcade,other,10.00,0.88,0.07,0.90,3
+dotandkey,Dotandkey,shopping,10.00,0.88,0.07,0.90,3
+dreammoneya,DreamMoney,other,10.00,0.88,0.07,0.90,5
+freelancer,Freelancer,jobs,10.00,0.88,0.07,0.90,4
+dmart,Dmart,food,10.00,0.88,0.07,0.90,4
+googlepay,Google pay,payments,10.00,0.88,0.07,0.90,4
+shein,Shein,shopping,10.00,0.88,0.07,0.90,11
+rummymost,Rummy Most,betting,10.00,0.88,0.07,0.90,7
+cricmatch360,cricmatch360,other,10.00,0.88,0.07,0.90,7
+3f,Game3f,other,10.00,0.88,0.07,0.90,3
+aagames,AA Games,other,10.00,0.88,0.07,0.90,4
+starexch,Starexch,other,10.00,0.88,0.07,0.90,11
+shriramone,Shriram One,other,10.00,0.88,0.07,0.90,11
+youtube,Youtube,streaming,10.00,0.88,0.07,0.90,4
+jiffy,Jiffy,other,10.00,0.88,0.07,0.90,7
+dhoom,Dhoom Play,other,10.00,0.88,0.07,0.90,11
+stablemoney,Stable Money,other,10.00,0.88,0.07,0.90,7
+ranglive,Ranglive,other,10.00,0.88,0.07,0.90,3
+rummypaisa,Rummy Paisa,betting,10.00,0.88,0.07,0.90,7
+jiohotstar,JioHotstar,streaming,10.00,0.88,0.07,0.90,11
+vercel,Vercel,tech,10.00,0.88,0.07,0.90,3
+jalwa,Jalwa,betting,10.00,0.88,0.07,0.90,11
+rajagame,Raja game,other,10.00,0.88,0.07,0.90,11
+567slots,567slots,betting,10.00,0.88,0.07,0.90,11
+6club,6 Club,other,10.00,0.88,0.07,0.90,11
+6profit,6 Profit,other,10.00,0.88,0.07,0.90,5
+a66game_22,66game,other,10.00,0.88,0.07,0.90,7
+zubydo_22,Zubydo,other,10.00,0.88,0.07,0.90,11
+zerox,Zerox,other,10.00,0.88,0.07,0.90,7
+zeptom,Zeptom,food,10.00,0.88,0.07,0.90,5
+yourrick,Your Rick,other,10.00,0.88,0.07,0.90,3
+yonoslots,Yonoslots,betting,10.00,0.88,0.07,0.90,3
+yonovip,Yono Vip,betting,10.00,0.88,0.07,0.90,3
+91rummy,91Rummy,betting,10.00,0.88,0.07,0.90,3
+abet,A Bet,other,10.00,0.88,0.07,0.90,2
+abcd,Aditya Birla Capital,other,10.00,0.88,0.07,0.90,11
+agrostar,Agro Star,other,10.00,0.88,0.07,0.90,2
+ak47,Ak47,other,10.00,0.88,0.07,0.90,3
+winmate,Winmate,other,10.00,0.88,0.07,0.90,5
+win11_22,Win11,other,10.00,0.88,0.07,0.90,5
+weplay,WePlay,other,10.00,0.88,0.07,0.90,11
+winza_22,Winza,betting,10.00,0.88,0.07,0.90,3
+wyse_22,Wyse,other,10.00,0.88,0.07,0.90,11
+yonogames,Yono Games,betting,10.00,0.88,0.07,0.90,11
+yonoking,Yono King,betting,10.00,0.88,0.07,0.90,5
+spinkaro,Spinkaro,other,10.00,0.88,0.07,0.90,7
+spin567,Spin567,other,10.00,0.88,0.07,0.90,11
+railtel,railtel,other,10.00,0.88,0.07,0.90,2
+star777,Star777,other,10.00,0.88,0.07,0.90,3
+storm,Storm,other,10.00,0.88,0.07,0.90,11
+starp_22,Starp,other,10.00,0.88,0.07,0.90,11
+sudipta,Sudipta,other,10.00,0.88,0.07,0.90,11
+storymax,Story Max,other,10.00,0.88,0.07,0.90,5
+svip777,Svip777,other,10.00,0.88,0.07,0.90,3
+t1game,T1game,other,10.00,0.88,0.07,0.90,3
+tapalam,Tap Alam,other,10.00,0.88,0.07,0.90,3
+tabe,Tabe,other,10.00,0.88,0.07,0.90,5
+teenpatisona,Teenpati Sona,other,10.00,0.88,0.07,0.90,2
+test_22,Test Service,other,10.00,0.88,0.07,0.90,2
+teenpattinobel,Teenpatti Nobel,betting,10.00,0.88,0.07,0.90,7
+twilio,Twilio,tech,10.00,0.88,0.07,0.90,3
+umoney,Umoney,other,10.00,0.88,0.07,0.90,11
+trumeds,Truemeds,other,10.00,0.88,0.07,0.90,2
+testbook,Testbook,edtech,10.00,0.88,0.07,0.90,7
+tickmill,Tickmill,trading,10.00,0.88,0.07,0.90,5
+tiranga,Tiranga,betting,10.00,0.88,0.07,0.90,7
+wazirwin,Wazirwin,other,10.00,0.88,0.07,0.90,7
+voyz,Voyz,other,10.00,0.88,0.07,0.90,11
+vip,VIP-777,betting,10.00,0.88,0.07,0.90,3
+ak777,Ak777,other,10.00,0.88,0.07,0.90,5
+almond,Almond,other,10.00,0.88,0.07,0.90,2
+andy_22,Andy,other,10.00,0.88,0.07,0.90,2
+apanamart_22,Apna Mart,jobs,10.00,0.88,0.07,0.90,3
+apple,Apple ID,tech,10.00,0.88,0.07,0.90,3
+bajajmarket,Bajaj Market,payments,10.00,0.88,0.07,0.90,3
+bacasino,BCASINO,betting,10.00,0.88,0.07,0.90,3
+pundit,Asli Pundit,other,10.00,0.88,0.07,0.90,3
+bharatpe,BharatPe,payments,10.00,0.88,0.07,0.90,3
+bigcity,Bigcity,other,10.00,0.88,0.07,0.90,5
+bizom,Bizom,other,10.00,0.88,0.07,0.90,7
+brevistay,Brevistay,other,10.00,0.88,0.07,0.90,3
+bounty,Bounty,other,10.00,0.88,0.07,0.90,2
+borzo,Borzo,other,10.00,0.88,0.07,0.90,3
+bookmydiamond,Book My Diamond,other,10.00,0.88,0.07,0.90,11
+boat,boAt,shopping,10.00,0.88,0.07,0.90,11
+brevo,Brevo,tech,10.00,0.88,0.07,0.90,5
+brskly,Brskly,other,10.00,0.88,0.07,0.90,5
+buggie,Buggie,other,10.00,0.88,0.07,0.90,2
+career360_22,Career 360,edtech,10.00,0.88,0.07,0.90,11
+cashbook,Cash Book,other,10.00,0.88,0.07,0.90,5
+cheq,CheQ,payments,10.00,0.88,0.07,0.90,4
+cigna_22,Cigna,other,10.00,0.88,0.07,0.90,3
+cipla_22,CIPLA,other,10.00,0.88,0.07,0.90,5
+citykart,Citykart,other,10.00,0.88,0.07,0.90,5
+connecto_22,Connecto,other,10.00,0.88,0.07,0.90,11
+crisscross,Crisscross,other,10.00,0.88,0.07,0.90,5
+dainikbhaskar,Dainik Bhaskar,other,10.00,0.88,0.07,0.90,7
+crystalpay_22,Crystal Pay,other,10.00,0.88,0.07,0.90,3
+croreplay_22,Crore Play,other,10.00,0.88,0.07,0.90,11
+dbggame,DBG Game,other,10.00,0.88,0.07,0.90,3
+btd,DBT Agriculture,other,10.00,0.88,0.07,0.90,3
+delhiveroo,Delhiveroo,other,10.00,0.88,0.07,0.90,5
+dermaco,Dermaco,shopping,10.00,0.88,0.07,0.90,2
+delhivery,Delhivery,other,10.00,0.88,0.07,0.90,2
+dggame,DG Game,other,10.00,0.88,0.07,0.90,7
+digialaya,Digialaya,other,10.00,0.88,0.07,0.90,7
+digitaltopup,Digital Topup,other,10.00,0.88,0.07,0.90,2
+dkart,DKart,other,10.00,0.88,0.07,0.90,11
+dove,Dove,other,10.00,0.88,0.07,0.90,3
+drop,Drop-D,other,10.00,0.88,0.07,0.90,7
+dropit_22,Dropit,other,10.00,0.88,0.07,0.90,2
+eipl,eIPL,other,10.00,0.88,0.07,0.90,11
+eatclub,Eatclub,food,10.00,0.88,0.07,0.90,11
+foxtale,Foxtale,other,10.00,0.88,0.07,0.90,3
+freehit,Free Hit,other,10.00,0.88,0.07,0.90,2
+freerecharge,FreeRecharge,other,10.00,0.88,0.07,0.90,5
+frnd,FRND,dating,10.00,0.88,0.07,0.90,2
+gamerummy,Game Rummy,betting,10.00,0.88,0.07,0.90,5
+game1,Game1,other,10.00,0.88,0.07,0.90,5
+google,Google & YouTube & Gmail = A,streaming,10.00,0.88,0.07,0.90,4
+googlemessage,Google Message,messaging,10.00,0.88,0.07,0.90,5
+hmrmal_22,Hmrmal,other,10.00,0.88,0.07,0.90,5
+havells_22,Havells,other,10.00,0.88,0.07,0.90,2
+happyrummy,Happy Rummy,betting,10.00,0.88,0.07,0.90,11
+housing,Housing.com,other,10.00,0.88,0.07,0.90,4
+icici,ICICI,payments,10.00,0.88,0.07,0.90,2
+icicimf,ICICI Mutual Fund,payments,10.00,0.88,0.07,0.90,7
+indusbet,Indusbet,other,10.00,0.88,0.07,0.90,2
+jaiclub,Jaiclub,other,10.00,0.88,0.07,0.90,7
+jiofiber_22,Jio Fiber,other,10.00,0.88,0.07,0.90,3
+jumbo,Jumbo,other,10.00,0.88,0.07,0.90,11
+lendingplate,Lendingplate,other,10.00,0.88,0.07,0.90,5
+kredbharat,Kredbharat,other,10.00,0.88,0.07,0.90,2
+klydo,Klydo,other,10.00,0.88,0.07,0.90,3
+lottery7,Lottery7,betting,10.00,0.88,0.07,0.90,11
+ludofancy_22,Ludo Fancy,betting,10.00,0.88,0.07,0.90,5
+mahaluck,Maha Luck,other,10.00,0.88,0.07,0.90,3
+mantrigame,Mantrigame,other,10.00,0.88,0.07,0.90,3
+mantrishop,Mantrishop,other,10.00,0.88,0.07,0.90,7
+master_22,Master EDU,other,10.00,0.88,0.07,0.90,7
+matkax,Matkax,betting,10.00,0.88,0.07,0.90,2
+meragaao,Mera Gaon,other,10.00,0.88,0.07,0.90,7
+milkbasket,Milkbasket,food,10.00,0.88,0.07,0.90,3
+jjh_22,mine,other,10.00,0.88,0.07,0.90,7
+mtgame,Mt Game,other,10.00,0.88,0.07,0.90,2
+mreward,Mreward,other,10.00,0.88,0.07,0.90,2
+mr777,Mr777,other,10.00,0.88,0.07,0.90,3
+mpocket_22,mPocket,other,10.00,0.88,0.07,0.90,2
+mymart,My Mart,other,10.00,0.88,0.07,0.90,3
+mywallet,My Wallet,payments,10.00,0.88,0.07,0.90,3
+nexsoft_22,Nexsoft,other,10.00,0.88,0.07,0.90,2
+netmeds,Netmeds,health,10.00,0.88,0.07,0.90,2
+nielsenmore_22,Nestle,other,10.00,0.88,0.07,0.90,7
+ncfun,NcFun,other,10.00,0.88,0.07,0.90,5
+novamines_22,Nova Mines,other,10.00,0.88,0.07,0.90,3
+okwin,Okwin,betting,10.00,0.88,0.07,0.90,11
+olacabs,Ola Cabs,travel,10.00,0.88,0.07,0.90,3
+orgen,Orgen,other,10.00,0.88,0.07,0.90,5
+dubaiexch247,dubaiexch247,other,10.00,0.88,0.07,0.90,2
+hamaramall,hamaramall,other,10.00,0.88,0.07,0.90,3
+hamramall,hamramall,other,10.00,0.88,0.07,0.90,2
+in99,in99,betting,10.00,0.88,0.07,0.90,3
+in999,in999,betting,10.00,0.88,0.07,0.90,11
+incred,incred,other,10.00,0.88,0.07,0.90,5
+indiago,indiago,travel,10.00,0.88,0.07,0.90,5
+jwin,jwin,other,10.00,0.88,0.07,0.90,2
+keenin,keenin,other,10.00,0.88,0.07,0.90,5
+kheloboss,kheloboss,other,10.00,0.88,0.07,0.90,3
+kk789,kk789,other,10.00,0.88,0.07,0.90,7
+parbet,parbet,other,10.00,0.88,0.07,0.90,3
+perbet,perbet,other,10.00,0.88,0.07,0.90,5
+pharmarack,pharmarack,other,10.00,0.88,0.07,0.90,5
+playconsole,play console,tech,10.00,0.88,0.07,0.90,7
+pmfby,pmfby,govt,10.00,0.88,0.07,0.90,11
+pointmatka,point matka,betting,10.00,0.88,0.07,0.90,5
+policybazaar,policy bazaar,other,10.00,0.88,0.07,0.90,3
+poonewala,poonawala fincorp,other,10.00,0.88,0.07,0.90,5
+praxo,praxo,other,10.00,0.88,0.07,0.90,7
+private,private,other,10.00,0.88,0.07,0.90,2
+mobi,mobikwik,payments,10.00,0.88,0.07,0.90,5
+mobileconnect,mobile connect,other,10.00,0.88,0.07,0.90,5
+private1,private -1,other,10.00,0.88,0.07,0.90,7
+quicktv,quick tv,streaming,10.00,0.88,0.07,0.90,7
+qwikcliver,qwiksilver,other,10.00,0.88,0.07,0.90,11
+razorpay,razorpay,payments,10.00,0.88,0.07,0.90,11
+realstate,real estate india,other,10.00,0.88,0.07,0.90,5
+rebounce,rebounce,other,10.00,0.88,0.07,0.90,11
+repair,repair challenge,edtech,10.00,0.88,0.07,0.90,7
+rewardmedia,reward media,other,10.00,0.88,0.07,0.90,5
+ricklive,ricklive,other,10.00,0.88,0.07,0.90,11
+ricktick,ricktick,other,10.00,0.88,0.07,0.90,2
+rockywin,rockywin,other,10.00,0.88,0.07,0.90,11
+rohini,rohini,other,10.00,0.88,0.07,0.90,11
+rojdhan,rojdhan,other,10.00,0.88,0.07,0.90,7
+roney,roney sensex,other,10.00,0.88,0.07,0.90,2
+rosier,rosier (carwale),other,10.00,0.88,0.07,0.90,11
+rummyclub,rummy club,betting,10.00,0.88,0.07,0.90,11
+leader,rummy leader,betting,10.00,0.88,0.07,0.90,11
+rummygrand,rummy grand,betting,10.00,0.88,0.07,0.90,4
+rummymars,rummy mars,betting,10.00,0.88,0.07,0.90,3
+rummysweety,rummy sweety,betting,10.00,0.88,0.07,0.90,7
+rupiyo,rupiyo,other,10.00,0.88,0.07,0.90,7
+samridhi,samridhi (havells),other,10.00,0.88,0.07,0.90,7
+shikhar,Shikhar,other,10.00,0.88,0.07,0.90,4
+shopflo,shopflo,other,10.00,0.88,0.07,0.90,2
+signal,signal,messaging,10.00,0.88,0.07,0.90,3
+simple,simple pay,other,10.00,0.88,0.07,0.90,2
+slotwinner,slot winner,other,10.00,0.88,0.07,0.90,4
+smsindiahub,sms india hub,tech,10.00,0.88,0.07,0.90,3
+ubereat,uber eats,travel,10.00,0.88,0.07,0.90,4
+ultragame,ultra game,other,10.00,0.88,0.07,0.90,2
+upstox,upstox,trading,10.00,0.88,0.07,0.90,3
+urbanpro,urban pro,other,10.00,0.88,0.07,0.90,3
+gujarat,vip gujarat,other,10.00,0.88,0.07,0.90,5
+fire11,Fire11,other,10.00,0.88,0.07,0.90,2
+digitalindia,Digital India,other,10.00,0.88,0.07,0.90,2
+cockfight,Cockfight,other,10.00,0.88,0.07,0.90,7
+kph,KPH,other,10.00,0.88,0.07,0.90,7
+asgame,AsGame,other,10.00,0.88,0.07,0.90,2
+p77,P77,other,10.00,0.88,0.07,0.90,4
+rajasthanherbal,Rajasthanherbal,other,10.00,0.88,0.07,0.90,7
+punjabking,Punjab King,other,10.00,0.88,0.07,0.90,3
+indianoil,Indian Oil,other,10.00,0.88,0.07,0.90,4
+teenpatineta,Teenpati Neta,other,10.00,0.88,0.07,0.90,3
+annalottery,Anna Lottery,betting,10.00,0.88,0.07,0.90,4
+meta,Meta,social,10.00,0.88,0.07,0.90,7
+kkr,KKR,other,10.00,0.88,0.07,0.90,7
+mantrimall,Mantrimall,other,10.00,0.88,0.07,0.90,3
+superj,SuperJ,other,10.00,0.88,0.07,0.90,7
+bharatgas,Bharatgas,other,10.00,0.88,0.07,0.90,3
+jaiho777,Jaiho777,other,10.00,0.88,0.07,0.90,7
+matka,Matka,betting,10.00,0.88,0.07,0.90,2
+jar,Jar,other,10.00,0.88,0.07,0.90,2
+gosh,Gosh,other,10.00,0.88,0.07,0.90,2
+rnfi,RNFI,other,10.00,0.88,0.07,0.90,3
+epaisa,Epaisa,payments,10.00,0.88,0.07,0.90,2
+allen,Allen,edtech,10.00,0.88,0.07,0.90,7
+paybet,Paybet,other,10.00,0.88,0.07,0.90,2
+cred,CRED: UPI & Credit Cards,payments,10.00,0.88,0.07,0.90,11
+jiosavaan,Jiosavaan,other,10.00,0.88,0.07,0.90,7
+viralo,Viralo,other,10.00,0.88,0.07,0.90,3
+aws,AWS,tech,10.00,0.88,0.07,0.90,7
+tywin,Tywin,other,10.00,0.88,0.07,0.90,2
+urbancompany,Urban Company,other,10.00,0.88,0.07,0.90,2
+worldlends,World Lends,other,10.00,0.88,0.07,0.90,3
+abhibus,Abhibus,other,10.00,0.88,0.07,0.90,3
+woweat,Wow Eat,food,10.00,0.88,0.07,0.90,2
+toing,Toing,other,10.00,0.88,0.07,0.90,7
+kalyanmatrimony,kalyanmatrimony,dating,10.00,0.88,0.07,0.90,7
+8jjbet,8jjbet,other,10.00,0.88,0.07,0.90,11
+kingfisher,Kingfisher,other,10.00,0.88,0.07,0.90,2
+astroyogi,Astroyogi,other,10.00,0.88,0.07,0.90,5
+rewardx,Rewardx,other,10.00,0.88,0.07,0.90,2
+barbequenation,Barbeque Nation,food,10.00,0.88,0.07,0.90,7
+friendshiphub,FriendshipHub,dating,10.00,0.88,0.07,0.90,3
+goibibo,Goibibo,travel,10.00,0.88,0.07,0.90,2
+googlechat,Google Chat,messaging,10.00,0.88,0.07,0.90,7
+growfitter,Growfitter,other,10.00,0.88,0.07,0.90,3
+rummyloot,Rummy Loot,betting,10.00,0.88,0.07,0.90,5
+truecaller,Truecaller,other,10.00,0.88,0.07,0.90,11
+bajajfinance,Bajaj Finance,payments,10.00,0.88,0.07,0.90,7
+digitinsurance,Digit Insurance,other,10.00,0.88,0.07,0.90,7
+zaploan,Zaploan,other,10.00,0.88,0.07,0.90,4
+licious,Licious,food,10.00,0.88,0.07,0.90,2
+upay,Upay,other,10.00,0.88,0.07,0.90,11
+unicefp2e,Unicef p2e,other,10.00,0.88,0.07,0.90,11
+kfc,KFC,food,10.00,0.88,0.07,0.90,2
+onlineshop,Online Shop,other,10.00,0.88,0.07,0.90,2
+financebuddha,Financebuddha,other,10.00,0.88,0.07,0.90,5
+4mmile,4mmile,other,10.00,0.88,0.07,0.90,7
+provilac,Provilac,other,10.00,0.88,0.07,0.90,7
+epaddy,epaddy,other,10.00,0.88,0.07,0.90,7
+prorewards,Pro Rewards,other,10.00,0.88,0.07,0.90,3
+mbet,Mbet,other,10.00,0.88,0.07,0.90,11
+vfs,VFS,other,10.00,0.88,0.07,0.90,7
+amway,Amway,other,10.00,0.88,0.07,0.90,3
+drivebison,drivebison,other,10.00,0.88,0.07,0.90,5
+phonepe,phonepe,payments,10.00,0.88,0.07,0.90,11
+rummyclubb,rummy club-1,betting,10.00,0.88,0.07,0.90,3
+zillybuy,Zilly Buy,other,10.00,0.88,0.07,0.90,3
+okmm,Okmm.com,other,10.00,0.88,0.07,0.90,2
+quicker,Quicker,other,10.00,0.88,0.07,0.90,11
+bistro,Bistro,other,10.00,0.88,0.07,0.90,2
+xipl,xIPL,other,10.00,0.88,0.07,0.90,11
+app20,App20,other,10.00,0.88,0.07,0.90,11
+krishvi,Krishvi,other,10.00,0.88,0.07,0.90,4
+indubt,INDUBT,other,10.00,0.88,0.07,0.90,4
+sigmlt,SIGMLT,other,10.00,0.88,0.07,0.90,3
+zingoy,Zingoy,other,10.00,0.88,0.07,0.90,3
+rxpay,RxPay,other,10.00,0.88,0.07,0.90,3
+jeet,Jeet,betting,10.00,0.88,0.07,0.90,2
+ubgtl,UBGTL,other,10.00,0.88,0.07,0.90,5
+ownly,Ownly,other,10.00,0.88,0.07,0.90,3
+ercs,ERCS,other,10.00,0.88,0.07,0.90,5
+kalyanjewellers,Kalyan Jewellers,other,10.00,0.88,0.07,0.90,5
+timepecash,TimePeCash,other,10.00,0.88,0.07,0.90,3
+spin99,Spin99,other,10.00,0.88,0.07,0.90,3
+herbalife,Herbalife,other,10.00,0.88,0.07,0.90,5
+gosats,Gosats,other,10.00,0.88,0.07,0.90,5
+4sideplay,4 Side Play,other,10.00,0.88,0.07,0.90,4
+pbks,PBKS,other,10.00,0.88,0.07,0.90,7
+youth,Youth,other,10.00,0.88,0.07,0.90,2
+playzhub,Playzhub,other,10.00,0.88,0.07,0.90,11
+epl,EPL,other,10.00,0.88,0.07,0.90,7
+galle,Galle,other,10.00,0.88,0.07,0.90,4
+iocl,IOCL (Indane),other,10.00,0.88,0.07,0.90,5
+chillar,Chillar,other,10.00,0.88,0.07,0.90,4
+moneyhi,Moneyhi,other,10.00,0.88,0.07,0.90,11
+cashdaily,Cash Daily,other,10.00,0.88,0.07,0.90,3
+bgil,BGIL,other,10.00,0.88,0.07,0.90,11
+ww5,Ww5,other,10.00,0.88,0.07,0.90,3
+jigri,Jigri,other,10.00,0.88,0.07,0.90,7
+savesage,Savesage,other,10.00,0.88,0.07,0.90,4
+akashinstitute,Akash Institute,edtech,10.00,0.88,0.07,0.90,2
+muthoot,Muthoot,other,10.00,0.88,0.07,0.90,4
+fcpay,Fc Pay,other,10.00,0.88,0.07,0.90,3
+boom79,Boom79,other,10.00,0.88,0.07,0.90,3
+test91,Test91,other,10.00,0.88,0.07,0.90,3
+newvt,Newvt,other,10.00,0.88,0.07,0.90,7
+hotya,Hotya,other,10.00,0.88,0.07,0.90,3
+teenpattirush,teen patti rush,betting,10.00,0.88,0.07,0.90,3
+yatharthgeeta,Yatharthgeeta,other,10.00,0.88,0.07,0.90,4
+pw,Pw,other,10.00,0.88,0.07,0.90,4
+californiaburrito,California Burrito,other,10.00,0.88,0.07,0.90,7
+rummynoble,Rummy Noble,betting,10.00,0.88,0.07,0.90,4
+redrob,Redrob,other,10.00,0.88,0.07,0.90,3
+rummyleader,Rummy Leader,betting,10.00,0.88,0.07,0.90,2
+flot,Flot,other,10.00,0.88,0.07,0.90,5
+jaihospin,Jaiho Spin,betting,10.00,0.88,0.07,0.90,11
+rupibt,Rupibt,other,10.00,0.88,0.07,0.90,5
+hdfcergo,HDFC ERGO,payments,10.00,0.88,0.07,0.90,7
+salarysetu,Salary Setu,other,10.00,0.88,0.07,0.90,7
+luci,Luci,other,10.00,0.88,0.07,0.90,4
+opinionbureo,Opinion bureo,other,10.00,0.88,0.07,0.90,4
+goldsbet,Goldsbet,other,10.00,0.88,0.07,0.90,11
+croma,Croma,shopping,10.00,0.88,0.07,0.90,2
+starzbet,Starzbet,other,10.00,0.88,0.07,0.90,11
+indwin,Indwin,other,10.00,0.88,0.07,0.90,11
+taurus,Taurus,other,10.00,0.88,0.07,0.90,3
+walter,Walter,other,10.00,0.88,0.07,0.90,2
+gamerji,Gamerji,gaming,10.00,0.88,0.07,0.90,5
+hoora,Hoora,other,10.00,0.88,0.07,0.90,5
+d2game,D2Game,other,10.00,0.88,0.07,0.90,11
+ticktac,Tick Tac,other,10.00,0.88,0.07,0.90,4
+kukutv,Kukutv,streaming,10.00,0.88,0.07,0.90,7
+1xgame,1xGame,other,10.00,0.88,0.07,0.90,3
+jeetfix,Jeetfix,other,10.00,0.88,0.07,0.90,2
+parimatch,Parimatch,other,10.00,0.88,0.07,0.90,11
+foxmotors,FoxMotors,other,10.00,0.88,0.07,0.90,11
+bbjili,Bbjili,other,10.00,0.88,0.07,0.90,7
+kirlo,Kirlo,other,10.00,0.88,0.07,0.90,7
+saudiaairline,Saudia airline,travel,10.00,0.88,0.07,0.90,3
+101z11,101z11,other,10.00,0.88,0.07,0.90,3
+8spinwinner,8spinwinner,other,10.00,0.88,0.07,0.90,3
+game11,Game11,other,10.00,0.88,0.07,0.90,11
+mantricenter,mantricenter,other,10.00,0.88,0.07,0.90,2
+wowtv,WowTv,other,10.00,0.88,0.07,0.90,2
+jugnoo,Jugnoo,travel,10.00,0.88,0.07,0.90,7
+arb,Arb,other,10.00,0.88,0.07,0.90,7
+x89,X89 App,other,10.00,0.88,0.07,0.90,7
+viewpoint,Viewpoint,other,10.00,0.88,0.07,0.90,2
+greenedge,greenedge,other,10.00,0.88,0.07,0.90,7
+kohinoor,Kohinoor,other,10.00,0.88,0.07,0.90,11
+yaarwin,Yaarwin,other,10.00,0.88,0.07,0.90,11
+wealthnobel,Wealth Nobel,other,10.00,0.88,0.07,0.90,11
+shadowfax,Shadowfax,other,10.00,0.88,0.07,0.90,11
+test66,Test66,other,10.00,0.88,0.07,0.90,7
+teenpatticash,Teenpatti Cash,betting,10.00,0.88,0.07,0.90,3
+game12,Game12,other,10.00,0.88,0.07,0.90,3
+sayacare,Saya Care,other,10.00,0.88,0.07,0.90,2
+mahatma,Mahatma,other,10.00,0.88,0.07,0.90,11
+bingo,Bingo,other,10.00,0.88,0.07,0.90,7
+spincasino,Spin Casino,betting,10.00,0.88,0.07,0.90,7
+earn3x,Earn3x,other,10.00,0.88,0.07,0.90,11
+joshjobs,joshjobs,jobs,10.00,0.88,0.07,0.90,11
+digitalliteracy,Digital Literacy,other,10.00,0.88,0.07,0.90,3
+stockgro,Stockgro,trading,10.00,0.88,0.07,0.90,5
+xoxoday,xoxoday,other,10.00,0.88,0.07,0.90,2
+yamaha,Yamaha,other,10.00,0.88,0.07,0.90,2
+rupay,Rupay,payments,10.00,0.88,0.07,0.90,3
+quizearnmoney,quizearnmoney,other,10.00,0.88,0.07,0.90,11
+hpleauge,hpleauge,other,10.00,0.88,0.07,0.90,11
+iplfun,Iplfun,other,10.00,0.88,0.07,0.90,3
+mobiworkx,Mobiworkx,other,10.00,0.88,0.07,0.90,7
+slikk,Slikk,other,10.00,0.88,0.07,0.90,11
+jiomartold,Jiomart Old,shopping,10.00,0.88,0.07,0.90,7
+cursor,Cursor,tech,10.00,0.88,0.07,0.90,5
+ruviexch,Ruviexch,other,10.00,0.88,0.07,0.90,11
+stockmock,Stockmock,other,10.00,0.88,0.07,0.90,3
+paymitra,paymitra,other,10.00,0.88,0.07,0.90,2
+cyberlink,cyberlink,other,10.00,0.88,0.07,0.90,11
+shiprocket,Shiprocket,other,10.00,0.88,0.07,0.90,7
+jeevansathi,Jeevansathi,dating,10.00,0.88,0.07,0.90,2
+rummyregal,Rummy Regal,betting,10.00,0.88,0.07,0.90,11
+pulselabs,Pulse Labs,other,10.00,0.88,0.07,0.90,7
+666.in,666.in,other,10.00,0.88,0.07,0.90,3
+gauipl,Gauipl,other,10.00,0.88,0.07,0.90,11
+hkpay,Hkpay,other,10.00,0.88,0.07,0.90,3
+instamart,Instamart,social,10.00,0.88,0.07,0.90,3
+emergencypaisa,Emergency Paisa,other,10.00,0.88,0.07,0.90,7
+enkash,Enkash,other,10.00,0.88,0.07,0.90,7
+qqwin,QQ Win,betting,10.00,0.88,0.07,0.90,3
+rexpay,Rexpay,other,10.00,0.88,0.07,0.90,3
+stote,Stote,other,10.00,0.88,0.07,0.90,11
+jackpotwheel,jackpotwheel,betting,10.00,0.88,0.07,0.90,11
+789jackpot,789Jackpot,betting,10.00,0.88,0.07,0.90,2
+onewin,One Win,betting,10.00,0.88,0.07,0.90,11
+univest,Univest,other,10.00,0.88,0.07,0.90,3
+motp,Motp,other,10.00,0.88,0.07,0.90,11
+handpickd,Handpickd,other,10.00,0.88,0.07,0.90,11
+raviexch,Raviexch,other,10.00,0.88,0.07,0.90,11
+driveu,driveu,other,10.00,0.88,0.07,0.90,4
+nhidcl,nhidcl,other,10.00,0.88,0.07,0.90,2
+luckykismat,luckykismat,other,10.00,0.88,0.07,0.90,4
+admin,Admin,other,10.00,0.88,0.07,0.90,11
+swacchbharat,Swacch Bharat,govt,10.00,0.88,0.07,0.90,11
+rexproearn,Rexproearn,other,10.00,0.88,0.07,0.90,5
+777in,777In,other,10.00,0.88,0.07,0.90,11
+instaastro,InstaAstro,social,10.00,0.88,0.07,0.90,11
+shaktipay,shaktipay,payments,10.00,0.88,0.07,0.90,7
+yonohub,Yonohub,other,10.00,0.88,0.07,0.90,4
+khelking,Khelking,other,10.00,0.88,0.07,0.90,3
+crown88,crown88,other,10.00,0.88,0.07,0.90,4
+8game,8game,other,10.00,0.88,0.07,0.90,3
+rummylegal,rummylegal,betting,10.00,0.88,0.07,0.90,4
+astrotalk,astrotalk,other,10.00,0.88,0.07,0.90,11
+foundit,Foundit,jobs,10.00,0.88,0.07,0.90,7
+crest777,Crest777,other,10.00,0.88,0.07,0.90,3
+c88,C88,other,10.00,0.88,0.07,0.90,11
+y1game,Y1Game,other,10.00,0.88,0.07,0.90,7
+arwallet,Ar Wallet,payments,10.00,0.88,0.07,0.90,4
+customfire,Customfire,other,10.00,0.88,0.07,0.90,11
+ukpayhub,ukpayhub,other,10.00,0.88,0.07,0.90,4
+hyperpure,Hyperpure,other,10.00,0.88,0.07,0.90,3
+mmy,MMY,other,10.00,0.88,0.07,0.90,7
+bn99,BN99,other,10.00,0.88,0.07,0.90,3
+thinkitlucky,thinkitlucky,other,10.00,0.88,0.07,0.90,11
+physicswallah,Physics Wallah,edtech,10.00,0.88,0.07,0.90,5
+noise,noise,shopping,10.00,0.88,0.07,0.90,11
+xmtrade,Xm Trade,trading,10.00,0.88,0.07,0.90,4
+cashvia,Cashvia,other,10.00,0.88,0.07,0.90,4
+frizza,Frizza,other,10.00,0.88,0.07,0.90,5
+jagran,jagran,other,10.00,0.88,0.07,0.90,4
+3cr,3cr,other,10.00,0.88,0.07,0.90,11
+vnrgame,VNR GAME,other,10.00,0.88,0.07,0.90,11
+ixigo,ixigo,travel,10.00,0.88,0.07,0.90,7
+solid,solid,other,10.00,0.88,0.07,0.90,11
+fidha,fidha,other,10.00,0.88,0.07,0.90,11
+rummyeaster,rummyeaster,betting,10.00,0.88,0.07,0.90,7
+levi,Levi,other,10.00,0.88,0.07,0.90,7
+betexc,betexc,other,10.00,0.88,0.07,0.90,3
+tvsmotor,tvsmotor,other,10.00,0.88,0.07,0.90,11
+zetarides,Zetarides,other,10.00,0.88,0.07,0.90,4
+swish,Swish,other,10.00,0.88,0.07,0.90,11
+mpartner,Mpartner,other,10.00,0.88,0.07,0.90,3
+mogli,Mogli,other,10.00,0.88,0.07,0.90,3
+t3pay,Tt3pay,other,10.00,0.88,0.07,0.90,3
+smartwallet,Smartwallet,payments,10.00,0.88,0.07,0.90,11
+skillstrainer,SkillsTrainer,other,10.00,0.88,0.07,0.90,5
+indmoney,INDmoney,trading,10.00,0.88,0.07,0.90,2
+school,School,other,10.00,0.88,0.07,0.90,3
+tatacliq,Tata Cliq,shopping,10.00,0.88,0.07,0.90,3
+goldgo,Gold Go,other,10.00,0.88,0.07,0.90,4
+focused,Focused,other,10.00,0.88,0.07,0.90,11
+yomo11,yomo11,other,10.00,0.88,0.07,0.90,4
+afratech,afratech,other,10.00,0.88,0.07,0.90,7
+voltas,Voltas,other,10.00,0.88,0.07,0.90,5
+chatbot,Chatbot,other,10.00,0.88,0.07,0.90,11
+majago,MajaGo,other,10.00,0.88,0.07,0.90,5
+ix7,iX7,other,10.00,0.88,0.07,0.90,7
+kickcash,KickCash,other,10.00,0.88,0.07,0.90,3
+lummp,Lummp,other,10.00,0.88,0.07,0.90,7
+jumpp,jumpp,other,10.00,0.88,0.07,0.90,11
+hercules,Hercules,other,10.00,0.88,0.07,0.90,5
+vymo,vymo,other,10.00,0.88,0.07,0.90,11
+pronto,pronto,other,10.00,0.88,0.07,0.90,3
+jio,My jio,other,10.00,0.88,0.07,0.90,11
+smc,smc,other,10.00,0.88,0.07,0.90,7
+moneybazar,moneybazar,other,10.00,0.88,0.07,0.90,5
+billcut,Billcut,other,10.00,0.88,0.07,0.90,3
+clubcorra,clubcorra,other,10.00,0.88,0.07,0.90,7
+satbet,satbet,other,10.00,0.88,0.07,0.90,4
+imffy,Imffy,other,10.00,0.88,0.07,0.90,11
+wininr,Wininr,other,10.00,0.88,0.07,0.90,11
+solidnxt,Solidnxt,other,10.00,0.88,0.07,0.90,4
+yono365,yono365,other,10.00,0.88,0.07,0.90,3
+rapidocaptain,Rapido Captain,travel,10.00,0.88,0.07,0.90,3
+nb9,NB9,other,10.00,0.88,0.07,0.90,5
+progamer,Progamer,other,10.00,0.88,0.07,0.90,5
+game13,Game13,other,10.00,0.88,0.07,0.90,5
+game14,Game14,other,10.00,0.88,0.07,0.90,3
+parle,Parle,food,10.00,0.88,0.07,0.90,3
+ctw,CTW,other,10.00,0.88,0.07,0.90,4
+divavip,Divavip,other,10.00,0.88,0.07,0.90,5
+fyers,Fyers,trading,10.00,0.88,0.07,0.90,4
+mahuaplay,mahuaplay,other,10.00,0.88,0.07,0.90,5
+cashin,Cashin,other,10.00,0.88,0.07,0.90,11
+proanalyser,ProAnalyser,other,10.00,0.88,0.07,0.90,11
+funngro,FUNNGRO,other,10.00,0.88,0.07,0.90,11
+yonorummy,Yono Rummy,betting,10.00,0.88,0.07,0.90,11
+win379,Win379,other,10.00,0.88,0.07,0.90,2
+rummyonline,Rummy Online,betting,10.00,0.88,0.07,0.90,4
+bet200,Bet200,other,10.00,0.88,0.07,0.90,4
+luxgain,Luxgain,other,10.00,0.88,0.07,0.90,3
+sheinold,Shein Old,shopping,10.00,0.88,0.07,0.90,11
+usmssaaffron,USMS SAFFRON,other,10.00,0.88,0.07,0.90,3
+hpl,HPL,health,10.00,0.88,0.07,0.90,3
+snglty,Snglty,other,10.00,0.88,0.07,0.90,11
+jmfs,JMFS,other,10.00,0.88,0.07,0.90,3
+come,Come,other,10.00,0.88,0.07,0.90,5
+rapidoiq,Rapidoiq,travel,10.00,0.88,0.07,0.90,3
+ciferon,ciferon,other,10.00,0.88,0.07,0.90,3
+hinge,Hinge,dating,10.00,0.88,0.07,0.90,5
+stockmojo,Stock Mojo,other,10.00,0.88,0.07,0.90,3
+happyteenpatti,happyteenpatti,betting,10.00,0.88,0.07,0.90,4
+aapay,aapay,other,10.00,0.88,0.07,0.90,11
+xpec,Xpec,other,10.00,0.88,0.07,0.90,3
+practo,Practo,health,10.00,0.88,0.07,0.90,5
+humsafar,Humsafar,travel,10.00,0.88,0.07,0.90,11
+1xbet,1xbet,other,10.00,0.88,0.07,0.90,11
+nexusludo,Nexus Ludo,betting,10.00,0.88,0.07,0.90,3
+82lottery,82Lottery,betting,10.00,0.88,0.07,0.90,11
+bn9,Bn9,other,10.00,0.88,0.07,0.90,3
+sharteji,sharteji,other,10.00,0.88,0.07,0.90,3
+55club,55club,betting,10.00,0.88,0.07,0.90,2
+chargezone,chargezone,other,10.00,0.88,0.07,0.90,11
+nourg,nourg,other,10.00,0.88,0.07,0.90,11
+bolt,bolt,other,10.00,0.88,0.07,0.90,11
+zulti,zulti,other,10.00,0.88,0.07,0.90,3
+rehearsalresearch,rehearsalresearch,other,10.00,0.88,0.07,0.90,3
+farmley,farmley,food,10.00,0.88,0.07,0.90,4
+mpokket,mpokket,other,10.00,0.88,0.07,0.90,3
+indclub,indclub,other,10.00,0.88,0.07,0.90,11
+28xbet,28xbet,other,10.00,0.88,0.07,0.90,2
+ynorg,ynorg,other,10.00,0.88,0.07,0.90,11
+nadi777,Nadi777,other,10.00,0.88,0.07,0.90,3
+chatgpt,Chatgpt(openai),tech,10.00,0.88,0.07,0.90,11
+cortevafarmerconnect,Corteva Farmer Connect,other,10.00,0.88,0.07,0.90,4
+t2game,T2 game,other,10.00,0.88,0.07,0.90,11
+teenpattichatai,Teen Patti Chatai,betting,10.00,0.88,0.07,0.90,4
+pragya,Pragya,govt,10.00,0.88,0.07,0.90,11
+rama777,Rama 777,betting,10.00,0.88,0.07,0.90,3
+hppay,HP pay,other,10.00,0.88,0.07,0.90,4
+iplwin55,Ipl Win 555,betting,10.00,0.88,0.07,0.90,5
+feelin,Feelin,other,10.00,0.88,0.07,0.90,5
+diuwin,Diuwin,other,10.00,0.88,0.07,0.90,5
+realteenpatti,Real teen patti,betting,10.00,0.88,0.07,0.90,3
+vtmarkets,VT Markets,trading,10.00,0.88,0.07,0.90,3
+cultfit,Cult Fit,health,10.00,0.88,0.07,0.90,4
+joymall,Joy Mall2,other,10.00,0.88,0.07,0.90,3
+paysetu,Pay Setu,other,10.00,0.88,0.07,0.90,11
+navi,Navi,payments,10.00,0.88,0.07,0.90,11
+game3f,Game 3f,other,10.00,0.88,0.07,0.90,7
+bebetta,BeBetta,other,10.00,0.88,0.07,0.90,11
+cutshort,Cutshort,other,10.00,0.88,0.07,0.90,4
+flabs,Flabs,other,10.00,0.88,0.07,0.90,11
+slot99,Slot99,other,10.00,0.88,0.07,0.90,3
+plixlife,Plixlife,shopping,10.00,0.88,0.07,0.90,11
+sagaslots,Sagaslots,betting,10.00,0.88,0.07,0.90,7
+zoomcar,Zoomcar,travel,10.00,0.88,0.07,0.90,5
+jiofinance,Jio Finance,payments,10.00,0.88,0.07,0.90,7
+alphapay,Alpha pay,other,10.00,0.88,0.07,0.90,11
+flipkartcoin,Flipkart super coins,shopping,10.00,0.88,0.07,0.90,3
+lazypay,Lazy Pay,payments,10.00,0.88,0.07,0.90,3
+dostt,Dostt,dating,10.00,0.88,0.07,0.90,11
+channelpay,ChannelPay,other,10.00,0.88,0.07,0.90,5
+jeem,Jeem,other,10.00,0.88,0.07,0.90,4
+bhault,Bhault,other,10.00,0.88,0.07,0.90,11
+goplayspring,Goplayspring,other,10.00,0.88,0.07,0.90,3
+innovist,Innovist,other,10.00,0.88,0.07,0.90,11
+prodege,Proedge,other,10.00,0.88,0.07,0.90,3
+mstock,Mstock,trading,10.00,0.88,0.07,0.90,4
+megapari,Mega Pari,other,10.00,0.88,0.07,0.90,5
+arpay,Arpay,other,10.00,0.88,0.07,0.90,3
+crownit,Crownit,other,10.00,0.88,0.07,0.90,11
+t20win,T20win,other,10.00,0.88,0.07,0.90,4
+hyugalife,Hyugalife,other,10.00,0.88,0.07,0.90,5
+aco,ACO,other,10.00,0.88,0.07,0.90,2
+quack,Quack Quack,other,10.00,0.88,0.07,0.90,2
+aoc,AOC,other,10.00,0.88,0.07,0.90,11
+trucks,TrucksUp,other,10.00,0.88,0.07,0.90,11
+nymph,Nymph,other,10.00,0.88,0.07,0.90,2
+hidnn,Hidnn,other,10.00,0.88,0.07,0.90,11
+winox,Win379,other,10.00,0.88,0.07,0.90,2
+magnify,Magnify,other,10.00,0.88,0.07,0.90,11
+nobroker,NoBroker,other,10.00,0.88,0.07,0.90,11
+redotplay,Redotplay,other,10.00,0.88,0.07,0.90,2
+fast2sms,Fast2sms,tech,10.00,0.88,0.07,0.90,2
+bingo101,Bingo101,other,10.00,0.88,0.07,0.90,2
+linkedin,Linkedin,social,10.00,0.88,0.07,0.90,5
+ipllucky,Ipllucky,other,10.00,0.88,0.07,0.90,11
+kraus,Kraus Jeans,other,10.00,0.88,0.07,0.90,2
+finmandir,Finmandir,other,10.00,0.88,0.07,0.90,3
+twogether,Twogether,dating,10.00,0.88,0.07,0.90,3
+sahyog,Sahyog,other,10.00,0.88,0.07,0.90,2
+doctutorial,DocTutorials,other,10.00,0.88,0.07,0.90,2
+rechargehub,Rechargehub,other,10.00,0.88,0.07,0.90,2
+southernexpress,southern express,other,10.00,0.88,0.07,0.90,11
+dhaniwin,dhaniwin,trading,10.00,0.88,0.07,0.90,5
+payzo,Payzo,other,10.00,0.88,0.07,0.90,11
+gitlab,Gitlab,tech,10.00,0.88,0.07,0.90,3
+cashkaro,cashkaro,other,10.00,0.88,0.07,0.90,3
+pokkeloadcredit,pokketloadcredit,other,10.00,0.88,0.07,0.90,11
+aa777,aa777,other,10.00,0.88,0.07,0.90,3
+rajpay,rajpay,other,10.00,0.88,0.07,0.90,3
+adda66pay,adda66pay,other,10.00,0.88,0.07,0.90,3
+cadbury,cadbury,food,10.00,0.88,0.07,0.90,11
+k777,k777,other,10.00,0.88,0.07,0.90,3
+indbet,indbet,other,10.00,0.88,0.07,0.90,5
+myshopify,myshopify,shopping,10.00,0.88,0.07,0.90,7
+mospay,mospay,other,10.00,0.88,0.07,0.90,4
+onepay,onepay,other,10.00,0.88,0.07,0.90,7
+vmm,vmm,other,10.00,0.88,0.07,0.90,11
+ons,ons,other,10.00,0.88,0.07,0.90,4
+myhq,myhq,other,10.00,0.88,0.07,0.90,3
+blinkrloan,blinkrloan,other,10.00,0.88,0.07,0.90,5
+bjp,BJP SARAL,other,10.00,0.88,0.07,0.90,11
+icicidirect,icicidirect,payments,10.00,0.88,0.07,0.90,3
+goplay11,goplay11,gaming,10.00,0.88,0.07,0.90,4
+360game,360game,other,10.00,0.88,0.07,0.90,3
+diwawin,diwawin,other,10.00,0.88,0.07,0.90,5
+taskmate,Taskmate,jobs,10.00,0.88,0.07,0.90,11
+gac,gac.gov.in,other,10.00,0.88,0.07,0.90,3
+polymarket,polymarket,other,10.00,0.88,0.07,0.90,4
+all5otp,All5OTP,other,10.00,0.88,0.07,0.90,11
+olx,OLX,other,10.00,0.88,0.07,0.90,11
+teenpattisona,Teenpatti Sona,betting,10.00,0.88,0.07,0.90,11
+zapploans,Zapploans,other,10.00,0.88,0.07,0.90,11
+trulymadly,TrulyMadly,dating,10.00,0.88,0.07,0.90,11
+diwapay,Diwapay,other,10.00,0.88,0.07,0.90,11
+rummyludo,Rummy Ludo,betting,10.00,0.88,0.07,0.90,11
+timeleauge,timeleauge,other,10.00,0.88,0.07,0.90,11
+waho,Waho,other,10.00,0.88,0.07,0.90,11
+tauruscash,Tauruscash,other,10.00,0.88,0.07,0.90,11
+myhpgas,myhpgas,other,10.00,0.88,0.07,0.90,11
+rummyadda,rummyadda,betting,10.00,0.88,0.07,0.90,11
+aliensworld,Aliens World,other,10.00,0.88,0.07,0.90,11
+sharechat,ShareChat,social,10.00,0.88,0.07,0.90,11
+jeema,Jeema,other,10.00,0.88,0.07,0.90,11
+incash,Incash,other,10.00,0.88,0.07,0.90,11
+91cric,91Cric,other,10.00,0.88,0.07,0.90,11
+mm1,Mm1,other,10.00,0.88,0.07,0.90,11
+estore,Estore,other,10.00,0.88,0.07,0.90,11
+ponyup,Pony Up,other,10.00,0.88,0.07,0.90,11
+buddy,Buddy,other,10.00,0.88,0.07,0.90,11
+666in,666In,other,10.00,0.88,0.07,0.90,11
+fomo7,Fomo7,other,10.00,0.88,0.07,0.90,11
+rajshree,Rajshree,other,10.00,0.88,0.07,0.90,11
+yn777,Yn777,other,10.00,0.88,0.07,0.90,11
+routematic,routematic,other,10.00,0.88,0.07,0.90,11
+walle8,Walle8,other,10.00,0.88,0.07,0.90,11
+thalagame,Thalagame,other,10.00,0.88,0.07,0.90,11
+offerzone,offerzone,other,10.00,0.88,0.07,0.90,11
+glamguider,glamguider,other,10.00,0.88,0.07,0.90,11
+freeup,freeup,other,10.00,0.88,0.07,0.90,11
+chaska99,Chaska99,other,10.00,0.88,0.07,0.90,11
+ztpl,ztpl,other,10.00,0.88,0.07,0.90,11
+crazycoffee,Crazy Coffee,other,10.00,0.88,0.07,0.90,11
+laxmipay,Laxmi Pay,payments,10.00,0.88,0.07,0.90,11
+uono,Uono,other,10.00,0.88,0.07,0.90,11
+bjpsadasya,BJP Sadasya,other,10.00,0.88,0.07,0.90,11
+spinach,spinach,food,10.00,0.88,0.07,0.90,11
+jxversnxs,JXVERSNXS,other,10.00,0.88,0.07,0.90,11
+sunaxen,SUNAXEN,other,10.00,0.88,0.07,0.90,11
+bnkntkvht,Bnkntkvht,other,10.00,0.88,0.07,0.90,11
+bhaulottery,Bhau Lottery,betting,10.00,0.88,0.07,0.90,11
+playniq,Playniq,other,10.00,0.88,0.07,0.90,11
+habityoga,HabitYoga,other,10.00,0.88,0.07,0.90,11
+vivo,Vivo,tech,10.00,0.88,0.07,0.90,11
+welby,Welby,other,10.00,0.88,0.07,0.90,11
+zomatodelhiverypartner,zomatodelhiverypartner,food,10.00,0.88,0.07,0.90,11
+coinswitch,CoinSwitch,trading,10.00,0.88,0.07,0.90,4
+rummytry,rummytry,betting,10.00,0.88,0.07,0.90,11
+timelypurse,timely purse,other,10.00,0.88,0.07,0.90,11
+bg678,BG678,other,10.00,0.88,0.07,0.90,11
+lagacyhome,Legacy Homes,other,10.00,0.88,0.07,0.90,11
+workindia,WorkIndia,jobs,10.00,0.88,0.07,0.90,11
+icash,Icash,other,10.00,0.88,0.07,0.90,11
+in7,In7,other,10.00,0.88,0.07,0.90,11
+orbitmart,Orbit Mart,other,10.00,0.88,0.07,0.90,11
+ramp,RAMP,other,10.00,0.88,0.07,0.90,11
+zepmeta,Zepmeta,other,10.00,0.88,0.07,0.90,11
+nattyindia,Nattyindia,other,10.00,0.88,0.07,0.90,11
+nadi,Nadi,other,10.00,0.88,0.07,0.90,11
+oyo,OYO,travel,10.00,0.88,0.07,0.90,11
+imperialblue,Imperial Blue,other,10.00,0.88,0.07,0.90,11
+cars24,Cars24,other,10.00,0.88,0.07,0.90,11
+22bet,22Bet,other,10.00,0.88,0.07,0.90,11
+rummypride,Rummy Pride,betting,10.00,0.88,0.07,0.90,11
+iqoo,iQOO,tech,10.00,0.88,0.07,0.90,11
+spin11,Spin11,other,10.00,0.88,0.07,0.90,11
+gratifi,Gratifi,other,10.00,0.88,0.07,0.90,11
+delhimetro,Delhi Metro,travel,10.00,0.88,0.07,0.90,11
+grafti,Grafti,other,10.00,0.88,0.07,0.90,11
+teenpattimaster,Teenpatti Master,betting,10.00,0.88,0.07,0.90,11
+13lggame,13lggame,other,10.00,0.88,0.07,0.90,11
+okcupid,Okcupid,dating,10.00,0.88,0.07,0.90,11
+wecoinpay,Wecoin Pay,other,10.00,0.88,0.07,0.90,11
+ringpay,Ring Pay,other,10.00,0.88,0.07,0.90,11
+uonohub,Uono Hub,other,10.00,0.88,0.07,0.90,11
+earntp,Earntp,other,10.00,0.88,0.07,0.90,11
+vegascasino,vegas casino,betting,10.00,0.88,0.07,0.90,11
+bigwinner,bigwinner,other,10.00,0.88,0.07,0.90,11
+frenzywinner,frenzywinner,other,10.00,0.88,0.07,0.90,11
+spin101,spin101,other,10.00,0.88,0.07,0.90,11
+sproxil,Sproxil,other,10.00,0.88,0.07,0.90,11
+9pay,9Pay,payments,10.00,0.88,0.07,0.90,11
+payone,Payone,other,10.00,0.88,0.07,0.90,11
+mothersgold,Mothersgold,other,10.00,0.88,0.07,0.90,11
+gugobet,Gugobet,other,10.00,0.88,0.07,0.90,11
+learningcsc,Learning csc,other,10.00,0.88,0.07,0.90,11
+jaiho91,jaiho91,other,10.00,0.88,0.07,0.90,11
+parleeyesalesman,parleeyesalesman,food,10.00,0.88,0.07,0.90,11
+moonpay,MoonPay,other,10.00,0.88,0.07,0.90,11
+mrbrown,MrBrown,other,10.00,0.88,0.07,0.90,11
+paytmold,Paytm Old,payments,10.00,0.88,0.07,0.90,11
+vrlbus,VrlBus,travel,10.00,0.88,0.07,0.90,11
+quackquack,QuackQuack,dating,10.00,0.88,0.07,0.90,11
+factsscan,factsscan,other,10.00,0.88,0.07,0.90,11
+hiyagame,Hiya Game,other,10.00,0.88,0.07,0.90,11
+slotspin,Slotspin,betting,10.00,0.88,0.07,0.90,11
+jaihowin,jaihowin,other,10.00,0.88,0.07,0.90,11
+indslot,indslot,other,10.00,0.88,0.07,0.90,11
+abcrummy,ABCRummy,betting,10.00,0.88,0.07,0.90,11
+hirummy,Hi Rummy,betting,10.00,0.88,0.07,0.90,11
+999pay,999pay,payments,10.00,0.88,0.07,0.90,11
+mytatva,mytatva,other,10.00,0.88,0.07,0.90,11
+tripoto,tripoto,other,10.00,0.88,0.07,0.90,11
+gajagame777,Gaja Game777,other,10.00,0.88,0.07,0.90,11
+hsbc,HSBC,payments,10.00,0.88,0.07,0.90,11
+bet213,Bet213,other,10.00,0.88,0.07,0.90,11
+betwin,Betwin,other,10.00,0.88,0.07,0.90,11
+ezprep,ezprep,other,10.00,0.88,0.07,0.90,11
+yolo,Yolo,other,10.00,0.88,0.07,0.90,11
+3fa,3FA,other,10.00,0.88,0.07,0.90,11
+sikka,sikka,other,10.00,0.88,0.07,0.90,11
+zeropay,Zeropay,other,10.00,0.88,0.07,0.90,11
+surewin,surewin,other,10.00,0.88,0.07,0.90,11
+cityflo,cityflo,other,10.00,0.88,0.07,0.90,11
+bet91,Bet91,other,10.00,0.88,0.07,0.90,11
+4rabet,4rabet,other,10.00,0.88,0.07,0.90,11
+santrishop,SantriShop,other,10.00,0.88,0.07,0.90,11
+diwpay,Diwpay,other,10.00,0.88,0.07,0.90,11
+50matka,50matka,betting,10.00,0.88,0.07,0.90,11
+ozi,OZI,other,10.00,0.88,0.07,0.90,11
+clbp,CLBP,other,10.00,0.88,0.07,0.90,11
+vfsglobal,VFS Global,other,10.00,0.88,0.07,0.90,11
+567jackpot,567Jackpot,betting,10.00,0.88,0.07,0.90,11
+gopay,Go Pay,other,10.00,0.88,0.07,0.90,11
+goaok,Goaok,other,10.00,0.88,0.07,0.90,11
+jungle,Jungle,other,10.00,0.88,0.07,0.90,11
+tcm,TCM,other,10.00,0.88,0.07,0.90,11
+phonepeold,PhonePe Old,payments,10.00,0.88,0.07,0.90,11
+safeguard,SafeGuard,other,10.00,0.88,0.07,0.90,11
+imshoi,imshoi,other,10.00,0.88,0.07,0.90,11
+arbpay,arbpay,other,10.00,0.88,0.07,0.90,11
+bangalharvest,Bengal Harvest,other,10.00,0.88,0.07,0.90,11
+hack2skill,hack2skill,other,10.00,0.88,0.07,0.90,11
+hindustan,Hindustan,other,10.00,0.88,0.07,0.90,11
+comepay,comepay,other,10.00,0.88,0.07,0.90,11
+local,Local,other,10.00,0.88,0.07,0.90,11
+kuiklo,Kuiklo,other,10.00,0.88,0.07,0.90,11
+halalbox,Halalbox,other,10.00,0.88,0.07,0.90,11
+peacock247,Peacock247,other,10.00,0.88,0.07,0.90,11
+quanbot,Quan Bot,other,10.00,0.88,0.07,0.90,11
+tataneuhdfc,Tata Neu HDFC,payments,10.00,0.88,0.07,0.90,11
+5xgame,5xGame,other,10.00,0.88,0.07,0.90,11
+bilibili,Bilibili,social,10.00,0.88,0.07,0.90,11
+flexsalary,Flex Salary,other,10.00,0.88,0.07,0.90,11
+betwinner,betwinner,other,10.00,0.88,0.07,0.90,11
+spingold,Spin Gold,betting,10.00,0.88,0.07,0.90,11
+rrpapp,Rrpapp,other,10.00,0.88,0.07,0.90,11
+paywin,Paywin,other,10.00,0.88,0.07,0.90,11
+vtion,Vtion,other,10.00,0.88,0.07,0.90,11
+lightningai,Lightning Al,other,10.00,0.88,0.07,0.90,11
+mangalam,Mangalam,other,10.00,0.88,0.07,0.90,11
+merawala,Mera Wala,other,10.00,0.88,0.07,0.90,11
+emversity,Emversity,edtech,10.00,0.88,0.07,0.90,11
+myfuture,myfuture,other,10.00,0.88,0.07,0.90,11
+trugold,trugold,other,10.00,0.88,0.07,0.90,11
+telephia,Telephia,other,10.00,0.88,0.07,0.90,11
+creatr,CreatR,other,10.00,0.88,0.07,0.90,11
+puspalottery,puspalottery,betting,10.00,0.88,0.07,0.90,11
+iinvest,Iinvest,other,10.00,0.88,0.07,0.90,11
+zaplan,zaplan,other,10.00,0.88,0.07,0.90,11
+grainotch,Grainotch,other,10.00,0.88,0.07,0.90,11
+hdfclife,HDFC Life,payments,10.00,0.88,0.07,0.90,11
+earnkaro,Earnkaro,other,10.00,0.88,0.07,0.90,11
+bajajbroking,Bajaj Broking,other,10.00,0.88,0.07,0.90,11
+icubeswire,icubeswire,other,10.00,0.88,0.07,0.90,11
+timbuktu,Timbuktu,other,10.00,0.88,0.07,0.90,11
+district,district,other,10.00,0.88,0.07,0.90,11
+ssclub,ssclub,other,10.00,0.88,0.07,0.90,11
+askmebet,askmebet,other,10.00,0.88,0.07,0.90,11
+a11game,A11game,other,10.00,0.88,0.07,0.90,11
+majaiinfotech,majaiinfotech,other,10.00,0.88,0.07,0.90,11
+nutrabay,nutrabay,other,10.00,0.88,0.07,0.90,11
+amazonold,Amazon Old,shopping,10.00,0.88,0.07,0.90,11
+tradeindia,tradeindia,trading,10.00,0.88,0.07,0.90,11
+hopr,Hopr,other,10.00,0.88,0.07,0.90,11
+fortunespin,Fortune Spin,betting,10.00,0.88,0.07,0.90,11
+roufetch,roufetch,other,10.00,0.88,0.07,0.90,11
+panditji,Pandit Ji,other,10.00,0.88,0.07,0.90,11
+doctutorials,doctutorials,other,10.00,0.88,0.07,0.90,11
+earnquix,earnquix,other,10.00,0.88,0.07,0.90,11
+win369,Win369,other,10.00,0.88,0.07,0.90,11
+ludowinner,Ludo Winner,betting,10.00,0.88,0.07,0.90,11
+geniezap,GenieZap,other,10.00,0.88,0.07,0.90,11
+rozrummy,rozrummy,betting,10.00,0.88,0.07,0.90,11
+finfinance,finfinance,other,10.00,0.88,0.07,0.90,11
+stage,Stage,streaming,10.00,0.88,0.07,0.90,11
+unicard,unicard,other,10.00,0.88,0.07,0.90,11
+bollygame,Bolly Game,other,10.00,0.88,0.07,0.90,11
+kalodia,Kalodia,other,10.00,0.88,0.07,0.90,11
+manboclub,Manboclub,other,10.00,0.88,0.07,0.90,11
+1agame,1agame,other,10.00,0.88,0.07,0.90,11
+msme,MSME,govt,10.00,0.88,0.07,0.90,11
+rrpold,RRP Old,other,10.00,0.88,0.07,0.90,11
+incredold,incredold,other,10.00,0.88,0.07,0.90,11
+dreem55,dreem55,other,10.00,0.88,0.07,0.90,11
+flipkartseller,Flipkart Seller,shopping,10.00,0.88,0.07,0.90,11
+paypho,Paypho,other,10.00,0.88,0.07,0.90,11
+lenskart,Lenskart,shopping,10.00,0.88,0.07,0.90,11
+mhagame,Mha Game,other,10.00,0.88,0.07,0.90,11
+bookmyshow,BookMyShow,other,10.00,0.88,0.07,0.90,11
+papapa,papapa,other,10.00,0.88,0.07,0.90,11
+liftor,Liftor,other,10.00,0.88,0.07,0.90,11
+honda,Honda,other,10.00,0.88,0.07,0.90,11
+rupee,rupee,other,10.00,0.88,0.07,0.90,11
+simplinamdharis,Simplinamdharis,other,10.00,0.88,0.07,0.90,11
+moj,Moj,social,10.00,0.88,0.07,0.90,11
+swissbeauty,swissbeauty,shopping,10.00,0.88,0.07,0.90,11
+bdgwin,bdgwin,other,10.00,0.88,0.07,0.90,11
+hudle,hudle,other,10.00,0.88,0.07,0.90,11
+dealzy,Dealzy,other,10.00,0.88,0.07,0.90,11
+maxrummy,Max Rummy,betting,10.00,0.88,0.07,0.90,11
+yy6game,Yy6 Game,other,10.00,0.88,0.07,0.90,11
+hindispin,Hindi Spin,betting,10.00,0.88,0.07,0.90,11
+tradex,TradeX,trading,10.00,0.88,0.07,0.90,11
+tashanwin,Tashanwin,other,10.00,0.88,0.07,0.90,11
+ramsabha,Ram Sabha,other,10.00,0.88,0.07,0.90,11
+yadi,Yadi,other,10.00,0.88,0.07,0.90,11
+iyirooms,iYi Rooms,other,10.00,0.88,0.07,0.90,11
+oladriver,Ola Driver,travel,10.00,0.88,0.07,0.90,11
+uberdriver,Uber Driver,travel,10.00,0.88,0.07,0.90,11
+futureskills,Futureskills,other,10.00,0.88,0.07,0.90,11
+gyantv,GyanTV,other,10.00,0.88,0.07,0.90,11
+coinus,Coinus,other,10.00,0.88,0.07,0.90,11
+himalaya,Himalaya,shopping,10.00,0.88,0.07,0.90,11
+jiosaavn,JioSaavn,streaming,10.00,0.88,0.07,0.90,11
+lichousing,Lic Housing,other,10.00,0.88,0.07,0.90,11
+mobikwik,MobiKwik,payments,10.00,0.88,0.07,0.90,11
+loanone,loanone,other,10.00,0.88,0.07,0.90,11
+indrummy,Ind Rummy,betting,10.00,0.88,0.07,0.90,11
+gumloop,gumloop,other,10.00,0.88,0.07,0.90,11
+ucoinpay,Ucoinpay,other,10.00,0.88,0.07,0.90,11
+vestige,Vestige,other,10.00,0.88,0.07,0.90,11
+banglarbhumi,BanglarBhumi,govt,10.00,0.88,0.07,0.90,11
+wastra,Wastra,shopping,10.00,0.88,0.07,0.90,11
+mmgame,Mmgame,other,10.00,0.88,0.07,0.90,11
+teenpattinew,teenpattinew,betting,10.00,0.88,0.07,0.90,11
+oropocket,OroPocket,other,10.00,0.88,0.07,0.90,11
+topone,topone,other,10.00,0.88,0.07,0.90,11
+crunchyroll,Crunchyroll,streaming,10.00,0.88,0.07,0.90,11
+royalwin,Royalwin,other,10.00,0.88,0.07,0.90,11
+digilocker,DigiLocker,govt,10.00,0.88,0.07,0.90,11
+lakshmi,lakshmi,other,10.00,0.88,0.07,0.90,11
+diwatop,diwatop,other,10.00,0.88,0.07,0.90,11
+diwavip,diwavip,other,10.00,0.88,0.07,0.90,11
+diwaslot,diwaslot,other,10.00,0.88,0.07,0.90,11
+diwa777,diwa777,other,10.00,0.88,0.07,0.90,11
+rokda7,Rokda7,other,10.00,0.88,0.07,0.90,11
+sfl,SFL,other,10.00,0.88,0.07,0.90,11
+betway,Betway,other,10.00,0.88,0.07,0.90,11
+jiogame,jiogame,other,10.00,0.88,0.07,0.90,4
+gclass,gclass,other,10.00,0.88,0.07,0.90,4
+prepladder,prepladder,edtech,10.00,0.88,0.07,0.90,5
+sbigeneral,sbigeneral,other,10.00,0.88,0.07,0.90,4
+gullybet,gullybet,other,10.00,0.88,0.07,0.90,5
+frendzo,frendzo,other,10.00,0.88,0.07,0.90,3
+spenbook,spenbook,other,10.00,0.88,0.07,0.90,5
+zaveai,zaveai,other,10.00,0.88,0.07,0.90,3
+woho,Woho,other,10.00,0.88,0.07,0.90,4
+unwin,unwin,other,10.00,0.88,0.07,0.90,3
+dream77,dream77,other,10.00,0.88,0.07,0.90,3
+mittalmall,mittalmall,other,10.00,0.88,0.07,0.90,4
+hostelco,hostelco,other,10.00,0.88,0.07,0.90,4
+ihanott,ihanott,other,10.00,0.88,0.07,0.90,4
+bgcash,bgcash,other,10.00,0.88,0.07,0.90,5
+dukaan,dukaan,shopping,10.00,0.88,0.07,0.90,3
+novapay,novapay,other,10.00,0.88,0.07,0.90,4
+airportpin,airportpin,other,10.00,0.88,0.07,0.90,5
+playcric,playcric,other,10.00,0.88,0.07,0.90,4
+bharattaxi,bharattaxi,other,10.00,0.88,0.07,0.90,3
+teenpattiyes,teenpattiyes,betting,10.00,0.88,0.07,0.90,5
+mergegateway,mergegateway,other,10.00,0.88,0.07,0.90,4
+chsolution,chsolution,other,10.00,0.88,0.07,0.90,5
+yespin,yespin,other,10.00,0.88,0.07,0.90,4
+feeld,feeld,dating,10.00,0.88,0.07,0.90,3
+vijaysales,vijaysales,shopping,10.00,0.88,0.07,0.90,4
+5588in,5588in,other,10.00,0.88,0.07,0.90,5
+mtfund,mtfund,other,10.00,0.88,0.07,0.90,4
+meowclans,meowclans,other,10.00,0.88,0.07,0.90,3
+meme,meme,other,10.00,0.88,0.07,0.90,5
+lovefund,lovefund,dating,10.00,0.88,0.07,0.90,4
+wolf777,wolf777,other,10.00,0.88,0.07,0.90,4
+101rummy,101rummy,betting,10.00,0.88,0.07,0.90,3
+icfai,icfai,other,10.00,0.88,0.07,0.90,4
+egpayment,egpayment,other,10.00,0.88,0.07,0.90,7
+rs9,rs9,other,10.00,0.88,0.07,0.90,3
+goagame,goagame,other,10.00,0.88,0.07,0.90,5
+playerludo,playerludo,other,10.00,0.88,0.07,0.90,3
+porter,porter,travel,10.00,0.88,0.07,0.90,3
+chatspark,chatspark,other,10.00,0.88,0.07,0.90,5
+mowin,mowin,other,10.00,0.88,0.07,0.90,5
+snapdeal,snapdeal,shopping,10.00,0.88,0.07,0.90,3
+sweet,sweet,other,10.00,0.88,0.07,0.90,4
+iyc,Indian Youth Congress,other,10.00,0.88,0.07,0.90,3
+luminous,luminous,other,10.00,0.88,0.07,0.90,5
+rayole,rayole,other,10.00,0.88,0.07,0.90,4
+replit,replit,tech,10.00,0.88,0.07,0.90,3
+kashrummy,kashrummy,betting,10.00,0.88,0.07,0.90,4
+reddit,reddit,social,10.00,0.88,0.07,0.90,3
+blinkit,Blinkit,food,10.00,0.88,0.07,0.90,8
+winmatch,Winmatch,other,10.00,0.88,0.07,0.90,8
+research360,research 360,other,10.00,0.88,0.07,0.90,8
+creditmantri,Creditmantri,other,9.91,0.88,0.07,0.90,8
+indiapolls,Indiapolls,other,9.91,0.88,0.07,0.90,8
+magicbricks,Magicbricks,other,9.28,0.88,0.07,0.90,8
+uber,Uber,travel,9.00,0.88,0.07,0.90,8
+pvr,Pvr,other,9.00,0.88,0.07,0.90,12
+paytm,Paytm,payments,8.57,0.88,0.07,0.90,8
+orientfame,Oriflame,other,8.57,0.88,0.07,0.90,8
+paypal,PayPal,payments,8.57,0.88,0.07,0.90,8
+playkaro,playkaro,other,8.57,0.88,0.07,0.90,8
+spincrush,Spincrush,other,8.57,0.88,0.07,0.90,8
+wingo,WIngo,betting,8.57,0.88,0.07,0.90,8
+rrp,RRP,other,8.00,0.88,0.07,0.90,11
+cisplt,Cisplt,other,8.00,0.88,0.07,0.90,11
+yonorose,yonorose,other,8.00,0.88,0.07,0.90,11
+amarujala,Amarujala,other,8.00,0.88,0.07,0.90,11
+digicredit,Digi Credit,other,7.70,0.88,0.07,0.90,12
+teenpattigame,teenpattigame,betting,7.20,0.88,0.07,0.90,5
+trutzee,Trutzee,other,7.20,0.88,0.07,0.90,5
+sajjalcash,Sajjal Cash,other,7.20,0.88,0.07,0.90,3
+gharsoaps,Ghar Soaps,shopping,7.20,0.88,0.07,0.90,5
+sitarapartner,Sitara Partner,other,7.20,0.88,0.07,0.90,5
+makemytrip,MakeMyTrip,travel,7.20,0.88,0.07,0.90,5
+bigmumbai,Big Mumbai,other,7.20,0.88,0.07,0.90,5
+stockedge,Stock Edge,trading,7.20,0.88,0.07,0.90,5
+sathipay,Sathipay,payments,7.20,0.88,0.07,0.90,5
+confirmtkt,Confirm tkt,travel,7.14,0.88,0.07,0.90,8
+discord,Discord,messaging,7.14,0.88,0.07,0.90,8
+fst,Fastwin,other,7.14,0.88,0.07,0.90,8
+viber,Viber,messaging,7.14,0.88,0.07,0.90,8
+redbus,redbus,travel,7.14,0.88,0.07,0.90,8
+citymall,City Mall,other,5.57,0.88,0.07,0.90,8
+imo,Imo,messaging,3.29,0.88,0.07,0.90,8
+justdial,Just Dial,other,2.79,0.88,0.07,0.90,8
+qds,Digitalindia,other,10.00,0.88,0.07,0.90,
+aaz,Ozan,other,10.00,0.88,0.07,0.90,
