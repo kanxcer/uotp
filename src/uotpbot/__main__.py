@@ -28,6 +28,7 @@ from .cli import main as cli_main
 from .config import ConfigError, Settings, from_environment
 from .engine import BotEngine
 from .ledger import Ledger
+from .provider.base import ProviderError, ServiceUnavailable
 from .pricing import Pricer
 
 log = logging.getLogger("uotpbot")
@@ -239,6 +240,27 @@ def _check(settings: Settings) -> int:
     try:
         balance = provider.probe()
         print(f"provider   ok   wallet {balance.credit}")
+        # Layer the diagnosis: auth passing does not mean orders can run.
+        # getPrices is read-only and exercises the provider's database, so
+        # it separates "your parameters are wrong" from "their backend is
+        # down" -- exactly the distinction that decides whether to fund the
+        # wallet or wait for the provider.
+        get_prices = getattr(provider, "get_prices", None)
+        if callable(get_prices):
+            try:
+                prices = get_prices()
+                if prices:
+                    print(f"prices     ok   {len(prices)} live entries")
+                else:
+                    print("prices     warn provider accepted the query but "
+                          "returned no price book; catalog CSV stays in force")
+            except ServiceUnavailable as exc:
+                problems.append(f"provider backend down: {exc}")
+                print(f"prices     DOWN auth+params passed, provider's own "
+                      f"backend refused: {exc}")
+            except ProviderError as exc:
+                problems.append(f"prices: {exc}")
+                print(f"prices     FAIL {exc}")
     except Exception as exc:  # noqa: BLE001
         problems.append(f"provider: {exc}")
         print(f"provider   FAIL {exc}")

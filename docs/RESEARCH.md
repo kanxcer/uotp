@@ -155,20 +155,51 @@ Four things this establishes, all now encoded in the code:
    `UOTP_SERVICE_MAP` translates (`whatsapp=wa,telegram=tg`) once the real
    vocabulary is known.
 
+### Re-probed on 2026-09-02 with the funded account (₹10)
+
+| Request | Response | Meaning |
+|---|---|---|
+| `action=getBalance` | `ACCESS_BALANCE:10` | key works; **rupees, not paise** → `UOTP_BALANCE_DIVISOR=1` is correct (a wrong divisor is a 100× pricing error, so this one is load-bearing) |
+| old 8-char key | `BAD_KEY` | correctly raises `AuthError`; already in the error table |
+| `getPrices&country=1&operator=any` | `BAD_OPERATOR` | country validated, operator not |
+| `getPrices&country=999&operator=abc` | `BAD_COUNTRY` | **country IS validated** — 0 and 1 pass, 999 does not |
+| `getPrices&country=0&operator=2` | `NO_CONNECTION` | operator validated, then the provider's own backend failed |
+| `getPrices&country=0&operator=3` | `NO_CONNECTION` | same — numeric ids ≥ 2 pass validation; 0/1 do not |
+| `getPrices&country=0&operator=any` / `all` / `jio` | `BAD_OPERATOR` | no string alias works |
+| `getStatus&id=1` | `ERROR_DATABASE` | reached the backend; database down |
+| `getActive`, `getHistory`, `getCountries`, `getPriceCountries`, `getPriceOperators` | `BAD_ACTION` | **do not exist on this deployment** |
+
+**The conclusion is a provider-side fault, not a config one.** Parameter
+validation runs, then every action that needs the database returns
+`NO_CONNECTION` / `ERROR_DATABASE`. Combined with the literal `/api/stubs/`
+path, the honest reading: `getBalance` is the only fully functional action
+right now. `getPrices` can be made to pass validation (`country=0`,
+`operator=2`) but the backend must come up before it returns prices. No
+purchase has ever completed against this endpoint, so the catalogue in
+`data/uotp_prices.csv` (transcribed from the public services page) remains
+the source of truth until `getPrices` answers.
+
+Two safety decisions fall directly out of this and are implemented in
+`provider/uotp.py`:
+
+1. `NO_CONNECTION` / `ERROR_DATABASE` / `ERROR_SQL` are classified as provider
+   **infrastructure** errors: reads surface them as retry-safe
+   `ServiceUnavailable`, and `wait_for_otp` deliberately tolerates them so a
+   DB blip never abandons a paid-for number mid-lease.
+2. On the **buy** action the same tokens mean the charge may have applied
+   *before* the backend died. They surface as `PurchaseTimedOut`
+   (outcome-unknown), and the engine's contract is: hold, reconcile
+   `getBalance`, never auto-retry a purchase into that response.
+   `uotpbot check` now prints the layered diagnosis (auth ok → params ok →
+   backend down) so this is visible before any wallet is funded.
+
 Only `getBalance` is documented by the provider. The remaining actions
-(`getNumber`, `getStatus`, `setStatus`, `getPrices`, `getActiveActivations`)
-follow this protocol family's conventions and are **inferred** — every action
-name and response prefix is configurable in `.env`, so a divergence is a
-config change rather than a code change. `UotpProvider.probe()` verifies the
-key and the balance prefix at startup.
-
-The exact service slug list and the valid `country`/`operator` values are still
-unknown; `getPrices` will return them once both parameters are right, and that
-response should replace the transcribed table in `data/uotp_prices.csv`.
-
-The path segment `/api/stubs/` suggests this may be a stub or sandbox
-endpoint; the returned balance of `0` is consistent with either an empty
-wallet or a stub. Worth confirming before funding a real account against it.
+(`getNumber`, `getStatus`, `setStatus`, `getPrices`) follow this protocol
+family's conventions and are **inferred** — every action name and response
+prefix is configurable in `.env`, so a divergence is a config change rather
+than a code change. `UotpProvider.probe()` verifies the key and the balance
+prefix at startup; `uotpbot check` additionally exercises `getPrices` to
+separate "bad config" from "provider outage".
 
 Purchases carry an `order` parameter where the provider supports it. Where it
 does not, an ambiguous timeout surfaces as `PurchaseTimedOut` so the caller

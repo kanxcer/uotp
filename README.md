@@ -188,7 +188,7 @@ If the closed-form expectation were wrong, those would diverge. The suite runs
 this check across the whole catalogue.
 
 ```bash
-pytest            # 210 tests, lint clean (ruff)
+pytest            # 366 tests, lint clean (ruff)
 ```
 
 ## Deploying to Render

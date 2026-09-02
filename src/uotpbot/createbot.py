@@ -124,11 +124,30 @@ class CreateBotFlow:
                 "Reply `yes` to accept these terms and create the bot, or `no` to "
                 "cancel.\n\n" + self._terms_summary(p)
             )
+        # Only AWAIT_MODE can fall through here. Accept typed choices so the
+        # flow still completes on a transport that cannot render buttons.
+        if p.step is Step.AWAIT_MODE:
+            choice = text.lower().strip(" .!\"'")
+            if choice in {"1", "platform", "platform numbers", "a"}:
+                return self.on_button(owner_id, CB_PLATFORM)
+            if choice in {"2", "own", "own api", "my own api", "api", "b"}:
+                return self.on_button(owner_id, CB_OWN_API)
         return CreateBotResult(
-            "Tap one of the buttons below to choose how your bot sources numbers.",
-            buttons=[("Platform numbers (no % fee)", CB_PLATFORM),
-                     ("My own API (5% fee)", CB_OWN_API)],
+            "Tap one of the buttons below (or type 1 or 2) to choose how your "
+            "bot sources numbers.",
+            buttons=self._mode_buttons(p),
         )
+
+    @staticmethod
+    def _mode_buttons(p: "PendingCreation") -> list[tuple[str, str]]:
+        """Mode buttons labelled with the fee actually configured.
+
+        A button that reads "5% fee" while PLATFORM_FEE_RATE says 7% is a
+        misrepresentation waiting to be quoted back: derive the label instead.
+        """
+        fee_text = p.fee.describe()
+        own = f"My own API ({fee_text})" if fee_text else "My own API"
+        return [("Platform numbers (no % fee)", CB_PLATFORM), (own, CB_OWN_API)]
 
     def _take_token(self, p: PendingCreation, token: str) -> CreateBotResult:
         if not validate_bot_token(token):
@@ -151,9 +170,8 @@ class CreateBotFlow:
             "price. No percentage fee; you keep everything above what you paid.\n\n"
             "**2. Your own API** - you bring a provider key and pay the provider "
             "directly. The platform takes "
-            f"{p.fee.describe()}, itemised on every sale.",
-            buttons=[("Platform numbers (no % fee)", CB_PLATFORM),
-                     ("My own API (5% fee)", CB_OWN_API)],
+            f"{p.fee.describe()}, itemised per sale.",
+            buttons=self._mode_buttons(p),
         )
 
     def _take_key(self, p: PendingCreation, key: str) -> CreateBotResult:
@@ -196,8 +214,8 @@ class CreateBotFlow:
                 "You will need your own provider API key.\n\n"
                 f"**Get one here:** {API_SIGNUP_URL}\n"
                 "(Register, top up your own balance, copy your API key.)\n\n"
-                f"The platform fee is **{p.fee.describe()}** on every sale your "
-                "bot makes.\n\nPaste your API key when you have it, or send "
+                f"The platform fee is **{p.fee.describe()}** on every sale your bot "
+                "makes.\n\nPaste your API key when you have it, or send "
                 "/cancel."
             )
         if data == CB_CONFIRM:
@@ -223,7 +241,7 @@ class CreateBotFlow:
         fee_line = (
             "No percentage fee."
             if bot.mode is SubBotMode.PLATFORM_API
-            else f"Platform fee: {bot.fee.describe()} on every sale."
+            else f"Platform fee: {bot.fee.describe()}."
         )
         return CreateBotResult(
             f"**Your bot `{bot.id}` is created.**\n\n"

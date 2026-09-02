@@ -120,6 +120,11 @@ ERROR_TOKENS: frozenset[str] = frozenset({
     # have no colon, so an unlisted token would parse as a *success* status
     # and be mis-handled rather than raising.
     "BAD_COUNTRY", "BAD_OPERATOR",
+    # Observed live 2026-09-02: once parameters validate, the provider's own
+    # backend answers NO_CONNECTION (getPrices) and ERROR_DATABASE
+    # (getStatus). Bare tokens again -- listed or they would parse as a
+    # success status and be polled as "no OTP yet" instead of raising.
+    "NO_CONNECTION", "ERROR_DATABASE",
 })
 
 #: Which exception each error token becomes.
@@ -129,6 +134,11 @@ _NO_FUNDS = frozenset({"ERROR_NO_BALANCE", "ERROR_EMPTY_ACCOUNT"})
 _BAD_REQUEST = frozenset({"BAD_ACTION", "BAD_STATUS", "BAD_SERVICE",
                           "NO_ACTIVATION", "ERROR_WRONG_ACTION",
                           "BAD_COUNTRY", "BAD_OPERATOR"})
+#: Provider-side infrastructure failures (observed live on the stub API).
+#: On reads these are transient and safe to retry. On a purchase the money
+#: may already have moved before the backend died, so the buy path must
+#: treat them as outcome-unknown and reconcile -- never auto-retry.
+_INFRA = frozenset({"NO_CONNECTION", "ERROR_DATABASE", "ERROR_SQL"})
 
 
 # ------------------------------------------------------------------ config
@@ -171,8 +181,12 @@ class UotpConfig:
     status_cancel: str = "8"
     #: getPrices was observed to require both of these. Their meaning is
     #: provider-specific and undocumented, so both are settings.
+    #: Tuned against the live endpoint on 2026-09-02: country 0 and 1 pass
+    #: validation (999 returns BAD_COUNTRY); operators "any"/"all"/"0"/"1"
+    #: return BAD_OPERATOR while 2 and 3 get through to the backend (which
+    #: was down, so operator ids' meaning is still unconfirmed).
     prices_country: str = "0"
-    prices_operator: str = "any"
+    prices_operator: str = "2"
     #: Maps this bot's service slug to the provider's. ``whatsapp`` was
     #: rejected with BAD_SERVICE, so the provider uses its own vocabulary.
     service_map: Mapping[str, str] = field(default_factory=dict)
@@ -272,6 +286,17 @@ class UotpProvider:
         message = f"provider returned {token} for action={action}" + (
             f" ({detail})" if detail != token else ""
         )
+        if token in _INFRA:
+            if action == self.config.action_get_number:
+                # The dangerous shape: the charge may have applied before the
+                # backend died. Surface as ambiguous so the engine holds the
+                # order for reconciliation instead of buying a second number.
+                return PurchaseTimedOut(
+                    message
+                    + " -- the charge may still have been applied; reconcile "
+                      "wallet balance and active orders before any retry"
+                )
+            return ServiceUnavailable(message + " -- provider backend issue, retry-safe")
         if token in _FATAL_AUTH:
             return AuthError(message)
         if token in _NO_FUNDS:

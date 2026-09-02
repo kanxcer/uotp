@@ -547,3 +547,89 @@ def test_live_get_balance():  # pragma: no cover - requires network + key
     provider = UotpProvider(UotpConfig(api_key=os.environ["UOTP_LIVE_KEY"]))
     balance = provider.probe()
     assert balance.credit.paise >= 0
+
+
+# --------------------------------------------------- live pins, 2026-09-02
+# Bodies below are VERBATIM responses observed from the real endpoint with
+# the funded account. They pin the vocabulary the bot runs against and catch
+# a provider-side change the moment the live test runs.
+def test_funded_wallet_body_is_rupees_not_paise():
+    p, _ = make("ACCESS_BALANCE:10")
+    assert p.get_balance().credit == INR(10)
+
+
+def test_rotated_key_raises_auth_error():
+    p, _ = make("BAD_KEY")
+    with pytest.raises(AuthError):
+        p.get_balance()
+
+
+def test_country_and_operator_rejections_are_config_errors():
+    for body in ("BAD_COUNTRY", "BAD_OPERATOR"):
+        p, _ = make(body)
+        with pytest.raises(ProviderError) as exc:
+            p.get_prices()
+        assert body in str(exc.value)
+
+
+def test_prices_country_and_operator_are_actually_sent():
+    p, opener = make("NO_CONNECTION")
+    with pytest.raises(ServiceUnavailable):
+        p.get_prices()
+    assert "country=0" in opener.calls[0]["url"]
+    assert "operator=2" in opener.calls[0]["url"]
+
+
+def test_backend_error_on_price_fetch_is_service_unavailable():
+    """NO_CONNECTION must not parse as a status -- observed live: the stub
+    passes our params through to a dead database layer."""
+    p, _ = make("NO_CONNECTION")
+    with pytest.raises(ServiceUnavailable):
+        p.get_prices()
+
+
+def test_backend_error_during_sms_polling_fakes_no_code_and_kills_no_order():
+    """ERROR_DATABASE from getStatus must not produce a fabricated code, and
+    must not abandon a paid-for number: get_sms returns [] (poll again), and
+    an outage that lasts the whole lease ends as timeout -> refund path."""
+    p, _ = make("ERROR_DATABASE")
+    assert p.get_sms("12345") == []
+
+
+def test_total_backend_outage_times_out_cleanly():
+    p, _ = make(*(["ERROR_DATABASE"] * 40))
+    alloc = NumberAllocation(order_id="999", phone="+919876543210",
+                             service="whatsapp", country="in", charged=INR(10))
+    result = p.wait_for_otp(alloc, timeout_seconds=0.3, poll_interval=0.01)
+    assert not result.success and result.code is None
+
+
+def test_backend_error_on_buy_is_outcome_unknown_not_a_config_error():
+    """The money-critical classification. NO_CONNECTION from getNumber means
+    the charge may already have applied before the backend died. Surfacing it
+    as PurchaseTimedOut makes the engine hold and reconcile; the engine must
+    NOT buy a second number on this response."""
+    p, _ = make("NO_CONNECTION")
+    with pytest.raises(PurchaseTimedOut) as exc:
+        p.buy_number("whatsapp")
+    assert "reconcile" in str(exc.value).lower()
+
+
+def test_error_sql_on_buy_also_holds_the_order():
+    p, _ = make("ERROR_SQL")
+    with pytest.raises(PurchaseTimedOut):
+        p.buy_number("telegram")
+
+
+def test_wait_for_otp_survives_a_backend_outage_mid_lease():
+    """A paid-for number must never be abandoned because the provider's DB
+    blipped: transient errors poll until the deadline, then cancel-shape."""
+    p, _ = make(
+        "ERROR_DATABASE",          # poll 1: backend down -> tolerated
+        "STATUS_OK:482193",        # poll 2: code arrived
+    )
+    alloc = NumberAllocation(order_id="999", phone="+919876543210",
+                             service="whatsapp", country="in", charged=INR(10))
+    result = p.wait_for_otp(alloc, timeout_seconds=2.0, poll_interval=0.01)
+    assert result.code == "482193"
+    assert result.success
