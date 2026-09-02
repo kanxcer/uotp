@@ -98,6 +98,9 @@ class Settings:
     allowed_users: tuple[str, ...] = ()
     owner_id: str = ""
     ledger_path: str = "ledger.db"
+    #: Customer wallet balances. Must share the ledger's durability story:
+    #: on ephemeral free-tier hosting only DATABASE_URL survives a deploy.
+    wallets_path: str = "wallets.db"
     #: Postgres connection string. When set, BOTH the ledger and the sub-bot
     #: registry live there instead of sqlite -- they must share one durability
     #: story, because a registry that outlives the ledger keeps charging fees
@@ -207,6 +210,7 @@ def from_environment(env_file: Optional[Path | str] = None) -> Settings:
         allowed_users=allowed,
         owner_id=_get("TELEGRAM_OWNER_ID", ""),
         ledger_path=_get("LEDGER_PATH", "ledger.db"),
+        wallets_path=_get("WALLETS_PATH", "wallets.db"),
         database_url=_get("DATABASE_URL", ""),
         database_schema=_get("DATABASE_SCHEMA", "uotp"),
         prices_path=_get("PRICES_PATH") or None,

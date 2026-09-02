@@ -19,7 +19,22 @@ from .whitelabel import SubBotRegistry
 
 log = logging.getLogger("uotpbot.store")
 
-__all__ = ["make_ledger", "make_registry", "backend_name"]
+__all__ = ["make_ledger", "make_registry", "make_wallets", "backend_name"]
+
+
+def make_wallets(settings: Settings):
+    """Customer wallet store matching the ledger's durability story.
+
+    A paying customer's balance must survive the same redeploys the audit
+    trail does, so the wallets follow DATABASE_URL exactly like the ledger.
+    """
+    if settings.database_url:
+        from .wallets import PostgresWallets
+
+        return PostgresWallets(settings.database_url, schema=settings.database_schema)
+    from .wallets import SqliteWallets
+
+    return SqliteWallets(settings.wallets_path)
 
 
 def backend_name(settings: Settings) -> str:

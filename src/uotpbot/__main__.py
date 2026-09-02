@@ -111,13 +111,16 @@ def _serve(settings: Settings) -> int:
         log.info("connected to %s; wallet %s", provider.name, balance.credit)
 
     from .bot.commands import CommandRouter
+    from .store import make_wallets
 
-    subbots = _make_whitelabel(settings, catalog, ledger, pricer)
+    wallets = make_wallets(settings)
+    subbots = _make_whitelabel(settings, catalog, ledger, pricer, wallets)
 
     def router_factory() -> CommandRouter:
         return CommandRouter(
             engine, catalog, pricer, ledger,
             owner_id=settings.owner_id, allowed_users=settings.allowed_users,
+            wallets=wallets,
             subbots=subbots.registry if subbots else None,
             platform_fee=_platform_fee(settings),
         )
@@ -172,11 +175,12 @@ class WhiteLabel:
     on_created: Optional[Callable[[object], None]] = None
 
 
-def _make_whitelabel(settings: Settings, catalog, ledger, pricer) -> Optional[WhiteLabel]:
+def _make_whitelabel(settings: Settings, catalog, ledger, pricer, wallets) -> Optional[WhiteLabel]:
     """Build the sub-bot registry and manager, or None when disabled."""
     if not settings.whitelabel_enabled:
         return None
     from .bot.commands import CommandRouter
+    from .wallets import ScopedWallets
     from .whitelabel import MultiBotManager
 
     registry = make_registry(settings)
@@ -199,6 +203,7 @@ def _make_whitelabel(settings: Settings, catalog, ledger, pricer) -> Optional[Wh
         return CommandRouter(
             sub_engine, catalog, pricer, ledger,
             owner_id=bot.owner_id, allowed_users=(),
+            wallets=ScopedWallets(wallets, bot.id),
         )
 
     manager = MultiBotManager(registry, router_factory,
