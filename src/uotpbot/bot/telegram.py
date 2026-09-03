@@ -298,10 +298,20 @@ def build_from_settings(settings: Settings, router_factory: Any) -> Any:
         support_contact=getattr(settings, "support_contact", ""),
         pay_upi_id=getattr(settings, "pay_upi_id", ""),
     )
+    # ``concurrent_updates`` is load-bearing for responsiveness.
+    #
+    # By default python-telegram-bot processes updates SEQUENTIALLY: it awaits
+    # one handler to complete before it starts the next. A single long-running
+    # handler -- a ``/buy`` text command, or a 💰 Check OTP tap, either of which
+    # can wait on the provider for the full ~5-minute OTP window -- would
+    # therefore queue every other update behind it, so Back / My numbers / the
+    # whole button grid froze until that order refunded. Running each update in
+    # its own task keeps the button surface live during a wait.
     app = (
         Application.builder()
         .token(settings.require_telegram())
         .post_init(_post_init)
+        .concurrent_updates(True)
         .build()
     )
     app.add_handler(CallbackQueryHandler(frontend.on_callback))
