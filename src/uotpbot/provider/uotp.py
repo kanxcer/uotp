@@ -115,6 +115,16 @@ ERROR_TOKENS: frozenset[str] = frozenset({
     "BAD_SERVICE", "ERROR_NO_NUMBERS", "ERROR_NO_BALANCE", "NO_ACTIVATION",
     "ERROR_EMPTY_ACCOUNT", "ERROR_WRONG_ACTION", "ERROR_NO_FREE",
     "ACCOUNT_INACTIVE", "ERROR_IP", "ERROR_NO_SERVICE",
+    # Bare (un-prefixed) variants the live uotp.store handler actually returns,
+    # verified 2026-09-03: getNumber answers NO_NUMBERS (that operator pool is
+    # empty) and NO_BALANCE (wallet can't cover that pool), with NO "ERROR_"
+    # prefix. Without these listed they parse as a *success* status, the
+    # operator walk stops at the first empty pool, and the purchase explodes
+    # with "expected ACCESS_NUMBER but got NO_NUMBERS" instead of moving to the
+    # next operator or reporting a clean no-stock/no-funds. A one-tap buy was
+    # failing on bigbasket exactly because of this.
+    "NO_NUMBERS", "NO_NUMBER", "NO_FREE", "NO_BALANCE", "NO_MONEY",
+    "ERROR_SERVICE", "WRONG_SERVICE", "ERROR_NO_ACTIVATION",
     # Observed live on 2026-09-02: getPrices without a country returns
     # BAD_COUNTRY, and with one but no operator returns BAD_OPERATOR. Both
     # have no colon, so an unlisted token would parse as a *success* status
@@ -129,11 +139,14 @@ ERROR_TOKENS: frozenset[str] = frozenset({
 
 #: Which exception each error token becomes.
 _FATAL_AUTH = frozenset({"ERROR_KEY", "BAD_KEY", "ERROR_IP", "ACCOUNT_INACTIVE"})
-_NO_STOCK = frozenset({"ERROR_NO_NUMBERS", "ERROR_NO_FREE", "ERROR_NO_SERVICE"})
-_NO_FUNDS = frozenset({"ERROR_NO_BALANCE", "ERROR_EMPTY_ACCOUNT"})
+_NO_STOCK = frozenset({"ERROR_NO_NUMBERS", "ERROR_NO_FREE", "ERROR_NO_SERVICE",
+                       "NO_NUMBERS", "NO_NUMBER", "NO_FREE", "ERROR_SERVICE",
+                       "WRONG_SERVICE"})
+_NO_FUNDS = frozenset({"ERROR_NO_BALANCE", "ERROR_EMPTY_ACCOUNT",
+                       "NO_BALANCE", "NO_MONEY"})
 _BAD_REQUEST = frozenset({"BAD_ACTION", "BAD_STATUS", "BAD_SERVICE",
-                          "NO_ACTIVATION", "ERROR_WRONG_ACTION",
-                          "BAD_COUNTRY", "BAD_OPERATOR"})
+                          "NO_ACTIVATION", "ERROR_NO_ACTIVATION",
+                          "ERROR_WRONG_ACTION", "BAD_COUNTRY", "BAD_OPERATOR"})
 #: Provider-side infrastructure failures (observed live on the stub API).
 #: On reads these are transient and safe to retry. On a purchase the money
 #: may already have moved before the backend died, so the buy path must

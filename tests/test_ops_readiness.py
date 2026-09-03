@@ -195,3 +195,43 @@ def test_unavailable_service_via_card_is_a_clean_no(tmp_path):
     assert not card.ok and "temporarily unavailable" in card.text
     buy = router.purchase(USER, "cloudkitchen")
     assert not buy.ok and "temporarily unavailable" in buy.text
+
+
+# -------------------------------------------------- live-observed bare tokens
+def test_bare_no_numbers_and_no_balance_are_recognized_and_walk_continues():
+    """Regression: uotp.store's handler returns BARE NO_NUMBERS / NO_BALANCE
+    (no 'ERROR_' prefix) on getNumber. They were not in ERROR_TOKENS, so they
+    parsed as a *success* status; the operator walk then broke on the FIRST
+    empty pool and raised "expected ACCESS_NUMBER but got NO_NUMBERS" instead
+    of trying the next operator -- a live bigbasket buy failed even though a
+    later operator (8) had stock.
+
+    This replays the exact live sequence and asserts the walk reaches operator
+    8 and returns the number.
+    """
+    p, opener = _provider(
+        "NO_NUMBERS", "NO_BALANCE", "NO_BALANCE",
+        "NO_NUMBERS", "NO_NUMBERS",
+        "ACCESS_NUMBER:6a991a5e295d9b7e0600e25c:919334803395",
+    )
+    alloc = p.buy_number("bigbasket", "22")
+    assert alloc.order_id == "6a991a5e295d9b7e0600e25c"
+    assert alloc.phone == "919334803395"
+    ops = []
+    for c in opener.calls:
+        # each call is action=getNumber&...operator=N
+        q = c["url"].split("?")[1].split("&")
+        ops.append(dict(kv.split("=", 1) for kv in q).get("operator"))
+    assert "8" in ops          # it reached the operator that had stock
+    assert "3" in ops          # and it walked past the empty pools
+
+
+def test_all_bare_no_stock_reports_clean_number_unavailable():
+    """If every operator pool is empty, the customer gets a clean no-stock
+    (NumberUnavailable) message rather than a confusing parse error.
+    Six operators in the bigbasket walk -> six NO_NUMBERS responses."""
+    from uotpbot.provider.base import NumberUnavailable
+    p, _ = _provider("NO_NUMBERS", "NO_NUMBERS", "NO_NUMBERS",
+                     "NO_NUMBERS", "NO_NUMBERS", "NO_NUMBERS")
+    with pytest.raises(NumberUnavailable):
+        p.buy_number("bigbasket", "22")
