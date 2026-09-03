@@ -542,12 +542,38 @@ class MenuUI:
         )
 
     def history_card(self, user_id: str) -> Reply:
-        store = self._store
-        get_orders = getattr(store, "recent_orders", None)
+        """🧾 My numbers: live (not-yet-expired) numbers first, then history.
+
+        A bought number must stay visible even after you leave the buy screen,
+        until it expires -- so we read the persisted ``active_numbers`` set
+        (created the moment a number is allocated) and keep it on top, offering
+        Check OTP / Resend / Cancel for the ones still being waited on.
+        """
+        lines: list[str] = []
+        rows: list[tuple[tuple[str, str], ...]] = []
+        live = self._active_numbers(user_id)
+        if live:
+            lines.append("🔴 LIVE numbers (still valid):")
+            extra: list[tuple[str, str]] = []
+            for a in live:
+                mins = max(1, int(round(a.seconds_left / 60)))
+                name = self.catalog.get(a.slug).name if self.catalog.has(a.slug) else a.slug
+                if a.has_otp:
+                    lines.append(f"\n✅ {name} · {a.gross}\n"
+                                 f"    📱 {a.phone} · OTP {a.otp} · {mins} min left")
+                else:
+                    lines.append(f"\n⏳ {name} · {a.gross}\n"
+                                 f"    📱 {a.phone} · {mins} min left (OTP pending)")
+                    if a.token:
+                        extra.append((("💰 Check OTP", f"co:{a.token}")))
+            if extra:
+                rows.append(tuple(extra))
+
+        get_orders = getattr(self._store, "recent_orders", None)
         if callable(get_orders):
             entries = get_orders(user_id=user_id, limit=8)
             if entries:
-                lines = ["🧾 Your orders (saved — survive restarts):"]
+                lines.append("\n📜 Completed:")
                 for o in entries:
                     when = time.strftime("%d %b %H:%M", time.localtime(o.ts))
                     name = self.catalog.get(o.slug).name if self.catalog.has(o.slug) else o.slug
@@ -556,23 +582,33 @@ class MenuUI:
                                      f"\n    📱 {o.phone} · OTP {o.otp}")
                     else:
                         lines.append(f"\n♻️ {when} — {name} · refunded {o.gross}")
-                return Reply("\n".join(lines),
-                             rows=((("🛒 Buy again", "l"), ("🏠 Menu", "m")),))
-        entries = self._history.get(user_id, [])
-        if not entries:
-            return Reply(
-                "🧾 No orders yet.\n\n"
-                "Bought numbers are listed here with the OTP that arrived.",
-                rows=((("🛒 Buy a number", "l"), ("🏠 Menu", "m")),),
-            )
-        lines = ["🧾 This session's numbers (newest first):"]
-        for ts, slug, ok, summary in entries:
-            when = time.strftime("%H:%M", time.localtime(ts))
-            lines.append(f"\n{'✅' if ok else '♻️ refunded'} {when} — {summary}")
-        return Reply(
-            "\n".join(lines),
-            rows=((("🛒 Buy again", "l"), ("🏠 Menu", "m")),),
-        )
+            if not live and not entries:
+                lines.append("No numbers yet.")
+        else:
+            entries = self._history.get(user_id, [])
+            if not live and not entries:
+                return Reply(
+                    "🧾 No orders yet.\n\n"
+                    "Bought numbers are listed here with the OTP that arrived.",
+                    rows=((("🛒 Buy a number", "l"), ("🏠 Menu", "m")),),
+                )
+            if entries:
+                lines.append("\n📜 This session:")
+                for ts, slug, ok, summary in entries:
+                    when = time.strftime("%H:%M", time.localtime(ts))
+                    lines.append(f"\n{'✅' if ok else '♻️ refunded'} {when} — {summary}")
+        rows.append((("🛒 Buy again", "l"), ("🏠 Menu", "m")))
+        return Reply("\n".join(lines), rows=tuple(rows))
+
+    def _active_numbers(self, user_id: str) -> list:
+        store = self._store
+        fn = getattr(store, "active_numbers", None)
+        if not callable(fn):
+            return []
+        try:
+            return list(fn(user_id=user_id))
+        except Exception:  # noqa: BLE001 - display only
+            return []
 
     def admin_panel(self, user_id: str) -> Reply:
         if not self.router._is_owner(user_id):

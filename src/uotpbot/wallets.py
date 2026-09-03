@@ -26,7 +26,7 @@ from .money import Money
 
 __all__ = [
     "WalletStore", "SqliteWallets", "PostgresWallets", "ScopedWallets",
-    "WalletError", "Topup", "OrderRow",
+    "WalletError", "Topup", "OrderRow", "ActiveNumber",
 ]
 
 
@@ -107,6 +107,23 @@ class ScopedWallets(WalletStore):
     def recent_orders(self, *, user_id: str = "", limit: int = 10):
         return self._inner.recent_orders(scope=self._scope, user_id=user_id, limit=limit)
 
+    # -- active numbers (scoped per bot) -----------------------------------
+    def record_active(self, *, user_id, slug, phone, provider_order_id="",
+                      token="", gross, otp="", valid_until):
+        return self._inner.record_active(user_id=user_id, slug=slug, phone=phone,
+                                         provider_order_id=provider_order_id,
+                                         token=token, gross=gross, otp=otp,
+                                         valid_until=valid_until, scope=self._scope)
+
+    def active_numbers(self, *, user_id: str = "", now=None):
+        return self._inner.active_numbers(scope=self._scope, user_id=user_id, now=now)
+
+    def update_active(self, provider_order_id: str, *, otp: str = ""):
+        return self._inner.update_active(provider_order_id, otp=otp)
+
+    def finish_active(self, provider_order_id: str):
+        return self._inner.finish_active(provider_order_id)
+
     def float_stats(self):
         return self._inner.float_stats(scope=self._scope)
 
@@ -146,6 +163,27 @@ CREATE TABLE IF NOT EXISTS {t} (
     success INTEGER NOT NULL CHECK (success IN (0, 1)),
     profit_paise INTEGER NOT NULL DEFAULT 0,
     ts REAL NOT NULL
+)
+"""
+
+#: Live (not yet expired) numbers a customer is still entitled to see. Unlike
+#: ``orders`` (written only once an order is *completed*), a row is created the
+#: moment a number is allocated so it stays viewable in "My numbers" even after
+#: the customer leaves the buy screen -- and it outlives a redeploy, which
+#: matters because an active number is a real, already-charged activation.
+_ACTIVE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS {t} (
+    {pk}
+    scope TEXT NOT NULL DEFAULT '',
+    user_id TEXT NOT NULL,
+    slug TEXT NOT NULL,
+    phone TEXT NOT NULL DEFAULT '',
+    provider_order_id TEXT NOT NULL DEFAULT '',
+    token TEXT NOT NULL DEFAULT '',
+    gross_paise INTEGER NOT NULL,
+    otp TEXT NOT NULL DEFAULT '',
+    ts REAL NOT NULL,
+    valid_until REAL NOT NULL
 )
 """
 
@@ -197,6 +235,35 @@ class Topup:
     decided_by: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class ActiveNumber:
+    """One live number a customer can still see (not yet expired).
+
+    ``token`` links back to the in-memory wait so the UI can offer Check OTP /
+    Resend / Cancel; it is empty after a redeploy (the number is still shown,
+    just without live actions).
+    """
+
+    id: int
+    user_id: str
+    slug: str
+    phone: str
+    provider_order_id: str
+    token: str
+    gross: Money
+    otp: str
+    ts: float
+    valid_until: float
+
+    @property
+    def seconds_left(self) -> float:
+        return max(self.valid_until - time.time(), 0.0)
+
+    @property
+    def has_otp(self) -> bool:
+        return bool(self.otp)
+
+
 class SqliteWallets(WalletStore):
     """File-backed store for local/dev runs.
 
@@ -217,7 +284,65 @@ class SqliteWallets(WalletStore):
             self._conn.execute(
                 _ORDERS_SCHEMA.format(t="orders", pk="id INTEGER PRIMARY KEY AUTOINCREMENT,")
             )
+            self._conn.execute(_ACTIVE_SCHEMA.format(
+                t="activenumbers", pk="id INTEGER PRIMARY KEY AUTOINCREMENT,"))
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_active ON activenumbers(scope, user_id)")
             self._conn.commit()
+
+    # -- active numbers ----------------------------------------------------
+    def record_active(self, *, user_id, slug, phone, provider_order_id="",
+                      token="", gross, otp="", valid_until, scope="") -> int:
+        """Persist a live number so it stays viewable until it expires."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO activenumbers(scope, user_id, slug, phone, "
+                " provider_order_id, token, gross_paise, otp, ts, valid_until) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (scope, user_id, slug, phone, provider_order_id, token,
+                 gross.paise, otp, time.time(), valid_until),
+            )
+            return int(cur.lastrowid or 0)
+
+    def active_numbers(self, *, scope: str = "", user_id: str = "",
+                       now: Optional[float] = None) -> list[ActiveNumber]:
+        """Every LIVE number for a user (ts <= now < valid_until), newest first."""
+        now = time.time() if now is None else now
+        sql = ("SELECT id, user_id, slug, phone, provider_order_id, token, "
+               " gross_paise, otp, ts, valid_until FROM activenumbers "
+               " WHERE scope = ? AND valid_until > ?")
+        params: list = [scope, now]
+        if user_id:
+            sql += " AND user_id = ?"
+            params.append(user_id)
+        sql += " ORDER BY id DESC"
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [self._active_from(r) for r in rows]
+
+    def update_active(self, provider_order_id: str, *, otp: str = "") -> None:
+        """Record the OTP on a live number once it arrives."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE activenumbers SET otp = ? WHERE provider_order_id = ?",
+                (otp, provider_order_id),
+            )
+
+    def finish_active(self, provider_order_id: str) -> None:
+        """Remove a number from the live set (delivered, refunded, or expired)."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "DELETE FROM activenumbers WHERE provider_order_id = ?",
+                (provider_order_id,),
+            )
+
+    @staticmethod
+    def _active_from(row) -> ActiveNumber:
+        return ActiveNumber(
+            id=row[0], user_id=row[1], slug=row[2], phone=row[3],
+            provider_order_id=row[4], token=row[5], gross=Money(row[6]),
+            otp=row[7], ts=row[8], valid_until=row[9],
+        )
 
     # -- payment top-ups ---------------------------------------------------
     def create_topup(
@@ -395,6 +520,62 @@ class PostgresWallets(WalletStore):
             self._to = f"{schema}.orders"
             self._conn.execute(_ORDERS_SCHEMA.format(
                 t=self._to, pk="id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"))
+            self._ta = f"{schema}.activenumbers"
+            self._conn.execute(_ACTIVE_SCHEMA.format(
+                t=self._ta, pk="id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"))
+            safe = schema.replace("-", "_").replace('"', "")
+            self._conn.execute(
+                f'CREATE INDEX IF NOT EXISTS "idx_active_{safe}" ON {self._ta}(scope, user_id)')
+
+    # -- active numbers ----------------------------------------------------
+    def record_active(self, *, user_id, slug, phone, provider_order_id="",
+                      token="", gross, otp="", valid_until, scope="") -> int:
+        with self._lock:
+            row = self._conn.execute(
+                f"INSERT INTO {self._ta}(scope, user_id, slug, phone, "
+                f" provider_order_id, token, gross_paise, otp, ts, valid_until) "
+                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                (scope, user_id, slug, phone, provider_order_id, token,
+                 gross.paise, otp, time.time(), valid_until),
+            ).fetchone()
+        return int(row[0])
+
+    def active_numbers(self, *, scope: str = "", user_id: str = "",
+                       now: Optional[float] = None) -> list[ActiveNumber]:
+        now = time.time() if now is None else now
+        sql = (f"SELECT id, user_id, slug, phone, provider_order_id, token, "
+               f" gross_paise, otp, ts, valid_until FROM {self._ta} "
+               " WHERE scope = %s AND valid_until > %s")
+        params: list = [scope, now]
+        if user_id:
+            sql += " AND user_id = %s"
+            params.append(user_id)
+        sql += " ORDER BY id DESC"
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [self._active_from(r) for r in rows]
+
+    def update_active(self, provider_order_id: str, *, otp: str = "") -> None:
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE {self._ta} SET otp = %s WHERE provider_order_id = %s",
+                (otp, provider_order_id),
+            )
+
+    def finish_active(self, provider_order_id: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                f"DELETE FROM {self._ta} WHERE provider_order_id = %s",
+                (provider_order_id,),
+            )
+
+    @staticmethod
+    def _active_from(row) -> ActiveNumber:
+        return ActiveNumber(
+            id=row[0], user_id=row[1], slug=row[2], phone=row[3],
+            provider_order_id=row[4], token=row[5], gross=Money(row[6]),
+            otp=row[7], ts=row[8], valid_until=row[9],
+        )
 
     # -- payment top-ups ---------------------------------------------------
     def create_topup(

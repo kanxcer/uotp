@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+import time
 import uuid
 from typing import Optional
 
@@ -367,13 +368,15 @@ class CommandRouter:
         self._debit(user_id, price)
         result = self.engine.allocate_number(user_id, slug, gross_price=price,
                                              server=server or None)
-        self._record_order(user_id, slug, price, result)
         if not result.success and result.order.state.value == "awaiting_otp" \
                 and result.phone:
             # Number allocated -> hand it over NOW; the OTP arrives separately.
             token = uuid.uuid4().hex[:12]
             self._awaiting[token] = (user_id, slug, result)
+            self._record_active(user_id, slug, price, result, token)
             return self.await_reply(token, result)
+        # Allocation failed (already refunded by the engine's _fail).
+        self._record_order(user_id, slug, price, result)
         # Allocation failed (already refunded by the engine's _fail).
         if result.refunded.paise > 0:
             self.credit(user_id, result.refunded)
@@ -466,6 +469,15 @@ class CommandRouter:
                 rows=((("💰 Check OTP", f"co:{token}"),), (("🏠 Menu", "m"),)),
             )
         self._awaiting.pop(token, None)
+        # Release confirmed -> remove from the active set too.
+        finish = getattr(self.wallets, "finish_active", None)
+        alloc = getattr(result, "_alloc", None)
+        provider_id = getattr(alloc, "order_id", "") if alloc else ""
+        if callable(finish) and provider_id:
+            try:
+                finish(provider_id)
+            except Exception:  # noqa: BLE001
+                pass
         self.credit(user_id, result.order.gross_price)
         return Reply(
             f"♻️ Cancelled — {slug} number released and {result.order.gross_price} "
@@ -493,6 +505,7 @@ class CommandRouter:
         result = self.engine.poll_otp(result, timeout_seconds=wait)
         if result.success and result.otp:
             self._awaiting.pop(token, None)
+            self._record_order(user_id, slug, result.order.gross_price, result)
             return Reply(
                 f"✅ OTP for {self.catalog.get(slug).name}: `{result.otp}`\n"
                 f"📱 Number: {result.phone}\n\n"
@@ -506,8 +519,9 @@ class CommandRouter:
         if result.refunded.paise > 0:
             self.credit(user_id, result.refunded)
         if not result.success:
-            # Terminal (timed out / refunded) -- clear it.
+            # Terminal (timed out / refunded) -- clear it and the active number.
             self._awaiting.pop(token, None)
+            self._record_order(user_id, slug, result.order.gross_price, result)
             return Reply(
                 f"⚠️ No OTP arrived for {slug}. Refunded {result.refunded} in "
                 f"full; balance {self.balance_of(user_id)}.",
@@ -515,6 +529,31 @@ class CommandRouter:
                 rows=((("🧾 My numbers", "o"), ("🏠 Menu", "m")),),
             )
         return self.await_reply(token, result)
+
+    def _record_active(self, user_id: str, slug: str, price: Money, result,
+                       token: str) -> None:
+        """Persist the just-allocated number so it shows in 'My numbers' and
+        survives leaving the buy screen / a redeploy."""
+        store = self.wallets
+        rec = getattr(store, "record_active", None)
+        if not callable(rec):
+            return
+        alloc = getattr(result, "_alloc", None)
+        provider_id = getattr(alloc, "order_id", "") if alloc else ""
+        # Absolute epoch expiry so the row stays viewable until the number is
+        # actually dead, surviving the message/navigation and a redeploy.
+        import datetime
+        if alloc is not None:
+            seconds_left = alloc.seconds_left()
+            valid_until = time.time() + max(seconds_left, 0)
+        else:
+            valid_until = time.time() + 20 * 60  # provider validity default
+        try:
+            rec(user_id=user_id, slug=slug, phone=result.phone or "",
+                provider_order_id=provider_id, token=token, gross=price,
+                valid_until=valid_until)
+        except Exception:  # noqa: BLE001 - a display cache must not block delivery
+            pass
 
     def _record_order(self, user_id: str, slug: str, price: Money, result) -> None:
         """Persist a durable order row for history + per-order profit.
@@ -532,6 +571,16 @@ class CommandRouter:
                 otp=result.otp or "", success=result.success, profit=result.profit)
         except Exception:  # never let the receipt printer block a delivery
             pass
+        # The order is now terminal (delivered or refunded): remove it from the
+        # live/active set so it no longer shows as an active number.
+        finish = getattr(store, "finish_active", None)
+        alloc = getattr(result, "_alloc", None)
+        provider_id = getattr(alloc, "order_id", "") if alloc else ""
+        if callable(finish) and provider_id:
+            try:
+                finish(provider_id)
+            except Exception:  # noqa: BLE001 - display cache, non-fatal
+                pass
 
     # -- white-label -----------------------------------------------------
     def cmd_createbot(self, user_id: str, args: list[str]) -> Reply:

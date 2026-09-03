@@ -7,6 +7,8 @@ bot A never spends on bot B.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from uotpbot.bot.commands import CommandRouter
@@ -95,4 +97,36 @@ def test_ui_balance_reflects_the_store(tmp_path):
     ui = MenuUI(router)
     store.adjust(USER, INR(42))
     assert "42" in ui.text(USER, "/start").text
+    store.close()
+
+
+def test_active_numbers_persist_and_expire(tmp_path):
+    store = SqliteWallets(str(tmp_path / "w.db"))
+    now = time.time()
+    store.record_active(user_id=USER, slug="telegram", phone="+919999999999",
+                        provider_order_id="p1", token="tok1", gross=INR(15),
+                        valid_until=now + 600)
+    live = store.active_numbers(user_id=USER, now=now + 100)
+    assert len(live) == 1
+    assert live[0].phone == "+919999999999"
+    assert live[0].token == "tok1"
+    assert live[0].seconds_left > 0
+    # A number past its expiry no longer shows.
+    assert store.active_numbers(user_id=USER, now=now + 700) == []
+    # Delivering records the OTP; it stays live until finished.
+    store.update_active("p1", otp="123456")
+    assert store.active_numbers(user_id=USER, now=now)[0].has_otp
+    store.finish_active("p1")
+    assert store.active_numbers(user_id=USER, now=now) == []
+    store.close()
+
+
+def test_scoped_active_numbers_are_isolated(tmp_path):
+    store = SqliteWallets(str(tmp_path / "w.db"))
+    scoped = ScopedWallets(store, scope="botA")
+    scoped.record_active(user_id=USER, slug="telegram", phone="+911111",
+                         provider_order_id="a", token="t", gross=INR(10),
+                         valid_until=time.time() + 500)
+    assert len(store.active_numbers(scope="botA", user_id=USER)) == 1
+    assert len(store.active_numbers(scope="botB", user_id=USER)) == 0
     store.close()

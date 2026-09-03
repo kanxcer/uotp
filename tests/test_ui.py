@@ -283,3 +283,36 @@ def test_cheapest_sticker_floors_at_min_charge():
     cat = Catalog({"cheap": ServiceCost("cheap", "Cheap", "x", INR(1), Decimal("0.9"))},
                   min_charge=INR(2))
     assert cat.cheapest_sticker() == INR(2)  # 1.00 floored up to min_charge 2.00
+
+
+def test_my_numbers_shows_active_number_and_check_otp(tmp_path):
+    """A bought number stays visible in 'My numbers' even after leaving the buy
+    screen: the live set is read from the wallet store and rendered on top."""
+    import time as _time
+    from uotpbot.wallets import SqliteWallets
+    catalog = Catalog(
+        {"telegram": ServiceCost("telegram", "Telegram", "messaging", INR(10),
+                                 Decimal("0.94"))},
+        (WalletPack("Pro", INR(1000), INR(1150)),),
+    )
+    ledger = Ledger()
+    pricer = Pricer(catalog)
+    provider = MockProvider({s.slug: catalog.sticker_price(s.slug)
+                             for s in catalog.services()}, balance=INR(5000), seed=5)
+    engine = BotEngine(catalog, provider, ledger, pricer,
+                       config=EngineConfig(retry_cap=3, otp_timeout_seconds=1.0,
+                                           poll_interval=0.01))
+    store = SqliteWallets(str(tmp_path / "w.db"))
+    router = CommandRouter(engine, catalog, pricer, ledger,
+                           owner_id=OWNER, allowed_users=(OWNER, USER),
+                           wallets=store)
+    ui = MenuUI(router)
+    store.record_active(user_id=USER, slug="telegram", phone="+919000000000",
+                        provider_order_id="p1", token="tok1", gross=INR(15),
+                        valid_until=_time.time() + 600)
+    reply = ui.button(USER, "o")  # 🧾 My numbers
+    assert "LIVE" in reply.text
+    assert "+919000000000" in reply.text
+    labels = [label for row in reply.rows for label, _ in row]
+    assert any("Check OTP" in l for l in labels)
+    store.close()
