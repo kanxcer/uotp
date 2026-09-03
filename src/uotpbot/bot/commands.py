@@ -10,6 +10,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+import uuid
+from typing import Optional
+
 from ..catalog import Catalog
 from ..createbot import CreateBotFlow, CreateBotResult
 from ..economics import EconomicsError
@@ -118,6 +121,11 @@ class CommandRouter:
         #: Set by the transport once a sub-bot's poller is live, so /createbot
         #: can report that its bot actually started.
         self.on_bot_created: Optional[Callable[[object], None]] = None
+        #: Number-first wait: token -> (customer_id, slug, engine result). An
+        #: order is placed here once a number is allocated and cleared when the
+        #: OTP is delivered or the wait is abandoned. Kept in memory: the wait
+        #: only spans a single order's lifetime, never a redeploy.
+        self._awaiting: dict[str, tuple[str, str, object]] = {}
 
     # -- helpers ---------------------------------------------------------
     def balance_of(self, user_id: str) -> Money:
@@ -315,6 +323,198 @@ class CommandRouter:
             f"balance {self.balance_of(user_id)}.{detail}",
             ok=False,
         )
+
+    def alloc_and_wait(
+        self, user_id: str, slug: str, *, server: str = ""
+    ) -> Reply:
+        """Validate, debit, allocate a number, and start waiting for its OTP.
+
+        Returns a reply that (a) shows the number immediately so the customer
+        can request the OTP on the target service, and (b) carries an
+        ``await_token`` so the transport can re-invoke :meth:`check_otp` on
+        demand. If the number cannot be allocated the customer is refunded.
+        """
+        if not self.catalog.has(slug):
+            return Reply(f"Unknown service {slug!r}. Try /list.", ok=False)
+
+        if (self.maintenance_fn and self.maintenance_fn()
+                and not self._is_owner(user_id)):
+            return Reply(
+                "🛠 Maintenance in progress — purchases are paused for a few "
+                "minutes. Your balance is safe; please try again shortly.",
+                ok=False,
+            )
+
+        serve = getattr(self.engine.provider, "can_serve", None)
+        if callable(serve) and not serve(slug) and not self._is_owner(user_id):
+            return Reply(
+                f"😔 {self.catalog.get(slug).name} numbers are temporarily "
+                "unavailable from our supplier. Nothing was charged — pick "
+                "another service, or try again later.",
+                ok=False,
+            )
+
+        price, _ = self.engine.quote(slug, server=server or None)
+        balance = self.balance_of(user_id)
+        if balance.paise < price.paise:
+            short = price - balance
+            return Reply(
+                f"That costs {price}; your balance is {balance}. "
+                f"Top up at least {short} more (💰 Balance → ➕ Add money).",
+                ok=False,
+            )
+
+        self._debit(user_id, price)
+        result = self.engine.allocate_number(user_id, slug, gross_price=price,
+                                             server=server or None)
+        self._record_order(user_id, slug, price, result)
+        if not result.success and result.order.state.value == "awaiting_otp" \
+                and result.phone:
+            # Number allocated -> hand it over NOW; the OTP arrives separately.
+            token = uuid.uuid4().hex[:12]
+            self._awaiting[token] = (user_id, slug, result)
+            return self.await_reply(token, result)
+        # Allocation failed (already refunded by the engine's _fail).
+        if result.refunded.paise > 0:
+            self.credit(user_id, result.refunded)
+        reason = getattr(result, "message", "") or ""
+        detail = f"\n\nWhy: {reason}" if reason else ""
+        return Reply(
+            f"⚠️ Couldn't get a number for {slug}. Refunded {result.refunded} in "
+            f"full; balance {self.balance_of(user_id)}.{detail}",
+            ok=False,
+        )
+
+    def await_reply(self, token: str, result) -> Reply:
+        """Build the 'number is yours; waiting for OTP' reply + a Check button."""
+        return Reply(
+            f"📱 {self.catalog.get(result.order.service).name}\n\n"
+            f"🎯 Your number: `{result.phone}`\n"
+            f"⏳ Waiting for the OTP to arrive (up to ~{int(self.engine.config.otp_timeout_seconds // 60)} min)…\n\n"
+            "Enter this number on the service to request the code, then tap "
+            "💰 Check OTP below. Auto-refund if it never lands.",
+            rows=(
+                ((f"💰 Check OTP", f"co:{token}"),),
+                ((f"🔁 Resend SMS", f"rs:{token}"), (f"♻️ Cancel", f"cx:{token}")),
+                (("🧾 My numbers", "o"), ("🏠 Menu", "m")),
+            ),
+        )
+
+    def resend_sms(self, token: str) -> Reply:
+        """🔁 Resend: ask the provider to re-send the code (setStatus=3)."""
+        entry = self._awaiting.get(token)
+        if entry is None:
+            return Reply("That order is no longer waiting. See 🧾 My numbers.",
+                         ok=False, rows=((("🧾 My numbers", "o"),),))
+        _uid, _slug, result = entry
+        alloc = getattr(result, "_alloc", None)
+        if alloc is None:
+            return Reply("No live number to resend on.", ok=False,
+                         rows=((("🏠 Menu", "m"),),))
+        ok = getattr(self.engine.provider, "resend", None)
+        if callable(ok) and ok(alloc.order_id):
+            return Reply(
+                "✅ Resent. Give it a moment, then tap 💰 Check OTP.",
+                rows=((("💰 Check OTP", f"co:{token}"),),
+                      (("🏠 Menu", "m"),)),
+            )
+        return Reply(
+            "Couldn't resend right now — the provider is briefly unavailable. "
+            "Tap 💰 Check OTP in a moment instead.",
+            ok=False,
+            rows=((("💰 Check OTP", f"co:{token}"),), (("🏠 Menu", "m"),)),
+        )
+
+    def cancel_wait(self, token: str) -> Reply:
+        """♻️ Cancel: release the number so the activation stops costing.
+
+        Only refund the customer when the provider actually confirmed the
+        release. If the provider refuses (the live handler returns
+        EARLY_CANCEL_DENIED for a fresh activation -- it must sit out its OTP
+        window), we tell the customer the truth rather than silently refunding
+        a number that is still live and spendable on our wallet.
+        """
+        entry = self._awaiting.get(token)
+        if entry is None:
+            return Reply("That order has finished. See 🧾 My numbers.",
+                         ok=False, rows=((("🧾 My numbers", "o"),),))
+        user_id, slug, result = entry
+        alloc = getattr(result, "_alloc", None)
+        released = True
+        refused = ""
+        if alloc is not None:
+            # Use cancel_strict so a provider refusal (EARLY_CANCEL_DENIED)
+            # propagates instead of being swallowed by the best-effort
+            # ``cancel`` (which returns Money(0) on both success and failure).
+            strict = getattr(self.engine.provider, "cancel_strict", None)
+            try:
+                if callable(strict):
+                    strict(alloc.order_id)
+                else:
+                    self.engine.provider.cancel(alloc.order_id)
+            except Exception as exc:  # noqa: BLE001 - surface provider refusal
+                released = False
+                refused = str(exc)
+        if not released:
+            return Reply(
+                "♻️ The provider won't release this number yet — a fresh "
+                "activation must wait out its window before it can be cancelled "
+                "or refunded. Tap 💰 Check OTP; if no code arrives it auto-refunds "
+                "at the deadline."
+                + (f"\n\n({refused})" if refused else ""),
+                ok=False,
+                rows=((("💰 Check OTP", f"co:{token}"),), (("🏠 Menu", "m"),)),
+            )
+        self._awaiting.pop(token, None)
+        self.credit(user_id, result.order.gross_price)
+        return Reply(
+            f"♻️ Cancelled — {slug} number released and {result.order.gross_price} "
+            f"returned to your balance ({self.balance_of(user_id)}).",
+            rows=((("🧾 My numbers", "o"), ("🏠 Menu", "m")),),
+        )
+
+    def check_otp(self, token: str, *, wait_seconds: int = 0) -> Reply:
+        """Re-check a waiting order for its OTP; deliver it when it arrives.
+
+        ``wait_seconds`` lets a button press block a short while before giving
+        up, so tapping 'Check' actually waits for a code that is seconds away
+        rather than replying instantly with nothing. The transport runs this
+        off the event loop (deferred), so a longer wait is fine.
+        """
+        entry = self._awaiting.get(token)
+        if entry is None:
+            return Reply(
+                "That order has finished or is no longer waiting. "
+                "See 🧾 My numbers.",
+                ok=False, rows=((("🧾 My numbers", "o"), ("🏠 Menu", "m")),),
+            )
+        user_id, slug, result = entry
+        wait = wait_seconds if wait_seconds > 0 else self.engine.config.otp_timeout_seconds
+        result = self.engine.poll_otp(result, timeout_seconds=wait)
+        if result.success and result.otp:
+            self._awaiting.pop(token, None)
+            return Reply(
+                f"✅ OTP for {self.catalog.get(slug).name}: `{result.otp}`\n"
+                f"📱 Number: {result.phone}\n\n"
+                f"Charged {result.order.gross_price} · Balance {self.balance_of(user_id)}",
+                rows=(
+                    (("🔁 Another", f"s:{slug}"), ("🧾 My numbers", "o")),
+                    (("🏠 Menu", "m"),),
+                ),
+            )
+        # Still waiting (or timed out to a refund).  If poll_otp refunded, reflect it.
+        if result.refunded.paise > 0:
+            self.credit(user_id, result.refunded)
+        if not result.success:
+            # Terminal (timed out / refunded) -- clear it.
+            self._awaiting.pop(token, None)
+            return Reply(
+                f"⚠️ No OTP arrived for {slug}. Refunded {result.refunded} in "
+                f"full; balance {self.balance_of(user_id)}.",
+                ok=False,
+                rows=((("🧾 My numbers", "o"), ("🏠 Menu", "m")),),
+            )
+        return self.await_reply(token, result)
 
     def _record_order(self, user_id: str, slug: str, price: Money, result) -> None:
         """Persist a durable order row for history + per-order profit.

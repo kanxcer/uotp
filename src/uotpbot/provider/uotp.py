@@ -135,6 +135,11 @@ ERROR_TOKENS: frozenset[str] = frozenset({
     # (getStatus). Bare tokens again -- listed or they would parse as a
     # success status and be polled as "no OTP yet" instead of raising.
     "NO_CONNECTION", "ERROR_DATABASE",
+    # Observed live 2026-09-03: cancelling a fresh activation is refused --
+    # the number must sit out its OTP window before the provider will release
+    # or refund it. Not a stock problem; a customer asking to cancel should see
+    # a clear message, not a confusing success-status parse.
+    "EARLY_CANCEL_DENIED", "CANCEL_DENIED", "PRICE_CHANGED", "PROVIDER_2FA",
 })
 
 #: Which exception each error token becomes.
@@ -192,6 +197,12 @@ class UotpConfig:
     #: setStatus codes: 1 ready, 3 request another SMS, 6 complete, 8 cancel.
     status_complete: str = "6"
     status_cancel: str = "8"
+    #: setStatus code that asks the provider to resend the SMS. The
+    #: SMS-activate-family convention is 3 ("request another"), and the live
+    #: handler accepts it (it reached the backend, which was down on our probe);
+    #: statuses 6/4 were BAD_STATUS by contrast. Configurable in case the
+    #: provider names it differently.
+    status_resend: str = "3"
     #: getPrices was observed to require both of these. Their meaning is
     #: provider-specific and undocumented, so both are settings.
     #: Tuned against the live endpoint on 2026-09-02: country 0 and 1 pass
@@ -663,6 +674,20 @@ class UotpProvider:
             )
         except ProviderError:
             pass
+
+    def resend(self, order_id: str) -> bool:
+        """Ask the provider to resend the SMS (setStatus=3, the protocol-family
+        'request another/code' code). Best-effort: returns True if the provider
+        accepted it (i.e. no auth/parameter error), False on any failure.
+        """
+        c = self.config
+        try:
+            self._request(
+                c.action_set_status, id=order_id.split("|")[0], status=c.status_resend
+            )
+            return True
+        except ProviderError:
+            return False
 
     def get_active(self) -> Sequence[Mapping[str, str]]:
         """Open activations, for reconciling after a crash."""

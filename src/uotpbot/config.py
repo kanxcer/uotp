@@ -177,6 +177,7 @@ def from_environment(env_file: Optional[Path | str] = None) -> Settings:
         canceled_prefix=_get("UOTP_PREFIX_CANCELED", "STATUS_CANCEL"),
         status_complete=_get("UOTP_STATUS_COMPLETE", "6"),
         status_cancel=_get("UOTP_STATUS_CANCEL", "8"),
+        status_resend=_get("UOTP_STATUS_RESEND", "3"),
         prices_country=_get("UOTP_PRICES_COUNTRY", "0"),
         # Numeric operator id, verified live: "any"/"0" are rejected with
         # BAD_OPERATOR, ids >= 2 pass validation (the provider then answered

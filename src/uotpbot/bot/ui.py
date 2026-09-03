@@ -789,6 +789,20 @@ class MenuUI:
         if kind == "y" and len(parts) >= 2:
             server = parts[2] if len(parts) == 3 else ""
             return self._begin_purchase(user_id, parts[1], server)
+        if kind == "co" and len(parts) == 2:
+            return self._check_waiting(user_id, parts[1])
+        if kind == "rs" and len(parts) == 2:
+            reply = self.router.resend_sms(parts[1])
+            return reply
+        if kind == "cx" and len(parts) == 2:
+            # Guard: only the customer who owns the wait can cancel it.
+            entry = getattr(self.router, "_awaiting", {}).get(parts[1])
+            if entry is not None and entry[0] != user_id:
+                return Reply("That's not your order.", ok=False,
+                             rows=((("🏠 Menu", "m"),),))
+            reply = self.router.cancel_wait(parts[1])
+            self._record(user_id, self._slug_for_token(parts[1]), reply)
+            return reply
         # Unknown: menus advance; they never rotate an old menu back.
         return Reply("That menu moved on. Fresh one:", ok=False,
                      rows=((("🏠 Menu", "m"),),))
@@ -824,16 +838,44 @@ class MenuUI:
         where = f" · server {server}" if server else ""
 
         def job(uid: str) -> Reply:
-            reply = self.router.purchase(uid, slug, server=server)
+            reply = self.router.alloc_and_wait(uid, slug, server=server)
             self._record(uid, slug, reply)
+            # Number-first: alloc_and_wait already returns the number (or a
+            # clean refund). For the success case we keep its Check OTP buttons;
+            # for a failure we wrap it like the old outcome so tests stay valid.
+            if reply.ok:
+                return reply
             return self._outcome(slug, reply)
 
         return Reply(
-            f"⏳ Buying {cost.name}{where} for {price}…\n\n"
-            "Reserving a number now; the OTP will be edited into THIS message.\n"
-            "Usually under a minute; automatic refund if nothing arrives.",
+            f"⏳ Reserving a {cost.name} number for {price}…\n\n"
+            "You'll get your number in a moment, then tap 💰 Check OTP once "
+            "you've requested the code. Auto-refund if nothing arrives.",
             deferred=job,
         )
+
+    def _check_waiting(self, user_id: str, token: str) -> Reply:
+        """💰 Check OTP tap: wait (off the event loop) for the code to land.
+
+        The transport runs ``deferred`` in a worker thread, so a bounded wait
+        is fine. We wait the remaining OTP window on this tap; if it comes, we
+        deliver it; if not, we tell the customer to try again shortly.
+        """
+        def job(uid: str) -> Reply:
+            reply = self.router.check_otp(token)
+            self._record(uid, self._slug_for_token(token), reply)
+            return reply
+
+        return Reply(
+            "⏳ Waiting for the OTP…\n\n"
+            "If you haven't already, enter your number on the service to "
+            "request the code. This waits a while, so do not tap repeatedly.",
+            deferred=job,
+        )
+
+    def _slug_for_token(self, token: str) -> str:
+        entry = getattr(self.router, "_awaiting", {}).get(token)
+        return entry[1] if entry else ""
 
     def _record(self, user_id: str, slug: str, reply: Reply) -> None:
         first = reply.text.splitlines()[0] if reply.text else "(no detail)"

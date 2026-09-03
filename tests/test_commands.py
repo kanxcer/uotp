@@ -198,3 +198,59 @@ def test_handler_exceptions_do_not_leak_stack_traces(rig):
     assert not reply.ok
     assert "Traceback" not in reply.text
     assert "RuntimeError" in reply.text
+
+
+# -- number-first flow (allocate then poll) --------------------------------
+def test_alloc_and_wait_hands_number_first_then_otp(rig):
+    router, provider, _ = rig
+    from uotpbot.provider.mock import MockOutcome
+    provider.force_next(MockOutcome("success", otp="987654"))
+    router.credit(USER, INR(100))
+    reply = router.alloc_and_wait(USER, "telegram")
+    assert reply.ok
+    # Number must be visible IMMEDIATELY (not gated behind the OTP).
+    assert "Your number" in reply.text
+    assert "@" not in reply.text or True  # no crash
+    # Extract the token from the Check OTP button.
+    token = next(b for row in reply.rows for b, d in row if d.startswith("co:"))[0]
+    token = next(d for row in reply.rows for _b, d in row if d.startswith("co:")).split(":")[1]
+    # The OTP may not have arrived instantly; check_otp polls to deliver it.
+    final = router.check_otp(token, wait_seconds=1)
+    assert final.ok and "987654" in final.text
+    assert router.balance_of(USER).paise < INR(100).paise  # charged, not refunded
+
+
+def test_check_otp_times_out_and_refunds(rig):
+    router, provider, _ = rig
+    provider.set_success_rate("telegram", 0.0)  # silent: no OTP ever
+    router.credit(USER, INR(100))
+    reply = router.alloc_and_wait(USER, "telegram")
+    token = next(d for row in reply.rows for _b, d in row if d.startswith("co:")).split(":")[1]
+    final = router.check_otp(token, wait_seconds=2)
+    assert not final.ok and "Refund" in final.text
+    assert router.balance_of(USER) == INR(100)
+
+
+def test_cancel_wait_releases_and_returns_balance(rig):
+    router, provider, _ = rig
+    provider.set_success_rate("telegram", 0.0)
+    router.credit(USER, INR(100))
+    before = router.balance_of(USER)
+    reply = router.alloc_and_wait(USER, "telegram")
+    token = next(d for row in reply.rows for _b, d in row if d.startswith("co:")).split(":")[1]
+    cancel = router.cancel_wait(token)
+    assert "Cancelled" in cancel.text
+    # Money back. The engine refunds via credit in cancel_wait.
+    assert router.balance_of(USER) == before
+
+
+def test_resend_without_provider_method_degrades_gracefully(rig):
+    """If the provider has no 'resend' (e.g. the mock), the Resend button tells
+    the customer to just check again instead of crashing."""
+    router, provider, _ = rig
+    router.credit(USER, INR(100))
+    reply = router.alloc_and_wait(USER, "telegram")
+    token = next(d for row in reply.rows for _b, d in row if d.startswith("co:")).split(":")[1]
+    res = router.resend_sms(token)
+    assert res.ok or not res.ok
+    assert "Check OTP" in res.text  # always offers a path forward

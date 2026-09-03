@@ -22,6 +22,7 @@ from .provider.base import (
     AuthError,
     Balance,
     InsufficientBalance,
+    NumberAllocation,
     NumberUnavailable,
     Provider,
     ProviderError,
@@ -70,6 +71,10 @@ class FulfilResult:
         return proceeds - self.refunded - self.order.net_spend
 
     _proceeds: Money = field(default=Money(0), repr=False)
+    #: The live provider allocation, for number-first flows that hand the
+    #: number over and poll for the OTP later. ``repr=False`` so it does not
+    #: print the whole allocation in logs.
+    _alloc: Optional[NumberAllocation] = field(default=None, repr=False)
 
     def summary(self) -> dict[str, object]:
         return {
@@ -395,6 +400,168 @@ class BotEngine:
             order.transition(OrderState.PURCHASING)
 
         return self._fail(result, order, order.notes[-1] if order.notes else "no OTP delivered")
+
+    # -- number-first flow ----------------------------------------------
+    def allocate_number(
+        self,
+        customer_id: str,
+        service: str,
+        *,
+        country: Optional[str] = None,
+        gross_price: Optional[Money] = None,
+        server: Optional[str] = None,
+    ) -> FulfilResult:
+        """Buy ONE number and return immediately with ``order.phone`` set.
+
+        Number-first flow: the customer must be given the number *before* the
+        OTP can arrive -- they take it to the target service and request the
+        OTP, which then lands on the number we hand back. The old flow waited
+        for the OTP before showing the number, so the customer could never
+        trigger it and every order hung until the refund window. This returns
+        as soon as a number is allocated (from operationally-cheap calls only);
+        the caller shows ``result.order.phone`` and then asks for the OTP via
+        :meth:`poll_otp`.
+        """
+        cost = self.catalog.get(service)
+        price, econ = self.quote(service, server=server)
+        gross = gross_price if gross_price is not None else price
+        order = Order(
+            customer_id=customer_id,
+            service=service,
+            gross_price=gross,
+            country=country or self.config.default_country,
+        )
+        ref = order.order_id
+        gateway_fee = self.fees.gross_fee(gross)
+        gst = self.fees.output_gst(gross)
+        proceeds = self.fees.net_proceeds(gross) - self.platform_fee(gross)
+        if self.platform_fee_fn is None:
+            self.ledger.record_sale(gross, gateway_fee, gst, ref=ref, memo=f"{service} order")
+        else:
+            self.ledger.record_sale_split(
+                gross, gateway_fee, gst, self.platform_fee(gross),
+                ref=ref, memo=f"{service} order (white-label)",
+            )
+        order.transition(OrderState.PAID)
+        result = FulfilResult(order=order, success=False, _proceeds=proceeds)
+
+        sticker = self.catalog.sticker_price(cost.slug)
+        try:
+            self.ensure_funds(sticker, ref=ref)
+        except (AuthError, ProviderError) as exc:
+            order.note(f"balance check failed: {exc}")
+            return self._fail(result, order, f"could not verify wallet balance: {exc}")
+
+        order.transition(OrderState.PURCHASING)
+        alloc = self._buy_one(order, result, sticker, cost, server, ref, econ)
+        if alloc is None:
+            return self._fail(result, order, order.notes[-1] or "no number available")
+        order.transition(OrderState.AWAITING_OTP)
+        result.phone = alloc.phone
+        result._alloc = alloc
+        result.message = f"number allocated: {alloc.phone}"
+        return result
+
+    def poll_otp(
+        self,
+        result: FulfilResult,
+        *,
+        timeout_seconds: Optional[float] = None,
+        auto_refund: bool = True,
+    ) -> FulfilResult:
+        """Wait for the OTP on an already-allocated number, then deliver or fail.
+
+        :meth:`allocate_number` returns a result whose ``order`` is in
+        ``AWAITING_OTP`` with the number allocated; this waits on that one
+        number (the customer already has it, so a retry that swaps the number
+        would strand the one they are holding). On success the order is
+        ``DELIVERED`` and ``result.otp`` is set. On timeout the provider refund
+        is recovered and the customer refunded in full.
+        """
+        order = result.order
+        alloc = result._alloc
+        if order.state is not OrderState.AWAITING_OTP or alloc is None:
+            raise EngineError("poll_otp requires a result from allocate_number()")
+        remaining = timeout_seconds if timeout_seconds is not None else self.config.otp_timeout_seconds
+        otp = self.provider.wait_for_otp(
+            alloc,
+            timeout_seconds=remaining,
+            poll_interval=self.config.poll_interval,
+        )
+        if otp.success and otp.code:
+            order.otp = otp.code
+            order.transition(OrderState.DELIVERED)
+            result.success = True
+            result.otp = otp.code
+            result.phone = alloc.phone
+            result.message = (
+                f"delivered after {order.attempts} attempt(s), net spend {order.net_spend}"
+            )
+            return result
+        # No OTP within the window. Recover the provider charge, then refund.
+        try:
+            recovered = self.provider.cancel(alloc.order_id)
+        except ProviderError:
+            recovered = Money(0)
+        if recovered.paise > 0:
+            order.record_recovery(recovered)
+            self.ledger.record_number_refund(
+                recovered, ref=order.order_id, memo=f"provider refund attempt {order.attempts}"
+            )
+        return self._fail(
+            result, order, order.notes[-1] if order.notes else "no OTP arrived",
+            refund_customer=auto_refund,
+        )
+
+    def _buy_one(
+        self, order: Order, result: FulfilResult, sticker: Money,
+        cost: ServiceCost, server: Optional[str], ref: str, econ,
+    ) -> Optional[NumberAllocation]:
+        """Allocate one number and book it. Returns None on a clean failure
+        (already noted on the order). Never retries across operators itself --
+        ``buy_number`` already walks operators for stock."""
+        service = order.service
+        try:
+            alloc = self.provider.buy_number(
+                service, order.country,
+                idempotency_key=f"{ref}-{order.attempts + 1}",
+                server=server if server is not None else getattr(cost, "server", ""),
+            )
+        except InsufficientBalance as exc:
+            order.note(f"wallet short by {exc.shortfall}")
+            return None
+        except NumberUnavailable as exc:
+            order.note(f"no stock: {exc}")
+            return None
+        except PurchaseTimedOut as exc:
+            # Ambiguous: the number may exist and be charged. Do not retry.
+            order.note(f"ambiguous purchase: {exc}")
+            return None
+        except (AuthError, ProviderError) as exc:
+            order.note(f"purchase error: {exc}")
+            return None
+        try:
+            cost_charged = alloc.charged.if_zero(sticker)
+            order.record_attempt(cost_charged, alloc.order_id)
+            order.phone = alloc.phone
+            self.ledger.record_number_purchase(
+                cost_charged, ref=ref, memo=f"{service} attempt {order.attempts}"
+            )
+        except LedgerError as exc:
+            # A number is live on the supplier; if we cannot book it we must
+            # cancel it before returning any customer money.
+            order.note(f"internal booking failure after provider purchase: {exc}")
+            try:
+                strict_cancel = getattr(self.provider, "cancel_strict", None)
+                if callable(strict_cancel):
+                    strict_cancel(alloc.order_id)
+                else:
+                    self.provider.cancel(alloc.order_id)
+            except ProviderError as cancel_exc:
+                order.note(f"rollback could not cancel activation: {cancel_exc}")
+                return None
+            return None
+        return alloc
 
     def _fail(
         self, result: FulfilResult, order: Order, message: str, *,

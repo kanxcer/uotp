@@ -634,3 +634,25 @@ def test_wait_for_otp_survives_a_backend_outage_mid_lease():
     result = p.wait_for_otp(alloc, timeout_seconds=2.0, poll_interval=0.01)
     assert result.code == "482193"
     assert result.success
+
+
+@pytest.mark.parametrize("token, exc", [
+    # Bare (un-prefixed) forms the LIVE uotp.store handler uses on getNumber.
+    ("NO_NUMBERS", NumberUnavailable),
+    ("NO_BALANCE", InsufficientBalance),
+    ("NO_FREE", NumberUnavailable),
+    ("NO_MONEY", InsufficientBalance),
+    # Provider-backend-infrastructure tokens must NOT be treated as success.
+    ("NO_CONNECTION", ServiceUnavailable),
+    ("ERROR_DATABASE", ServiceUnavailable),
+    # Cancelling a fresh activation; must be ProviderError, not mis-parsed.
+    ("EARLY_CANCEL_DENIED", ProviderError),
+])
+def test_live_tokens_map_to_exceptions(token, exc):
+    """Tokens the real uotp.store handler returns (observed live 2026-09-03)
+    must map to the right exception so the bot never parses a failure as a
+    success status."""
+    from uotpbot.provider.base import ServiceUnavailable
+    p, _ = make(token)
+    with pytest.raises(exc):
+        p.get_balance()
