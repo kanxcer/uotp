@@ -392,3 +392,34 @@ def test_history_detail_rich_receipt(tmp_path):
     other = ui.button(OUTSIDER, f"h:{oid}")
     assert other.ok is False
     store.close()
+
+
+def test_typed_my_numbers_matches_the_button_screen(tmp_path):
+    """'my numbers' typed (and /numbers) must open the same screen as 🧾 My
+    numbers, not fall through to search and return the menu."""
+    import time as _time
+    from uotpbot.wallets import SqliteWallets
+    catalog = Catalog(
+        {"telegram": ServiceCost("telegram", "Telegram", "messaging", INR(10),
+                                 Decimal("0.94"))},
+        (WalletPack("Pro", INR(1000), INR(1150)),),
+    )
+    ledger = Ledger(); pricer = Pricer(catalog)
+    provider = MockProvider({s.slug: catalog.sticker_price(s.slug)
+                             for s in catalog.services()}, balance=INR(5000), seed=5)
+    engine = BotEngine(catalog, provider, ledger, pricer,
+                       config=EngineConfig(retry_cap=3, otp_timeout_seconds=1.0,
+                                           poll_interval=0.01))
+    store = SqliteWallets(str(tmp_path / "w.db"))
+    router = CommandRouter(engine, catalog, pricer, ledger,
+                           owner_id=OWNER, allowed_users=(OWNER, USER), wallets=store)
+    ui = MenuUI(router)
+    store.record_active(user_id=USER, slug="telegram", phone="+919000000000",
+                        provider_order_id="p1", token="tok1", gross=INR(15),
+                        valid_until=_time.time() + 600)
+    for phrase in ("my numbers", "My Numbers", "/numbers", "/my numbers"):
+        reply = ui.text(USER, phrase)
+        assert "my numbers" in reply.text.lower() or "LIVE" in reply.text \
+            or "No live numbers" in reply.text, phrase
+        assert reply.text.strip() and "✳️ YCOTP Numbers" != reply.text.strip()
+    store.close()

@@ -185,6 +185,13 @@ class MenuUI:
         if low in ("/admin", "/owner", "/panel"):
             self._wizard.pop(user_id, None)
             return self.admin_panel(user_id)
+        # "My numbers" as a typed command or phrase must go to the SAME screen
+        # as the 🧾 My numbers button, not fall through to search (which returns
+        # the menu and looks like "not working").
+        if low in ("/numbers", "/my", "/my numbers", "/mynumbers", "my numbers",
+                   "mynumbers", "numbers", "/history", "/my-numbers"):
+            self._wizard.pop(user_id, None)
+            return self.history_card(user_id)
         flow = self.router._createbot_flow  # pending-token funnel lives there
         if flow is not None and flow.pending(user_id) and not body.startswith("/"):
             return self.router.handle(user_id, body)
@@ -619,7 +626,10 @@ class MenuUI:
             lines.append("🔴 LIVE numbers (tap a number for its buttons):")
             for a in live:
                 mins = max(1, int(round(a.seconds_left / 60)))
-                name = self.catalog.get(a.slug).name if self.catalog.has(a.slug) else a.slug
+                try:
+                    name = self.catalog.get(a.slug).name if self.catalog.has(a.slug) else a.slug
+                except Exception:  # noqa: BLE001 - never blank the whole screen
+                    name = a.slug
                 if a.has_otp:
                     lines.append(f"\n✅ {name} · {a.gross} · {mins} min left")
                     lines.append(f"    📱 {a.phone} · OTP `{a.otp}`")
@@ -642,7 +652,10 @@ class MenuUI:
             for i, o in enumerate(entries[:10]):
                 if hasattr(o, "success"):  # persisted OrderRow
                     when = self._iso(o.ts)
-                    name = self.catalog.get(o.slug).name if self.catalog.has(o.slug) else o.slug
+                    try:
+                        name = self.catalog.get(o.slug).name if self.catalog.has(o.slug) else o.slug
+                    except Exception:  # noqa: BLE001
+                        name = o.slug
                     badge = "✅ delivered" if o.success else "♻️ refunded"
                     lines.append(f"\n{badge} · {name} · {o.gross} · {when}")
                     rows.append(((f"👁 {name} details", f"h:{o.id}"),))
