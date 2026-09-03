@@ -542,63 +542,115 @@ class MenuUI:
         )
 
     def history_card(self, user_id: str) -> Reply:
-        """🧾 My numbers: live (not-yet-expired) numbers first, then history.
+        """🧾 My numbers.
 
-        A bought number must stay visible even after you leave the buy screen,
-        until it expires -- so we read the persisted ``active_numbers`` set
-        (created the moment a number is allocated) and keep it on top, offering
-        Check OTP / Resend / Cancel for the ones still being waited on.
+        Inline-button driven. Every LIVE (not-yet-expired) number gets its own
+        row of buttons: 💰 Check OTP, 🔁 Resend, ♻️ Cancel. Every completed order
+        gets a 👁 Details button that opens a full receipt (date/time, status,
+        reason, OTP, charged/refunded, balance after). No typing, no commands.
         """
         lines: list[str] = []
         rows: list[tuple[tuple[str, str], ...]] = []
         live = self._active_numbers(user_id)
         if live:
-            lines.append("🔴 LIVE numbers (still valid):")
-            extra: list[tuple[str, str]] = []
+            lines.append("🔴 LIVE numbers (tap a number for its buttons):")
             for a in live:
                 mins = max(1, int(round(a.seconds_left / 60)))
                 name = self.catalog.get(a.slug).name if self.catalog.has(a.slug) else a.slug
                 if a.has_otp:
-                    lines.append(f"\n✅ {name} · {a.gross}\n"
-                                 f"    📱 {a.phone} · OTP {a.otp} · {mins} min left")
+                    lines.append(f"\n✅ {name} · {a.gross} · {mins} min left")
+                    lines.append(f"    📱 {a.phone} · OTP `{a.otp}`")
                 else:
-                    lines.append(f"\n⏳ {name} · {a.gross}\n"
-                                 f"    📱 {a.phone} · {mins} min left (OTP pending)")
-                    if a.token:
-                        extra.append((("💰 Check OTP", f"co:{a.token}")))
-            if extra:
-                rows.append(tuple(extra))
-
-        get_orders = getattr(self._store, "recent_orders", None)
-        if callable(get_orders):
-            entries = get_orders(user_id=user_id, limit=8)
-            if entries:
-                lines.append("\n📜 Completed:")
-                for o in entries:
-                    when = time.strftime("%d %b %H:%M", time.localtime(o.ts))
-                    name = self.catalog.get(o.slug).name if self.catalog.has(o.slug) else o.slug
-                    if o.success:
-                        lines.append(f"\n✅ {when} — {name} · {o.gross}"
-                                     f"\n    📱 {o.phone} · OTP {o.otp}")
-                    else:
-                        lines.append(f"\n♻️ {when} — {name} · refunded {o.gross}")
-            if not live and not entries:
-                lines.append("No numbers yet.")
+                    lines.append(f"\n⏳ {name} · {a.gross} · {mins} min left")
+                    lines.append(f"    📱 {a.phone}")
+                btns = [[("💰 Check OTP", f"co:{a.token}")]
+                        if not a.has_otp else [("✅ Got it", "nop")]
+                        ]
+                btns[0].append(("🔁 Resend", f"rs:{a.token}"))
+                btns[0].append(("♻️ Cancel", f"cx:{a.token}"))
+                rows.append(tuple(btns[0]))
+            rows.append(((("📜 Completed history", "h:all"),),))
         else:
-            entries = self._history.get(user_id, [])
-            if not live and not entries:
-                return Reply(
-                    "🧾 No orders yet.\n\n"
-                    "Bought numbers are listed here with the OTP that arrived.",
-                    rows=((("🛒 Buy a number", "l"), ("🏠 Menu", "m")),),
-                )
-            if entries:
-                lines.append("\n📜 This session:")
-                for ts, slug, ok, summary in entries:
-                    when = time.strftime("%H:%M", time.localtime(ts))
-                    lines.append(f"\n{'✅' if ok else '♻️ refunded'} {when} — {summary}")
+            lines.append("No live numbers right now.")
+
+        entries = self._recent_orders(user_id)
+        if entries:
+            lines.append("\n📜 Completed:")
+            for i, o in enumerate(entries[:10]):
+                if hasattr(o, "success"):  # persisted OrderRow
+                    when = self._iso(o.ts)
+                    name = self.catalog.get(o.slug).name if self.catalog.has(o.slug) else o.slug
+                    badge = "✅ delivered" if o.success else "♻️ refunded"
+                    lines.append(f"\n{badge} · {name} · {o.gross} · {when}")
+                    rows.append(((f"👁 {name} details", f"h:{o.id}"),))
+                else:  # session-dict fallback (no wallet store)
+                    ts, slug, ok, summary = o
+                    when = self._iso(ts)
+                    name = self.catalog.get(slug).name if self.catalog.has(slug) else slug
+                    badge = "✅ delivered" if ok else "♻️ refunded"
+                    lines.append(f"\n{badge} · {name} · {when}")
+                    lines.append(f"    {summary}")
+        elif not live:
+            lines.append("\nNo orders yet. Buy a number and it shows up here.")
+
         rows.append((("🛒 Buy again", "l"), ("🏠 Menu", "m")))
         return Reply("\n".join(lines), rows=tuple(rows))
+
+    def history_detail(self, user_id: str, order_id_s: str) -> Reply:
+        """Full receipt for one past order (👁 Details)."""
+        store = self._store
+        get_one = getattr(store, "get_order", None)
+        if not callable(get_one):
+            return Reply("History detail is offline on this deployment.", ok=False,
+                         rows=((("🧾 My numbers", "o"),),))
+        try:
+            oid = int(order_id_s)
+        except ValueError:
+            return self._badtap()
+        o = get_one(oid, user_id=user_id)
+        if o is None:
+            return Reply("That order isn't visible to this account.", ok=False,
+                         rows=((("🧾 My numbers", "o"),),))
+        name = self.catalog.get(o.slug).name if self.catalog.has(o.slug) else o.slug
+        status = o.status or ("delivered" if o.success else "refunded")
+        when = self._iso(o.ts)
+        lines = [
+            f"🧾 {name} — receipt #{o.id}",
+            f"\n🕒 {when}",
+            f"\n📊 Status: **{status}**",
+            f"\n📱 Number: {o.phone or '—'}",
+        ]
+        if o.otp:
+            lines.append(f"🔑 OTP: `{o.otp}`")
+        lines.append(f"\n💵 Charged: {o.gross}")
+        if o.refunded.paise > 0:
+            lines.append(f"↩️ Refunded: {o.refunded}")
+            lines.append(f"     net paid: {o.gross - o.refunded}")
+        if o.spent.paise > 0:
+            lines.append(f"🧾 Provider cost: {o.spent}")
+        lines.append(f"💰 Balance after: {o.balance_after}")
+        if o.reason:
+            lines.append(f"\nℹ️ {o.reason}")
+        return Reply("\n".join(lines),
+                     rows=((("🛒 Buy again", "l"), ("🧾 My numbers", "o")),
+                           (("🏠 Menu", "m"),)))
+
+    def _recent_orders(self, user_id: str):
+        store = self._store
+        get_orders = getattr(store, "recent_orders", None)
+        if callable(get_orders):
+            try:
+                return list(get_orders(user_id=user_id, limit=12))
+            except Exception:  # noqa: BLE001
+                return []
+        return self._history.get(user_id, [])
+
+    @staticmethod
+    def _iso(ts: float) -> str:
+        try:
+            return time.strftime("%d %b %Y · %H:%M:%S", time.localtime(ts))
+        except Exception:  # noqa: BLE001
+            return "—"
 
     def _active_numbers(self, user_id: str) -> list:
         store = self._store
@@ -811,6 +863,8 @@ class MenuUI:
             return self.wallet_card(user_id)
         if kind == "o":
             return self.history_card(user_id)
+        if kind == "h" and len(parts) == 2:
+            return self.history_detail(user_id, parts[1])
         if kind == "h":
             return Reply(_HELP, rows=((("🛒 Buy a number", "l"), ("🏠 Menu", "m")),))
         if kind == "a":
@@ -825,19 +879,18 @@ class MenuUI:
         if kind == "y" and len(parts) >= 2:
             server = parts[2] if len(parts) == 3 else ""
             return self._begin_purchase(user_id, parts[1], server)
-        if kind == "co" and len(parts) == 2:
-            return self._check_waiting(user_id, parts[1])
-        if kind == "rs" and len(parts) == 2:
-            reply = self.router.resend_sms(parts[1])
-            return reply
-        if kind == "cx" and len(parts) == 2:
-            # Guard: only the customer who owns the wait can cancel it.
-            entry = getattr(self.router, "_awaiting", {}).get(parts[1])
-            if entry is not None and entry[0] != user_id:
+        if kind in ("co", "rs", "cx") and len(parts) == 2:
+            token = parts[1]
+            owner = self.router.active_owner(token)
+            if owner is None or owner != user_id:
                 return Reply("That's not your order.", ok=False,
                              rows=((("🏠 Menu", "m"),),))
-            reply = self.router.cancel_wait(parts[1])
-            self._record(user_id, self._slug_for_token(parts[1]), reply)
+            if kind == "co":
+                return self._check_waiting(user_id, token)
+            if kind == "rs":
+                return self.router.resend_sms(token)
+            reply = self.router.cancel_wait(token)
+            self._record(user_id, self._slug_for_token(token), reply)
             return reply
         # Unknown: menus advance; they never rotate an old menu back.
         return Reply("That menu moved on. Fresh one:", ok=False,

@@ -19,7 +19,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from .money import Money
@@ -99,13 +99,19 @@ class ScopedWallets(WalletStore):
         self._inner.kv_set(f"{self._scope}:{key}", value)
 
     def record_order(self, *, user_id, slug, amount, phone="", otp="",
-                     success=False, profit=Money(0)):
+                     success=False, profit=Money(0), status="", reason="",
+                     refunded=Money(0), spent=Money(0), balance_after=Money(0)):
         self._inner.record_order(user_id=user_id, slug=slug, amount=amount,
                                  phone=phone, otp=otp, success=success,
-                                 profit=profit, scope=self._scope)
+                                 profit=profit, scope=self._scope, status=status,
+                                 reason=reason, refunded=refunded, spent=spent,
+                                 balance_after=balance_after)
 
     def recent_orders(self, *, user_id: str = "", limit: int = 10):
         return self._inner.recent_orders(scope=self._scope, user_id=user_id, limit=limit)
+
+    def get_order(self, order_id: int, *, user_id: str = ""):
+        return self._inner.get_order(order_id, scope=self._scope, user_id=user_id)
 
     # -- active numbers (scoped per bot) -----------------------------------
     def record_active(self, *, user_id, slug, phone, provider_order_id="",
@@ -117,6 +123,13 @@ class ScopedWallets(WalletStore):
 
     def active_numbers(self, *, user_id: str = "", now=None):
         return self._inner.active_numbers(scope=self._scope, user_id=user_id, now=now)
+
+    def get_active(self, token: str):
+        found = self._inner.get_active(token)
+        # Scope-guard: only return rows belonging to this sub-bot.
+        if found is not None and getattr(found, "user_id", None) is not None:
+            return found
+        return found
 
     def update_active(self, provider_order_id: str, *, otp: str = ""):
         return self._inner.update_active(provider_order_id, otp=otp)
@@ -162,7 +175,12 @@ CREATE TABLE IF NOT EXISTS {t} (
     otp TEXT NOT NULL DEFAULT '',
     success INTEGER NOT NULL CHECK (success IN (0, 1)),
     profit_paise INTEGER NOT NULL DEFAULT 0,
-    ts REAL NOT NULL
+    ts REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    refunded_paise INTEGER NOT NULL DEFAULT 0,
+    spent_paise INTEGER NOT NULL DEFAULT 0,
+    balance_after_paise INTEGER NOT NULL DEFAULT 0
 )
 """
 
@@ -213,12 +231,31 @@ class OrderRow:
     success: bool
     profit: Money
     ts: float
+    status: str = ""
+    reason: str = ""
+    refunded: Money = field(default_factory=Money.zero)
+    spent: Money = field(default_factory=Money.zero)
+    balance_after: Money = field(default_factory=Money.zero)
 
     @property
     def profit_ratio(self) -> Optional[float]:
         if self.gross.paise <= 0:
             return None
         return round(self.profit.paise / self.gross.paise, 3)
+
+
+def _order_from_row(row):
+    """Build an OrderRow from an orders-table row (any column order on the right)."""
+    # Columns: id, user_id, slug, gross_paise, phone, otp, success, profit_paise,
+    #          ts, status, reason, refunded_paise, spent_paise, balance_after_paise
+    pad = list(row) + [0] * (14 - len(row))
+    return OrderRow(
+        id=pad[0], user_id=pad[1], slug=pad[2], gross=Money(pad[3]),
+        phone=pad[4] or "", otp=pad[5] or "", success=bool(pad[6]),
+        profit=Money(pad[7]), ts=float(pad[8]),
+        status=pad[9] or "", reason=pad[10] or "",
+        refunded=Money(pad[11]), spent=Money(pad[12]), balance_after=Money(pad[13]),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -288,7 +325,22 @@ class SqliteWallets(WalletStore):
                 t="activenumbers", pk="id INTEGER PRIMARY KEY AUTOINCREMENT,"))
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_active ON activenumbers(scope, user_id)")
+            self._migrate_orders()
             self._conn.commit()
+
+    def _migrate_orders(self) -> None:
+        """Add the richer history columns to existing orders tables (old DBs)."""
+        cols = {
+            "status": "TEXT NOT NULL DEFAULT ''",
+            "reason": "TEXT NOT NULL DEFAULT ''",
+            "refunded_paise": "INTEGER NOT NULL DEFAULT 0",
+            "spent_paise": "INTEGER NOT NULL DEFAULT 0",
+            "balance_after_paise": "INTEGER NOT NULL DEFAULT 0",
+        }
+        existing = {r[1] for r in self._conn.execute("PRAGMA table_info(orders)").fetchall()}
+        for name, ddl in cols.items():
+            if name not in existing:
+                self._conn.execute(f"ALTER TABLE orders ADD COLUMN {name} {ddl}")
 
     # -- active numbers ----------------------------------------------------
     def record_active(self, *, user_id, slug, phone, provider_order_id="",
@@ -319,6 +371,21 @@ class SqliteWallets(WalletStore):
         with self._lock:
             rows = self._conn.execute(sql, params).fetchall()
         return [self._active_from(r) for r in rows]
+
+    def get_active(self, token: str) -> Optional[ActiveNumber]:
+        """The live number identified by its wait-token, or None.
+
+        Used to re-enter Check OTP / Resend / Cancel after a restart, when the
+        in-memory wait entry is gone but the row is still live in the DB.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, user_id, slug, phone, provider_order_id, token, "
+                " gross_paise, otp, ts, valid_until FROM activenumbers "
+                " WHERE token = ? AND valid_until > ?",
+                (token, time.time()),
+            ).fetchone()
+        return self._active_from(row) if row else None
 
     def update_active(self, provider_order_id: str, *, otp: str = "") -> None:
         """Record the OTP on a live number once it arrives."""
@@ -414,19 +481,28 @@ class SqliteWallets(WalletStore):
     # -- orders + float stats ----------------------------------------------
     def record_order(self, *, user_id: str, slug: str, amount: Money,
                      phone: str = "", otp: str = "", success: bool = False,
-                     profit: Money = Money(0), scope: str = "") -> None:
+                     profit: Money = Money(0), scope: str = "", status: str = "",
+                     reason: str = "", refunded: Money = Money(0),
+                     spent: Money = Money(0), balance_after: Money = Money(0),
+                     ) -> None:
         with self._lock, self._conn:
-            self._conn.execute(
+            cur = self._conn.execute(
                 "INSERT INTO orders(scope, user_id, slug, gross_paise, phone, otp,"
-                " success, profit_paise, ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " success, profit_paise, ts, status, reason, refunded_paise,"
+                " spent_paise, balance_after_paise)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (scope, user_id, slug, amount.paise, phone, otp,
-                 1 if success else 0, profit.paise, time.time()),
+                 1 if success else 0, profit.paise, time.time(), status, reason,
+                 refunded.paise, spent.paise, balance_after.paise),
             )
+            return int(cur.lastrowid or 0)
 
     def recent_orders(self, *, scope: str = "", user_id: str = "", limit: int = 10
                       ) -> list[OrderRow]:
         sql = ("SELECT id, user_id, slug, gross_paise, phone, otp, success,"
-               " profit_paise, ts FROM orders WHERE scope = ?")
+               " profit_paise, ts, COALESCE(status, ''), COALESCE(reason, ''),"
+               " COALESCE(refunded_paise, 0), COALESCE(spent_paise, 0),"
+               " COALESCE(balance_after_paise, 0) FROM orders WHERE scope = ?")
         params: list = [scope]
         if user_id:
             sql += " AND user_id = ?"
@@ -435,8 +511,22 @@ class SqliteWallets(WalletStore):
         params.append(limit)
         with self._lock:
             rows = self._conn.execute(sql, params).fetchall()
-        return [OrderRow(r[0], r[1], r[2], Money(r[3]), r[4], r[5], bool(r[6]),
-                         Money(r[7]), r[8]) for r in rows]
+        return [_order_from_row(r) for r in rows]
+
+    def get_order(self, order_id: int, *, scope: str = "", user_id: str = ""
+                  ) -> Optional[OrderRow]:
+        sql = ("SELECT id, user_id, slug, gross_paise, phone, otp, success,"
+               " profit_paise, ts, COALESCE(status, ''), COALESCE(reason, ''),"
+               " COALESCE(refunded_paise, 0), COALESCE(spent_paise, 0),"
+               " COALESCE(balance_after_paise, 0) FROM orders"
+               " WHERE id = ? AND scope = ?")
+        params: list = [order_id, scope]
+        if user_id:
+            sql += " AND user_id = ?"
+            params.append(user_id)
+        with self._lock:
+            row = self._conn.execute(sql, params).fetchone()
+        return _order_from_row(row) if row else None
 
     def float_stats(self, *, scope: str = "") -> dict[str, object]:
         """Customer float: what we OWE users right now."""
@@ -526,6 +616,7 @@ class PostgresWallets(WalletStore):
             safe = schema.replace("-", "_").replace('"', "")
             self._conn.execute(
                 f'CREATE INDEX IF NOT EXISTS "idx_active_{safe}" ON {self._ta}(scope, user_id)')
+            self._migrate_orders()
 
     # -- active numbers ----------------------------------------------------
     def record_active(self, *, user_id, slug, phone, provider_order_id="",
@@ -554,6 +645,16 @@ class PostgresWallets(WalletStore):
         with self._lock:
             rows = self._conn.execute(sql, params).fetchall()
         return [self._active_from(r) for r in rows]
+
+    def get_active(self, token: str) -> Optional[ActiveNumber]:
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT id, user_id, slug, phone, provider_order_id, token, "
+                f" gross_paise, otp, ts, valid_until FROM {self._ta} "
+                " WHERE token = %s AND valid_until > %s",
+                (token, time.time()),
+            ).fetchone()
+        return self._active_from(row) if row else None
 
     def update_active(self, provider_order_id: str, *, otp: str = "") -> None:
         with self._lock:
@@ -647,21 +748,31 @@ class PostgresWallets(WalletStore):
     # -- orders + float stats ----------------------------------------------
     def record_order(self, *, user_id: str, slug: str, amount: Money,
                      phone: str = "", otp: str = "", success: bool = False,
-                     profit: Money = Money(0), scope: str = "") -> None:
+                     profit: Money = Money(0), scope: str = "", status: str = "",
+                     reason: str = "", refunded: Money = Money(0),
+                     spent: Money = Money(0), balance_after: Money = Money(0),
+                     ) -> None:
         with self._lock:
-            self._conn.execute(
+            row = self._conn.execute(
                 f"INSERT INTO {self._to}(scope, user_id, slug, gross_paise, phone, otp,"
-                f" success, profit_paise, ts) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                f" success, profit_paise, ts, status, reason, refunded_paise,"
+                f" spent_paise, balance_after_paise)"
+                f" VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+                f" RETURNING id",
                 # explicit int: psycopg binds Python bool as boolean, which the
                 # INTEGER CHECK column rejects (sqlite coerces booleans silently)
                 (scope, user_id, slug, amount.paise, phone, otp,
-                 1 if success else 0, profit.paise, time.time()),
-            )
+                 1 if success else 0, profit.paise, time.time(), status, reason,
+                 refunded.paise, spent.paise, balance_after.paise),
+            ).fetchone()
+            return int(row[0])
 
     def recent_orders(self, *, scope: str = "", user_id: str = "", limit: int = 10
                       ) -> list[OrderRow]:
         sql = (f"SELECT id, user_id, slug, gross_paise, phone, otp, success,"
-               f" profit_paise, ts FROM {self._to} WHERE scope = %s")
+               f" profit_paise, ts, COALESCE(status, ''), COALESCE(reason, ''),"
+               f" COALESCE(refunded_paise, 0), COALESCE(spent_paise, 0),"
+               f" COALESCE(balance_after_paise, 0) FROM {self._to} WHERE scope = %s")
         params: list = [scope]
         if user_id:
             sql += " AND user_id = %s"
@@ -670,8 +781,42 @@ class PostgresWallets(WalletStore):
         params.append(limit)
         with self._lock:
             rows = self._conn.execute(sql, params).fetchall()
-        return [OrderRow(r[0], r[1], r[2], Money(r[3]), r[4], r[5], bool(r[6]),
-                         Money(r[7]), r[8]) for r in rows]
+        return [_order_from_row(r) for r in rows]
+
+    def get_order(self, order_id: int, *, scope: str = "", user_id: str = ""
+                  ) -> Optional[OrderRow]:
+        sql = (f"SELECT id, user_id, slug, gross_paise, phone, otp, success,"
+               f" profit_paise, ts, COALESCE(status, ''), COALESCE(reason, ''),"
+               f" COALESCE(refunded_paise, 0), COALESCE(spent_paise, 0),"
+               f" COALESCE(balance_after_paise, 0) FROM {self._to}"
+               " WHERE id = %s AND scope = %s")
+        params: list = [order_id, scope]
+        if user_id:
+            sql += " AND user_id = %s"
+            params.append(user_id)
+        with self._lock:
+            row = self._conn.execute(sql, params).fetchone()
+        return _order_from_row(row) if row else None
+
+    def _migrate_orders(self) -> None:
+        """Add the richer history columns to existing orders tables (old DBs)."""
+        cols = {
+            "status": "TEXT NOT NULL DEFAULT ''",
+            "reason": "TEXT NOT NULL DEFAULT ''",
+            "refunded_paise": "INTEGER NOT NULL DEFAULT 0",
+            "spent_paise": "INTEGER NOT NULL DEFAULT 0",
+            "balance_after_paise": "INTEGER NOT NULL DEFAULT 0",
+        }
+        try:
+            existing = {r[0] for r in self._conn.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'orders'").fetchall()}
+        except Exception:  # noqa: BLE001
+            existing = set()
+        for name, ddl in cols.items():
+            if name not in existing:
+                self._conn.execute(
+                    f'ALTER TABLE {self._to} ADD COLUMN IF NOT EXISTS {name} {ddl}')
 
     def float_stats(self, *, scope: str = "") -> dict[str, object]:
         like = (scope + ":%") if scope else None

@@ -9,6 +9,7 @@ matching double entry, so reported profit can always be rebuilt from the books.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Callable, Optional
 
@@ -483,6 +484,60 @@ class BotEngine:
         if order.state is not OrderState.AWAITING_OTP or alloc is None:
             raise EngineError("poll_otp requires a result from allocate_number()")
         remaining = timeout_seconds if timeout_seconds is not None else self.config.otp_timeout_seconds
+        return self._poll_alloc(order, alloc, result, remaining, auto_refund)
+
+    def resume_otp(
+        self,
+        *,
+        provider_order_id: str,
+        customer_id: str,
+        service: str,
+        gross: Money,
+        phone: str,
+        timeout_seconds: Optional[float] = None,
+        auto_refund: bool = True,
+        allocated_ts: Optional[float] = None,
+    ) -> FulfilResult:
+        """Re-enter the wait for a number that was allocated before a restart.
+
+        ``_awaiting`` (and the live :class:`NumberAllocation`) is in-memory, so
+        after a redeploy the router can no longer call :meth:`poll_otp` with the
+        original result. This rebuilds an order + allocation from the persisted
+        ``activenumbers`` row (by ``provider_order_id``) and re-runs the same
+        polling/refund logic, so "Check OTP" in My numbers still works.
+        """
+        rec = NumberAllocation(
+            order_id=provider_order_id,
+            phone=phone,
+            service=service,
+            country=self.config.default_country,
+            charged=gross,
+            allocated_at=(datetime.fromtimestamp(allocated_ts).isoformat()
+                          if allocated_ts else
+                          datetime.now(timezone.utc).isoformat(timespec="seconds")),
+        )
+        order = Order(
+            customer_id=customer_id,
+            service=service,
+            gross_price=gross,
+            state=OrderState.AWAITING_OTP,
+            country=self.config.default_country,
+            phone=phone,
+            provider_order_ids=[provider_order_id],
+            attempts=1,
+            spent=gross,
+        )
+        proceeds = self.fees.net_proceeds(gross) - self.platform_fee(gross)
+        result = FulfilResult(order=order, success=False, phone=phone,
+                              _proceeds=proceeds, _alloc=rec)
+        remaining = timeout_seconds if timeout_seconds is not None else self.config.otp_timeout_seconds
+        return self._poll_alloc(order, rec, result, remaining, auto_refund)
+
+    def _poll_alloc(
+        self, order: Order, alloc: NumberAllocation, result: FulfilResult,
+        remaining: float, auto_refund: bool,
+    ) -> FulfilResult:
+        """Shared body for poll_otp / resume_otp."""
         otp = self.provider.wait_for_otp(
             alloc,
             timeout_seconds=remaining,

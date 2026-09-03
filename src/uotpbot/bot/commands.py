@@ -405,17 +405,12 @@ class CommandRouter:
 
     def resend_sms(self, token: str) -> Reply:
         """🔁 Resend: ask the provider to re-send the code (setStatus=3)."""
-        entry = self._awaiting.get(token)
-        if entry is None:
+        provider_order_id = self._provider_order_id(token)
+        if not provider_order_id:
             return Reply("That order is no longer waiting. See 🧾 My numbers.",
                          ok=False, rows=((("🧾 My numbers", "o"),),))
-        _uid, _slug, result = entry
-        alloc = getattr(result, "_alloc", None)
-        if alloc is None:
-            return Reply("No live number to resend on.", ok=False,
-                         rows=((("🏠 Menu", "m"),),))
         ok = getattr(self.engine.provider, "resend", None)
-        if callable(ok) and ok(alloc.order_id):
+        if callable(ok) and ok(provider_order_id):
             return Reply(
                 "✅ Resent. Give it a moment, then tap 💰 Check OTP.",
                 rows=((("💰 Check OTP", f"co:{token}"),),
@@ -428,6 +423,18 @@ class CommandRouter:
             rows=((("💰 Check OTP", f"co:{token}"),), (("🏠 Menu", "m"),)),
         )
 
+    def _provider_order_id(self, token: str) -> str:
+        """The provider order id for a wait-token, from memory or the DB.
+
+        Handles the in-memory fast path and the after-restart case in one place.
+        """
+        entry = self._awaiting.get(token)
+        if entry is not None:
+            alloc = getattr(entry[2], "_alloc", None)
+            return getattr(alloc, "order_id", "") if alloc else ""
+        active = self._active_by_token(token)
+        return getattr(active, "provider_order_id", "") if active else ""
+
     def cancel_wait(self, token: str) -> Reply:
         """♻️ Cancel: release the number so the activation stops costing.
 
@@ -438,23 +445,31 @@ class CommandRouter:
         a number that is still live and spendable on our wallet.
         """
         entry = self._awaiting.get(token)
-        if entry is None:
-            return Reply("That order has finished. See 🧾 My numbers.",
-                         ok=False, rows=((("🧾 My numbers", "o"),),))
-        user_id, slug, result = entry
-        alloc = getattr(result, "_alloc", None)
+        user_id = slug = None
+        result = None
+        provider_id = ""
+        if entry is not None:
+            user_id, slug, result = entry
+            alloc = getattr(result, "_alloc", None)
+            provider_id = getattr(alloc, "order_id", "") if alloc else ""
+        else:
+            active = self._active_by_token(token)
+            if active is None:
+                return Reply("That order has finished. See 🧾 My numbers.",
+                             ok=False, rows=((("🧾 My numbers", "o"),),))
+            user_id, slug, provider_id = active.user_id, active.slug, active.provider_order_id
         released = True
         refused = ""
-        if alloc is not None:
+        if provider_id:
             # Use cancel_strict so a provider refusal (EARLY_CANCEL_DENIED)
             # propagates instead of being swallowed by the best-effort
             # ``cancel`` (which returns Money(0) on both success and failure).
             strict = getattr(self.engine.provider, "cancel_strict", None)
             try:
                 if callable(strict):
-                    strict(alloc.order_id)
+                    strict(provider_id)
                 else:
-                    self.engine.provider.cancel(alloc.order_id)
+                    self.engine.provider.cancel(provider_id)
             except Exception as exc:  # noqa: BLE001 - surface provider refusal
                 released = False
                 refused = str(exc)
@@ -471,16 +486,16 @@ class CommandRouter:
         self._awaiting.pop(token, None)
         # Release confirmed -> remove from the active set too.
         finish = getattr(self.wallets, "finish_active", None)
-        alloc = getattr(result, "_alloc", None)
-        provider_id = getattr(alloc, "order_id", "") if alloc else ""
         if callable(finish) and provider_id:
             try:
                 finish(provider_id)
             except Exception:  # noqa: BLE001
                 pass
-        self.credit(user_id, result.order.gross_price)
+        gross = result.order.gross_price if result is not None and result.order else Money(0)
+        self.credit(user_id, gross)
+        name = self.catalog.get(slug).name if self.catalog.has(slug) else slug
         return Reply(
-            f"♻️ Cancelled — {slug} number released and {result.order.gross_price} "
+            f"♻️ Cancelled — {name} number released and {gross} "
             f"returned to your balance ({self.balance_of(user_id)}).",
             rows=((("🧾 My numbers", "o"), ("🏠 Menu", "m")),),
         )
@@ -494,15 +509,30 @@ class CommandRouter:
         off the event loop (deferred), so a longer wait is fine.
         """
         entry = self._awaiting.get(token)
-        if entry is None:
+        if entry is not None:
+            user_id, slug, result = entry
+            wait = wait_seconds if wait_seconds > 0 else self.engine.config.otp_timeout_seconds
+            result = self.engine.poll_otp(result, timeout_seconds=wait)
+            return self._after_check(token, user_id, slug, result)
+        # Restart-safe: re-enter the wait straight from the DB row.
+        active = self._active_by_token(token)
+        if active is None:
             return Reply(
                 "That order has finished or is no longer waiting. "
                 "See 🧾 My numbers.",
                 ok=False, rows=((("🧾 My numbers", "o"), ("🏠 Menu", "m")),),
             )
-        user_id, slug, result = entry
         wait = wait_seconds if wait_seconds > 0 else self.engine.config.otp_timeout_seconds
-        result = self.engine.poll_otp(result, timeout_seconds=wait)
+        result = self.engine.resume_otp(
+            provider_order_id=active.provider_order_id,
+            customer_id=active.user_id, service=active.slug,
+            gross=active.gross, phone=active.phone, allocated_ts=active.ts,
+            timeout_seconds=wait,
+        )
+        return self._after_check(token, active.user_id, active.slug, result)
+
+    def _after_check(self, token: str, user_id: str, slug: str, result) -> Reply:
+        """Shared tail of check_otp: deliver the OTP, refund on timeout, or wait."""
         if result.success and result.otp:
             self._awaiting.pop(token, None)
             self._record_order(user_id, slug, result.order.gross_price, result)
@@ -529,6 +559,33 @@ class CommandRouter:
                 rows=((("🧾 My numbers", "o"), ("🏠 Menu", "m")),),
             )
         return self.await_reply(token, result)
+
+    def _active_by_token(self, token: str) -> Optional[object]:
+        """Look up a live number by its wait-token.
+
+        Works whether or not the in-memory ``_awaiting`` entry is still there
+        (so Check OTP / Resend / Cancel survive a redeploy).
+        """
+        store = self.wallets
+        fn = getattr(store, "get_active", None)
+        if not callable(fn):
+            return None
+        try:
+            return fn(token)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def active_owner(self, token: str) -> Optional[str]:
+        """The user_id that owns a wait-token, from memory or the DB.
+
+        Lets the UI authorise Check OTP / Resend / Cancel against the right
+        customer even after a redeploy.
+        """
+        entry = self._awaiting.get(token)
+        if entry is not None:
+            return entry[0]
+        active = self._active_by_token(token)
+        return getattr(active, "user_id", None) if active else None
 
     def _record_active(self, user_id: str, slug: str, price: Money, result,
                        token: str) -> None:
@@ -566,9 +623,19 @@ class CommandRouter:
         rec = getattr(store, "record_order", None)
         if not callable(rec):
             return
+        # Rich history fields: status/reason, what was refunded, what the
+        # provider charged, and the customer's balance right after.
+        status = "delivered" if result.success else (
+            "refunded" if result.refunded.paise > 0 else "failed"
+        )
+        reason = result.message or ""
+        alloc = getattr(result, "_alloc", None)
+        spent = alloc.charged if alloc is not None else Money(0)
         try:
             rec(user_id=user_id, slug=slug, amount=price, phone=result.phone or "",
-                otp=result.otp or "", success=result.success, profit=result.profit)
+                otp=result.otp or "", success=result.success, profit=result.profit,
+                status=status, reason=reason, refunded=result.refunded,
+                spent=spent, balance_after=self.balance_of(user_id))
         except Exception:  # never let the receipt printer block a delivery
             pass
         # The order is now terminal (delivered or refunded): remove it from the

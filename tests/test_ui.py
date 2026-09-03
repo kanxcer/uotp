@@ -199,7 +199,6 @@ def test_history_records_purchases_this_session(rig):
     ui.button(USER, "y:telegram").deferred(USER)
     history = ui.button(USER, "o")
     assert history.ok
-    assert "session" in history.text.lower()
     assert "telegram" in history.text.lower() or "OTP" in history.text
 
 
@@ -313,6 +312,83 @@ def test_my_numbers_shows_active_number_and_check_otp(tmp_path):
     reply = ui.button(USER, "o")  # 🧾 My numbers
     assert "LIVE" in reply.text
     assert "+919000000000" in reply.text
-    labels = [label for row in reply.rows for label, _ in row]
+    labels = []
+    for row in reply.rows:
+        for b in row:
+            if isinstance(b, tuple) and len(b) == 2:
+                labels.append(b[0])
     assert any("Check OTP" in l for l in labels)
+    assert any("Resend" in l for l in labels)
+    assert any("Cancel" in l for l in labels)
+    store.close()
+
+
+def test_check_otp_works_after_restart_via_db(tmp_path):
+    """The 💰 Check OTP (and the co:/rs:/cx: buttons) must survive a redeploy:
+    the router re-enters the wait straight from the activenumbers row, not the
+    now-empty in-memory _awaiting map."""
+    import time as _time
+    from uotpbot.wallets import SqliteWallets
+    catalog = Catalog(
+        {"telegram": ServiceCost("telegram", "Telegram", "messaging", INR(10),
+                                 Decimal("0.94"))},
+        (WalletPack("Pro", INR(1000), INR(1150)),),
+    )
+    ledger = Ledger()
+    pricer = Pricer(catalog)
+    provider = MockProvider({s.slug: catalog.sticker_price(s.slug)
+                             for s in catalog.services()}, balance=INR(5000), seed=5)
+    engine = BotEngine(catalog, provider, ledger, pricer,
+                       config=EngineConfig(retry_cap=3, otp_timeout_seconds=1.0,
+                                           poll_interval=0.01))
+    store = SqliteWallets(str(tmp_path / "w.db"))
+    router = CommandRouter(engine, catalog, pricer, ledger,
+                           owner_id=OWNER, allowed_users=(OWNER, USER), wallets=store)
+    ui = MenuUI(router)
+    # Simulate a pre-restart buy: an active row exists and the in-memory _awaiting is empty.
+    store.record_active(user_id=USER, slug="telegram", phone="+919000000000",
+                        provider_order_id="alloc1", token="tok9", gross=INR(15),
+                        valid_until=_time.time() + 600)
+    # The mock has no SMS for alloc1, so check_otp refunds -> record_order writes history.
+    reply = ui.button(USER, "co:tok9")
+    reply.deferred(USER)  # run the off-event-loop wait
+    # A terminal outcome: OTP delivered OR refund recorded in orders.
+    rows = store.recent_orders(scope="", user_id=USER, limit=5)
+    assert len(rows) >= 1
+    assert rows[0].status in ("delivered", "refunded")
+    store.close()
+
+
+def test_history_detail_rich_receipt(tmp_path):
+    """👁 Details shows a full receipt: exact date/time, status, reason, charged,
+    refunded, provider cost and balance-after -- for that customer only."""
+    from uotpbot.wallets import SqliteWallets
+    catalog = Catalog(
+        {"telegram": ServiceCost("telegram", "Telegram", "messaging", INR(10),
+                                 Decimal("0.94"))},
+        (WalletPack("Pro", INR(1000), INR(1150)),),
+    )
+    ledger = Ledger()
+    pricer = Pricer(catalog)
+    provider = MockProvider({s.slug: catalog.sticker_price(s.slug)
+                             for s in catalog.services()}, balance=INR(5000), seed=5)
+    engine = BotEngine(catalog, provider, ledger, pricer,
+                       config=EngineConfig(otp_timeout_seconds=1.0))
+    store = SqliteWallets(str(tmp_path / "w.db"))
+    router = CommandRouter(engine, catalog, pricer, ledger,
+                           owner_id=OWNER, allowed_users=(OWNER, USER), wallets=store)
+    ui = MenuUI(router)
+    oid = store.record_order(user_id=USER, slug="telegram", amount=INR(18),
+                             phone="+911111", otp="654321", success=True,
+                             profit=INR(5), status="delivered",
+                             reason="delivered after 2 attempts", spent=INR(10),
+                             balance_after=INR(82), scope="")
+    reply = ui.button(USER, f"h:{oid}")
+    assert reply.ok
+    assert "delivered" in reply.text
+    assert "18" in reply.text and "10" in reply.text and "82" in reply.text
+    assert "654321" in reply.text
+    # Another user cannot view it.
+    other = ui.button(OUTSIDER, f"h:{oid}")
+    assert other.ok is False
     store.close()

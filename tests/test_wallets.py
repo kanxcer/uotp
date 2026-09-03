@@ -130,3 +130,27 @@ def test_scoped_active_numbers_are_isolated(tmp_path):
     assert len(store.active_numbers(scope="botA", user_id=USER)) == 1
     assert len(store.active_numbers(scope="botB", user_id=USER)) == 0
     store.close()
+
+
+def test_orders_rich_history_fields_and_get_order(tmp_path):
+    store = SqliteWallets(str(tmp_path / "w.db"))
+    now = time.time()
+    store.record_order(user_id=USER, slug="telegram", amount=INR(18), phone="+911111",
+                       otp="123456", success=True, profit=INR(5), status="delivered",
+                       reason="delivered after 2 attempts", refunded=INR(0),
+                       spent=INR(10), balance_after=INR(82))
+    store.record_order(user_id=USER, slug="binance", amount=INR(22), success=False,
+                       status="refunded", reason="no OTP arrived", refunded=INR(22),
+                       spent=INR(10), balance_after=INR(60))
+    rows = store.recent_orders(scope="", user_id=USER, limit=10)
+    assert len(rows) == 2
+    top = rows[0]
+    assert top.status == "refunded"
+    assert top.refunded.paise == 2200
+    assert top.balance_after.paise == 6000
+    # get_order retrieves the exact one and enforces ownership.
+    delivered = store.get_order(rows[1].id, scope="", user_id=USER)
+    assert delivered is not None and delivered.status == "delivered"
+    assert delivered.spent.paise == 1000
+    assert store.get_order(rows[1].id, scope="", user_id="someone-else") is None
+    store.close()
