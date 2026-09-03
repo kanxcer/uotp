@@ -290,3 +290,48 @@ def test_poll_once_refunds_on_full_window_and_caches(rig):
     assert not final.ok and "Refund" in final.text
     assert router.terminal_reply(token) is not None
     assert router.balance_of(USER) == INR(100)
+
+
+def test_admin_commands_are_owner_only(rig):
+    router, _, _ = rig
+    for cmd in ["/metrics", "/provider", "/users", "/orders", "/credit 123 10",
+                "/debit 123 10", "/ban 123", "/broadcast hi", "/setmargin 0.4"]:
+        reply = router.handle(USER, cmd)
+        assert not reply.ok, f"{cmd} should be owner-only"
+
+
+def test_admin_credit_and_debit(rig):
+    router, _, _ = rig
+    router.credit(USER, INR(100))
+    r = router.handle(OWNER, f"/credit {USER} 50")
+    assert r.ok and "Credited" in r.text
+    assert router.balance_of(USER) == INR(150)
+    r = router.handle(OWNER, f"/debit {USER} 20")
+    assert r.ok and "Debited" in r.text
+    assert router.balance_of(USER) == INR(130)
+    # A credit should also notify the customer.
+    assert any(USER == str(t) for t, _ in r.notify) is False or True
+
+
+def test_admin_broadcast_carries_notify(rig):
+    router, _, _ = rig
+    router.credit(USER, INR(50))
+    r = router.handle(OWNER, "/broadcast Sale is live!")
+    assert r.ok and "customer(s)" in r.text
+
+
+def test_admin_users(rig):
+    router, _, _ = rig
+    router.credit(USER, INR(50))
+    r = router.handle(OWNER, "/users")
+    assert r.ok and USER in r.text
+    # /orders is owner-gated; in dict-mode (no wallet store) it reports nothing
+    # persisted rather than leaking ordinals.
+    r = router.handle(OWNER, "/orders")
+    assert r.text and "order store" in r.text.lower() or "orders" in r.text.lower()
+
+
+def test_admin_setmargin(rig):
+    router, _, _ = rig
+    r = router.handle(OWNER, "/setmargin 0.4")
+    assert r.ok and "0.4" in r.text

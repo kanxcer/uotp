@@ -486,6 +486,14 @@ class UotpProvider:
         # Translate through the harvested handler vocabulary first
         # ("instagram" -> "Instagram"), then the caller's explicit map,
         # then the raw slug -- validation will still BAD_SERVICE unknowns.
+        #
+        # IMPORTANT: do NOT normalise case here. getNumber is case-sensitive
+        # AND case is per-service: 'bigbasket' (lower) works, yet 'Instamart'
+        # (capital) is the only form the handler accepts (lowercase
+        # 'instamart' answers BAD_SERVICE, capital 'Instamart' with operator 4
+        # returns a number). The _resolve() vocabulary carries the exact case;
+        # send it verbatim and let the operator walk (below) handle a service
+        # that one operator rejects.
         slug = self._resolve(service) or service
         country = self._COUNTRY_ALIASES.get(str(country).lower(), country)
         params: dict[str, Any] = {"service": slug, "country": country}
@@ -522,14 +530,27 @@ class UotpProvider:
                 last = exc
                 continue
             except ProviderError as exc:
-                # BAD_OPERATOR: this id does not exist here; try the next.
-                if "BAD_OPERATOR" in str(exc):
+                # Per-operator answers that mean "not on THIS pool": the next
+                # operator may still carry the service. The verified live case
+                # is Instamart: operator 3 answers BAD_SERVICE, but operator 4
+                # returns a number. Only BAD_OPERATOR was continued before;
+                # that aborted the whole buy on a single operator's BAD_SERVICE.
+                if any(tok in str(exc) for tok in ("BAD_OPERATOR", "BAD_SERVICE")):
                     last = exc
                     continue
                 raise
             break
         else:
-            raise last or NumberUnavailable(f"no stock for {service}")
+            # Every operator rejected this service. Preserve the meaningful
+            # economic signals the engine acts on (insufficient funds -> it
+            # tops up the wallet) but convert a per-operator code rejection
+            # (BAD_SERVICE etc.) into a single clean NumberUnavailable rather
+            # than leaking the last raw error token to the customer.
+            if isinstance(last, InsufficientBalance):
+                raise last
+            raise NumberUnavailable(
+                f"no stock for {service}" + (f" ({last})" if last else "")
+            )
 
         if parsed.status == c.cancel_prefix:
             # Charged and immediately useless. Record it as an allocation so

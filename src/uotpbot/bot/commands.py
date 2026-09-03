@@ -19,7 +19,7 @@ from ..createbot import CreateBotFlow, CreateBotResult
 from ..economics import EconomicsError
 from ..engine import BotEngine
 from ..ledger import Ledger
-from ..money import Money
+from ..money import INR, Money
 from ..pricing import Pricer
 from ..whitelabel import PlatformFee, SubBotRegistry
 
@@ -196,6 +196,17 @@ class CommandRouter:
             "wallet": self.cmd_wallet,
             "report": self.cmd_report,
             "status": self.cmd_status,
+            # Owner/admin commands.
+            "metrics": self.cmd_metrics,
+            "provider": self.cmd_provider,
+            "credit": self.cmd_credit,
+            "debit": self.cmd_debit,
+            "orders": self.cmd_orders,
+            "users": self.cmd_users,
+            "ban": self.cmd_ban,
+            "maintenance": self.cmd_maintenance,
+            "broadcast": self.cmd_broadcast,
+            "setmargin": self.cmd_setmargin,
         }
 
         # White-label commands. /cancel always works so an owner stuck mid-flow
@@ -751,3 +762,221 @@ class CommandRouter:
             f"Net profit: {pnl['net_profit']}\n"
             f"Revenue: {pnl['revenue']}  COGS: {pnl['cogs']}"
         )
+
+    # -- admin commands (owner-only) -------------------------------------
+    def cmd_metrics(self, user_id: str, args: list[str]) -> Reply:
+        """📊 Operational snapshot: users, float, orders, P&L, supplier wallet."""
+        if not self._is_owner(user_id):
+            return Reply("Owner only.", ok=False)
+        status = self.engine.status()
+        pnl = status["pnl"]
+        fs = None
+        store = self.wallets
+        fn = getattr(store, "float_stats", None) if store is not None else None
+        if callable(fn):
+            try:
+                fs = fn()
+            except Exception:  # noqa: BLE001
+                fs = None
+        uids = []
+        ufn = getattr(store, "user_ids", None) if store is not None else None
+        if callable(ufn):
+            try:
+                uids = list(ufn())
+            except Exception:  # noqa: BLE001
+                uids = []
+        order_lines = []
+        ofn = getattr(store, "recent_orders", None) if store is not None else None
+        if callable(ofn):
+            try:
+                orders = list(ofn(limit=100))
+                delivered = sum(1 for o in orders if o.success)
+                refunded = sum(1 for o in orders if not o.success)
+                order_lines = [f"Orders (last 100): {len(orders)} · ✅ {delivered} · ♻️ {refunded}"]
+            except Exception:  # noqa: BLE001
+                pass
+        lines = [
+            "📊 TITAN metrics",
+            f"\n👥 Users: {len(uids)}",
+            f"💵 Customer float: {fs['float'] if fs else '—'}",
+            f"\n🏦 Supplier wallet: {status['provider_wallet']}",
+            f"📒 Ledger wallet: {status['ledger_wallet']}",
+            f"\n💹 Revenue: {pnl['revenue']} · COGS: {pnl['cogs']} · Net: {pnl['net_profit']}",
+        ]
+        if order_lines:
+            lines.append("\n" + order_lines[0])
+        pinfo = getattr(self.pricer, "target_margin", None)
+        if pinfo is not None:
+            lines.append(f"🎯 Target margin: {pinfo:.0%}" if hasattr(pinfo, "__truediv__") else f"🎯 Target margin: {pinfo}")
+        return Reply("\n".join(lines))
+
+    def cmd_provider(self, user_id: str, args: list[str]) -> Reply:
+        """🏦 Supplier wallet + which operator/pool the rail is using."""
+        if not self._is_owner(user_id):
+            return Reply("Owner only.", ok=False)
+        status = self.engine.status()
+        return Reply(
+            f"🏦 Supplier: {status['provider']}\n"
+            f"Supplier wallet: {status['provider_wallet']}\n"
+            f"Ledger wallet: {status['ledger_wallet']}\n"
+            f"Net profit: {status['pnl']['net_profit']}\n"
+            f"Revenue: {status['pnl']['revenue']}"
+        )
+
+    def cmd_credit(self, user_id: str, args: list[str]) -> Reply:
+        """💳 /credit <user_id> <amount> — add balance to a customer."""
+        if not self._is_owner(user_id):
+            return Reply("Owner only.", ok=False)
+        if len(args) < 2:
+            return Reply("Usage: /credit <user_id> <amount> (e.g. /credit 123456789 250)", ok=False)
+        target, amount_s = args[0], args[1]
+        try:
+            amount = INR(amount_s)
+        except Exception:  # noqa: BLE001
+            return Reply(f"Bad amount '{amount_s}'. Use rupees, e.g. 250 or 20.50.", ok=False)
+        if amount.is_negative or amount.is_zero:
+            return Reply("Amount must be positive.", ok=False)
+        try:
+            new = self.credit(target, amount)
+        except Exception as exc:  # noqa: BLE001
+            return Reply(f"Could not credit: {exc}", ok=False)
+        return Reply(
+            f"✅ Credited {amount} to `{target}` (balance now {new}).",
+            notify=((target, f"💳 Deposit confirmed! {amount} added to your balance (now {new}).")),
+        )
+
+    def cmd_debit(self, user_id: str, args: list[str]) -> Reply:
+        """↩️ /debit <user_id> <amount> — take back a balance (admin adjust)."""
+        if not self._is_owner(user_id):
+            return Reply("Owner only.", ok=False)
+        if len(args) < 2:
+            return Reply("Usage: /debit <user_id> <amount>", ok=False)
+        target, amount_s = args[0], args[1]
+        try:
+            amount = INR(amount_s)
+        except Exception:  # noqa: BLE001
+            return Reply(f"Bad amount '{amount_s}'.", ok=False)
+        if amount.is_negative or amount.is_zero:
+            return Reply("Amount must be positive.", ok=False)
+        try:
+            new = self._debit(target, amount)
+        except Exception as exc:  # noqa: BLE001
+            return Reply(f"Could not debit: {exc}", ok=False)
+        return Reply(f"↩️ Debited {amount} from `{target}` (balance now {new}).")
+
+    def cmd_ban(self, user_id: str, args: list[str]) -> Reply:
+        """🚫 /ban <user_id> | /unban <user_id> — toggle access."""
+        if not self._is_owner(user_id):
+            return Reply("Owner only.", ok=False)
+        if not args:
+            return Reply("Usage: /ban <user_id>  or  /unban <user_id>", ok=False)
+        target = args[0]
+        mode = "ban"
+        current = set(self.allowed_users or [])
+        if target in current:
+            current.discard(target)
+            (setattr(self, "allowed_users", tuple(current)))
+            return Reply(f"🚫 Banned `{target}` from buying.")
+        current.add(target)
+        setattr(self, "allowed_users", tuple(current))
+        return Reply(f"✅ Unbanned `{target}`.")
+
+    def cmd_maintenance(self, user_id: str, args: list[str]) -> Reply:
+        """🛠 /maintenance [on|off] — pivot buying (owner)."""
+        if not self._is_owner(user_id):
+            return Reply("Owner only.", ok=False)
+        # Report the real state (the persistent toggle is the Owner panel
+        # button in the UI, which writes the KV flag). Never fake an override
+        # here that would desync the persisted flag.
+        cur = self.maintenance_fn() if self.maintenance_fn else False
+        return Reply(
+            f"🛠 Maintenance is currently {'ON — buying paused for customers' if cur else 'OFF — buying is live'}.\n"
+            "To flip it persistently, use the Owner panel: ⚙️ Owner → 🛠 Toggle maintenance."
+        )
+
+    def cmd_orders(self, user_id: str, args: list[str]) -> Reply:
+        """📦 /orders [user_id] — recent orders (admin)."""
+        if not self._is_owner(user_id):
+            return Reply("Owner only.", ok=False)
+        store = self.wallets
+        ofn = getattr(store, "recent_orders", None) if store is not None else None
+        if not callable(ofn):
+            return Reply("No order store on this deployment (nothing persisted yet).", ok=False)
+        uid = args[0] if args else ""
+        try:
+            orders = list(ofn(user_id=uid, limit=20))
+        except Exception as exc:  # noqa: BLE001
+            return Reply(f"Could not read orders: {exc}", ok=False)
+        if not orders:
+            return Reply(f"No orders{' for ' + uid if uid else ''} yet.")
+        lines = [f"📦 Orders ({'user ' + uid if uid else 'all'}):"]
+        for o in orders:
+            when = time.strftime("%d %b %H:%M", time.localtime(o.ts))
+            name = self.catalog.get(o.slug).name if self.catalog.has(o.slug) else o.slug
+            badge = "✅" if o.success else "♻️"
+            lines.append(f"\n{badge} #{o.id} · {name} · {o.gross} · {o.status or ('delivered' if o.success else 'refunded')} · {when}")
+            lines.append(f"    {o.phone} · user `{o.user_id}`")
+        return Reply("\n".join(lines))
+
+    def cmd_users(self, user_id: str, args: list[str]) -> Reply:
+        """👥 /users — active customers and balances (owner)."""
+        if not self._is_owner(user_id):
+            return Reply("Owner only.", ok=False)
+        store = self.wallets
+        ufn = getattr(store, "user_ids", None) if store is not None else None
+        if callable(ufn):
+            try:
+                uids = list(ufn())
+            except Exception as exc:  # noqa: BLE001
+                return Reply(f"Could not read users: {exc}", ok=False)
+        else:
+            uids = list(self.balances.keys())
+        if not uids:
+            return Reply("No customers yet.")
+        lines = [f"👥 Customers ({len(uids)}):"]
+        for u in uids[:30]:
+            bal = self.balance_of(u)
+            tag = " 👑" if self._is_owner(u) else ""
+            lines.append(f"\n`{u}` · {bal}{tag}")
+        return Reply("\n".join(lines))
+
+    def cmd_broadcast(self, user_id: str, args: list[str]) -> Reply:
+        """📢 /broadcast <message> — announce to every authorised customer."""
+        if not self._is_owner(user_id):
+            return Reply("Owner only.", ok=False)
+        msg = " ".join(args).strip()
+        if not msg:
+            return Reply("Usage: /broadcast <your announcement>", ok=False)
+        store = self.wallets
+        ufn = getattr(store, "user_ids", None) if store is not None else None
+        targets: list[str] = []
+        if callable(ufn):
+            try:
+                targets = [u for u in ufn() if not self._is_owner(u)]
+            except Exception:  # noqa: BLE001
+                targets = []
+        else:
+            targets = [u for u in self.balances if not self._is_owner(u)]
+        notify = tuple((t, f"📢 Announcement:\n\n{msg}") for t in targets)
+        return Reply(
+            f"📢 Sent '{msg}' to {len(targets)} customer(s).",
+            notify=notify,
+        )
+
+    def cmd_setmargin(self, user_id: str, args: list[str]) -> Reply:
+        """🎯 /setmargin <fraction> — set the live pricing margin (0.35 = 35%)."""
+        if not self._is_owner(user_id):
+            return Reply("Owner only.", ok=False)
+        if not args:
+            cur = getattr(self.pricer, "target_margin", None)
+            return Reply(f"Current target margin: {cur}" if cur else "Margin unavailable.")
+        try:
+            from decimal import Decimal
+            new = Decimal(args[0])
+        except Exception:  # noqa: BLE001
+            return Reply("Bad margin. Use a fraction, e.g. 0.35 (35%).", ok=False)
+        if not (0 < new <= 2):
+            return Reply("Margin must be between 0 and 2 (e.g. 0.35).", ok=False)
+        setattr(self.pricer, "target_margin", new)
+        return Reply(f"🎯 Target margin set to {new} ({new:.0%}).")
+

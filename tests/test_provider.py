@@ -493,8 +493,12 @@ def test_live_bad_action_for_an_unknown_action():
 
 
 def test_live_bad_service_on_getnumber():
-    p, _ = make("BAD_SERVICE")
-    with pytest.raises(ProviderError, match="BAD_SERVICE"):
+    """A lone BAD_SERVICE (the service the handler rejects) must now surface as a
+    clean NumberUnavailable after the walk tries every operator (verified live:
+    Instamart is BAD_SERVICE on operator 3 but a number on operator 4)."""
+    p, _ = make("BAD_SERVICE", "BAD_SERVICE", "BAD_SERVICE", "BAD_SERVICE",
+                operator_order=("1", "2"))
+    with pytest.raises(NumberUnavailable):
         p.buy_number("whatsapp")
 
 
@@ -656,3 +660,34 @@ def test_live_tokens_map_to_exceptions(token, exc):
     p, _ = make(token)
     with pytest.raises(exc):
         p.get_balance()
+
+
+def test_buy_number_walks_past_a_bad_service_operator():
+    """A service that one operator answers BAD_SERVICE on must still be tried on
+    the next operator (verified live: Instamart is BAD_SERVICE on op 3 but
+    returns a number on op 4). The walk must not abort on a single operator's
+    BAD_SERVICE."""
+    bodies = ["BAD_SERVICE", "ACCESS_NUMBER:a1b2c3:917000000001:10"]
+    p, opener = make(*bodies, operator_order=("1", "2"))
+    alloc = p.buy_number("zznotavocab", "22")
+    assert alloc.phone == "917000000001"
+    assert alloc.order_id == "a1b2c3"
+    # Two getNumber calls were made: op=1 (BAD_SERVICE) then op=2 (success).
+    number_calls = [c["url"] for c in opener.calls if "getNumber" in c["url"]]
+    assert len(number_calls) == 2
+    assert "operator=1" in number_calls[0]
+    assert "operator=2" in number_calls[1]
+
+
+def test_buy_number_aborts_if_all_operators_bad_service():
+    """If every operator answers BAD_SERVICE, the buy fails with a clean
+    NumberUnavailable instead of an opaque BAD_SERVICE leak."""
+    p, opener = make("BAD_SERVICE", "BAD_SERVICE", operator_order=("1", "2"))
+    from uotpbot.provider.base import NumberUnavailable, ProviderError
+    try:
+        p.buy_number("zznotavocab", "22")
+        raise AssertionError("should have raised")
+    except NumberUnavailable:
+        pass  # expected: all operators rejected the service
+    except ProviderError as exc:
+        raise AssertionError(f"unexpected ProviderError: {exc}")

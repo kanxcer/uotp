@@ -140,6 +140,9 @@ class ScopedWallets(WalletStore):
     def float_stats(self):
         return self._inner.float_stats(scope=self._scope)
 
+    def user_ids(self):
+        return self._inner.user_ids(scope=self._scope)
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS {t} (
@@ -542,6 +545,18 @@ class SqliteWallets(WalletStore):
                     " WHERE user_id NOT LIKE '%:%'").fetchone()
         return {"users": int(row[0]), "float": Money(int(row[1]))}
 
+    def user_ids(self, *, scope: str = "") -> list[str]:
+        """Every wallet user id for this scope, for admin broadcast/reporting."""
+        like = (scope + ":%") if scope else None
+        with self._lock:
+            if like:
+                rows = self._conn.execute(
+                    "SELECT user_id FROM wallets WHERE user_id LIKE ?", (like,)).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT user_id FROM wallets WHERE user_id NOT LIKE '%:%'").fetchall()
+        return [r[0] for r in rows]
+
     def balance(self, user_id: str) -> Money:
         with self._lock:
             row = self._conn.execute(
@@ -830,6 +845,19 @@ class PostgresWallets(WalletStore):
                     "SELECT COUNT(*), COALESCE(SUM(balance_paise), 0) FROM"
                     f" {self._t} WHERE user_id NOT LIKE '%:%'").fetchone()
         return {"users": int(row[0]), "float": Money(int(row[1]))}
+
+    def user_ids(self, *, scope: str = "") -> list[str]:
+        like = (scope + ":%") if scope else None
+        with self._lock:
+            if like:
+                rows = self._conn.execute(
+                    f"SELECT user_id FROM {self._t} WHERE user_id LIKE %s", (like,)
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    f"SELECT user_id FROM {self._t} WHERE user_id NOT LIKE '%:%'"
+                ).fetchall()
+        return [r[0] for r in rows]
 
     def balance(self, user_id: str) -> Money:
         with self._lock:
