@@ -187,6 +187,57 @@ class CommandRouter:
         return bool(self.owner_id) and user_id == self.owner_id
 
     @staticmethod
+    def _remaining_otp_minutes(alloc) -> Optional[int]:
+        """Whole minutes left before this number auto-resolves (refund/deadline).
+
+        Works from a live ``NumberAllocation`` (its ``seconds_left`` is the
+        remaining validity) or a persisted ``ActiveNumber``. Returns None when
+        no timing is available so callers can fall back to a generic note.
+        """
+        try:
+            secs = float(getattr(alloc, "seconds_left", lambda: 0)())
+        except Exception:  # noqa: BLE001
+            return None
+        if secs <= 0:
+            return 0
+        return int(secs // 60)
+
+    @staticmethod
+    def _minute_text(mins: Optional[int]) -> str:
+        if mins is None:
+            return ""
+        return f"~{mins} min" if mins >= 1 else "less than a minute"
+
+    def _otp_window_minutes(self, alloc) -> Optional[int]:
+        """Whole minutes left in the OTP window (when the number auto-resolves).
+
+        The number stays valid for several minutes after the OTP window, but the
+        auto-refund happens when no code arrives by the OTP deadline, so the
+        countdown the customer cares about (\"when can I cancel / when does it
+        refund\") is the OTP window remaining, not the full validity.
+        """
+        if alloc is None:
+            return None
+        try:
+            from datetime import datetime, timezone
+            allocated = getattr(alloc, "allocated_at", None)
+            if isinstance(allocated, str) and allocated:
+                ts = datetime.fromisoformat(allocated).timestamp()
+            else:
+                ts = getattr(alloc, "ts", None)
+            if ts is None:
+                return None
+            import time
+            elapsed = time.time() - float(ts)
+            window = self.engine.config.otp_timeout_seconds
+            remaining = window - elapsed
+            if remaining <= 0:
+                return 0
+            return int(remaining // 60)
+        except Exception:  # noqa: BLE001
+            return None
+
+    @staticmethod
     def _retryable(reason: str) -> bool:
         """Whether a failed buy is worth a one-tap retry.
 
@@ -575,11 +626,16 @@ class CommandRouter:
                 service=slug or "", server=provider_id.split("|")[-1] if provider_id else "",
                 order_id=provider_id, cost_paise=cost,
             )
+            alloc = getattr(result, "_alloc", None) if result is not None else None
+            if alloc is None:
+                active = self._active_by_token(token)
+                alloc = active
+            left = self._otp_window_minutes(alloc)
+            timer = f"\n\n⏳ You can tap ♻️ Cancel again in about {self._minute_text(left)}, "\
+                    f"or tap 💰 Check OTP and it refunds automatically if no " \
+                    f"code arrives before then."
             return Reply(
-                "♻️ The provider won't release this number yet — a fresh "
-                "activation must wait out its window before it can be cancelled "
-                "or refunded. Tap 💰 Check OTP; if no code arrives it auto-refunds "
-                "at the deadline."
+                "♻️ This number can't be cancelled yet." + timer
                 + (f"\n\n({refused})" if refused else ""),
                 ok=False,
                 rows=((("💰 Check OTP", f"co:{token}"),), (("🏠 Menu", "m"),)),
@@ -658,10 +714,15 @@ class CommandRouter:
         if result.success and result.otp:
             self._awaiting.pop(token, None)
             self._record_order(user_id, slug, result.order.gross_price, result)
+            left = self._remaining_otp_minutes(getattr(result, "_alloc", None))
+            valid = ""
+            if left is not None:
+                valid = f"\n⏳ Number valid for {self._minute_text(left)} — use it before that."
             reply = Reply(
                 f"✅ OTP for {self.catalog.get(slug).name}: `{result.otp}`\n"
                 f"📱 Number: {result.phone}\n\n"
-                f"Charged {result.order.gross_price} · Balance {self.balance_of(user_id)}",
+                f"Charged {result.order.gross_price} · Balance {self.balance_of(user_id)}"
+                f"{valid}",
                 rows=(
                     (("🔁 Another", f"s:{slug}"), ("🧾 My numbers", "o")),
                     (("🏠 Menu", "m"),),

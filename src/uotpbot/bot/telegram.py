@@ -182,7 +182,23 @@ class TelegramFrontend:
             await query.answer("OK" if reply.ok else "Rejected")
             return
 
-        reply = self.ui.button(user_id, data)
+        # ``ui.button`` handles token buttons (💰 Check OTP / 🔁 Resend / ♻️
+        # Cancel) by calling the provider SYNCHRONOUSLY (setStatus). Running it
+        # off the event loop keeps that network call from blocking every other
+        # customer's tap. A thrown error must never silently drop the screen --
+        # the transport always edits to a real fallback instead.
+        try:
+            reply = await _run_offloop(self.ui.button, user_id, data)
+        except Exception as exc:  # noqa: BLE001 - never freeze a tap
+            log.exception("button handler failed")
+            await query.answer("Hmm")
+            if message is not None:
+                await self._safe_edit_text(
+                    message,
+                    "⚠️ Something went wrong opening that screen. Please "
+                    "tap again — nothing was charged.",
+                )
+            return
         await query.answer("OK" if reply.ok else "Hmm")
         if message is None:
             return

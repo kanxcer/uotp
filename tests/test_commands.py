@@ -397,3 +397,44 @@ def test_admin_command_opens_panel(rig):
     assert "Owner only" in r.text
     r = router.handle(OWNER, "/admin")
     assert r.ok and "Owner panel" in r.text
+
+
+def test_cancel_refusal_message_has_timer(rig):
+    """EARLY_CANCEL_DENIED must show a clear countdown the customer can act on,
+    not the terse raw provider error."""
+    router, provider, _ = rig
+    from uotpbot.provider.base import ProviderError
+    provider.set_success_rate("telegram", 0.0)
+    router.credit(USER, INR(100))
+    reply = router.alloc_and_wait(USER, "telegram")
+    token = next(d for row in reply.rows for _b, d in row if d.startswith("co:")).split(":")[1]
+    # Force the provider to refuse the release, as the live handler does.
+    original = provider.cancel
+    def refusing(order_id):
+        raise ProviderError("EARLY_CANCEL_DENIED for action=setStatus")
+    provider.cancel = refusing  # type: ignore[assignment]
+    provider.cancel_strict = refusing  # type: ignore[assignment]
+    try:
+        cancel = router.cancel_wait(token)
+    finally:
+        provider.cancel = original  # type: ignore[assignment]
+    assert not cancel.ok
+    assert "can't be cancelled yet" in cancel.text
+    # The raw provider token should no longer be the headline.
+    assert "EARLY_CANCEL_DENIED" not in cancel.text.split("\n")[0]
+    # A human countdown is present.
+    assert "Cancel again in" in cancel.text or "min" in cancel.text
+
+
+def test_delivered_message_mentions_number_validity(rig):
+    """After an OTP arrives, tell the customer how long the number stays valid."""
+    router, provider, _ = rig
+    from uotpbot.provider.mock import MockOutcome
+    provider.force_next(MockOutcome("success", otp="555111"))
+    router.credit(USER, INR(100))
+    reply = router.alloc_and_wait(USER, "telegram")
+    # The OTP may already be present so check_otp delivers it.
+    token = next(d for row in reply.rows for _b, d in row if d.startswith("co:")).split(":")[1]
+    final = router.check_otp(token, wait_seconds=1)
+    assert final.ok and "555111" in final.text
+    assert "valid for" in final.text or "valid" in final.text.lower()
