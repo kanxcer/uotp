@@ -116,3 +116,26 @@ def test_every_bundled_service_is_consistent():
         assert abs(observed - modelled) / modelled < Decimal("0.06"), (
             f"{cost.slug}: observed {observed} vs modelled {modelled}"
         )
+
+
+def test_cli_simulate_does_not_crash_on_tolerance_branch():
+    """Regression: cmd_simulate's 2%-tolerance check multiplied a Decimal by a
+    float (``... * 0.02``), which raises TypeError. The pure ``monte_carlo``
+    tests never exercised the CLI wrapper, so CI stayed green while
+    ``uotpbot simulate`` crashed on every run. This pins that the command
+    completes (returning 0 for agreement or 1 for a mismatch) instead of
+    raising.
+    """
+    import argparse
+
+    from uotpbot.cli import cmd_simulate
+
+    args = argparse.Namespace(
+        service="google", orders=4000, retry_cap=3, seed=7,
+        prices=None,
+        gateway_rate="0.02", gateway_fixed=0, fee_gst="0.18",
+        gst_rate="0", gst_exclusive=False, chargeback_rate="0",
+        strategy="target_margin", target_margin="0.35", safety_buffer="0",
+    )
+    rc = cmd_simulate(args)
+    assert rc in (0, 1)  # completes; the crash we guarded raises instead

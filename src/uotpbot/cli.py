@@ -240,7 +240,7 @@ def cmd_simulate(args: argparse.Namespace) -> int:
         int(Decimal(str(result.get("cost_delta", "0"))) * 100)
     )
     print()
-    if abs(delta.paise) <= max(20, int(Decimal(str(result["modelled_cost_per_delivery"])) * 100 * 0.02)):
+    if abs(delta.paise) <= max(20, int(Decimal(str(result["modelled_cost_per_delivery"])) * 100 * Decimal("0.02"))):
         print(f"OK: simulated and modelled cost agree within {delta} (<= 2%).")
     else:
         print(f"MISMATCH: simulated vs modelled differ by {delta}. "
