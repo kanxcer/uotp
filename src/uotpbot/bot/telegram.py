@@ -17,6 +17,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
 from ..config import Settings
@@ -26,6 +29,50 @@ from .ui import MenuUI
 __all__ = ["TelegramFrontend", "run_bot", "build_from_settings"]
 
 log = logging.getLogger("uotpbot.telegram")
+
+
+# Long-running off-loop work (OTP waits, buys, polls) runs on this dedicated
+# pool. ``asyncio.to_thread`` would use asyncio's DEFAULT executor, which is
+# only ``min(32, cpu_count + 4)`` -- 6 threads on a small box -- so more than a
+# handful of concurrent orders would starve it and freeze every button press.
+# Sized from BOT_WORKERS (default 32) so it comfortably holds many in-flight
+# waits. Threads mostly *sleep* on poll intervals, so a big pool is cheap and
+# is the difference between "50k users / 10+ concurrent orders" working and the
+# bot going unresponsive.
+_EXECUTOR: Optional[ThreadPoolExecutor] = None
+_EXECUTOR_LOCK = threading.Lock()
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _get_executor() -> ThreadPoolExecutor:
+    """The bot's worker pool for off-loop work (created once, lazily)."""
+    global _EXECUTOR
+    if _EXECUTOR is None:
+        with _EXECUTOR_LOCK:
+            if _EXECUTOR is None:
+                # Cap so a runaway value can't spawn thousands of threads.
+                workers = max(8, min(_int_env("BOT_WORKERS", 32), 128))
+                _EXECUTOR = ThreadPoolExecutor(
+                    max_workers=workers, thread_name_prefix="uotp-worker"
+                )
+    return _EXECUTOR
+
+
+async def _run_offloop(fn, *args):
+    """Run ``fn`` on the sized bot executor, never the 6-thread default pool.
+
+    This is what lets many concurrent orders wait on their OTP simultaneously
+    instead of queueing behind each other and freezing the button surface.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_get_executor(), fn, *args)
+
 
 try:  # pragma: no cover - exercised only when the dependency is installed
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -105,7 +152,7 @@ class TelegramFrontend:
         user_id = str(getattr(user, "id", "")) if user else ""
         if not user_id:
             return
-        reply = await asyncio.to_thread(self.ui.text, user_id, message.text)
+        reply = await _run_offloop(self.ui.text, user_id, message.text)
         await self._deliver_reply(message, reply)
         await self._send_notifications(context, reply)
 
@@ -147,7 +194,7 @@ class TelegramFrontend:
         # Purchase (or any slow step): placeholder now, outcome when done.
         await self._safe_edit(message, reply)
         try:
-            final = await asyncio.to_thread(deferred, user_id)
+            final = await _run_offloop(deferred, user_id)
         except Exception as exc:  # never leave the customer staring at a spinner
             log.exception("deferred step failed")
             kind = type(exc).__name__
@@ -193,7 +240,7 @@ class TelegramFrontend:
         already showed; a stale token resolves to nothing and we stop silently.
         """
         try:
-            _terminal, _reply = await asyncio.to_thread(self.router.poll_once, token)
+            _terminal, _reply = await _run_offloop(self.router.poll_once, token)
             stored = self.router.terminal_reply(token)
             if stored is not None:
                 await self._safe_edit(message, stored)
@@ -219,7 +266,7 @@ class TelegramFrontend:
         if not user_id:
             return
         file_id = photos[-1].file_id  # largest size Telegram offered
-        reply = await asyncio.to_thread(self.ui.photo, user_id, file_id)
+        reply = await _run_offloop(self.ui.photo, user_id, file_id)
         await self._deliver_reply(message, reply)
         if reply.forward_photo and self.router.owner_id and context is not None:
             caption = reply.notify[0][1] if reply.notify else "Payment screenshot"
