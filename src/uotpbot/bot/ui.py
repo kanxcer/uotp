@@ -466,8 +466,60 @@ class MenuUI:
             rows=((("✖️ Cancel", "w"),),),
         )
 
+    def _admin_input_prompt(self, user_id: str, action: str) -> Reply:
+        """Start the collect-input wizard for an owner action."""
+        if not self.router._is_owner(user_id):
+            return Reply("Owner only.", ok=False, rows=((("🏠 Menu", "m"),),))
+        prompt = {
+            "credit": ("➕ ADD BALANCE TO A CUSTOMER",
+                       "Send the user's Telegram id and the amount, e.g.\n"
+                       "`123456789 250`"),
+            "debit": ("↩️ DEDUCT FROM A CUSTOMER",
+                      "Send the user's Telegram id and the amount, e.g.\n"
+                      "`123456789 50`"),
+            "ban": ("🚫 BAN / UNBAN A CUSTOMER",
+                    "Send the user's Telegram id to toggle their access, e.g.\n"
+                    "`123456789`"),
+            "broadcast": ("📢 BROADCAST TO ALL CUSTOMERS",
+                          "Send your announcement text, e.g.\n"
+                          "`Big sale today on all numbers!`"),
+        }[action]
+        self._wizard[user_id] = {"flow": "admin", "action": action, "step": "input"}
+        return Reply(f"{prompt[0]}\n\n{prompt[1]}\n\nTap ✖️ Cancel to abort.",
+                     rows=((("✖️ Cancel", "a"),),))
+
     def _wizard_text(self, user_id: str, body: str) -> Reply:
         wizard = self._wizard.get(user_id) or {}
+        flow = wizard.get("flow")
+        if flow == "admin" and wizard.get("step") == "input":
+            action = wizard.get("action", "")
+            if action == "credit":
+                args = self._split_uid_amount(body)
+                if args is None:
+                    return Reply("Format: <user id> <amount> — e.g. `123456789 250`.",
+                                 ok=False, rows=((("✖️ Cancel", "a"),),))
+                return self.router.handle(user_id, f"/credit {args}")
+            if action == "debit":
+                args = self._split_uid_amount(body)
+                if args is None:
+                    return Reply("Format: <user id> <amount> — e.g. `123456789 50`.",
+                                 ok=False, rows=((("✖️ Cancel", "a"),),))
+                return self.router.handle(user_id, f"/debit {args}")
+            if action == "ban":
+                uid = body.strip().split()[0] if body.strip() else ""
+                if not uid:
+                    return Reply("Please send just the user's Telegram id.",
+                                 ok=False, rows=((("✖️ Cancel", "a"),),))
+                return self.router.handle(user_id, f"/ban {uid}")
+            if action == "broadcast":
+                text = body.strip()
+                if not text:
+                    return Reply("Please send the announcement text.",
+                                 ok=False, rows=((("✖️ Cancel", "a"),),))
+                return self.router.handle(user_id, f"/broadcast {text}")
+            self._wizard.pop(user_id, None)
+            return self.main_menu(user_id)
+
         if wizard.get("flow") != "topup" or wizard.get("step") != "amount":
             self._wizard.pop(user_id, None)
             return self.main_menu(user_id)
@@ -485,6 +537,14 @@ class MenuUI:
             "it goes straight to the owner with approve/decline buttons.",
             rows=((("✖️ Cancel", "w"),),),
         )
+
+    @staticmethod
+    def _split_uid_amount(text: str) -> Optional[str]:
+        """\"123456789 250\" -> the two args for /credit|/debit, else None."""
+        tokens = (text or "").strip().split()
+        if len(tokens) == 2 and tokens[0].strip().lstrip("-").isdigit():
+            return f"{tokens[0].strip()} {tokens[1].strip()}"
+        return None
 
     @staticmethod
     def _parse_amount(text: str) -> Optional[Money]:
@@ -690,7 +750,11 @@ class MenuUI:
             rows=(
                 ((f"🧾 Top-ups ({len(pending)} pending)", "a:t"),),
                 (("📦 Orders & per-order profit", "a:o"),),
+                (("💳 Add balance", "ax:credit"), ("↩️ Deduct", "ax:debit")),
+                (("👥 Customers", "ax:users"), ("🚫 Ban/Unban", "ax:ban")),
+                (("📢 Broadcast", "ax:broadcast"), ("📊 Metrics", "ax:metrics")),
                 (("🛠 Toggle maintenance", "a:mm"), ("🖼 Payment QR", "a:qr")),
+                (("🕳 Sunk cost", "ax:sunkcost"), ("🏦 Provider", "ax:provider")),
                 (("🏠 Menu", "m"),),
             ),
         )
@@ -853,6 +917,19 @@ class MenuUI:
                     "✅ Maintenance OFF — buying is live again."
                 )
                 return Reply(text, rows=((("◀️ Owner panel", "a"),),))
+            return self._badtap()
+        if kind == "ax":
+            # Admin-panel action button. Display-only actions run the owner
+            # command and render its reply; input actions (credit/debit/ban/
+            # broadcast) start a short prompt that collects the details on the
+            # next message. Owner-gated; blocked for anyone else.
+            if not self.router._is_owner(user_id) or len(parts) != 2:
+                return Reply("Owner only.", ok=False, rows=((("🏠 Menu", "m"),),))
+            action = parts[1]
+            if action in {"users", "orders", "metrics", "provider", "sunkcost"}:
+                return self.router.handle(user_id, f"/{action}")
+            if action in {"credit", "debit", "ban", "broadcast"}:
+                return self._admin_input_prompt(user_id, action)
             return self._badtap()
         if kind == "l":
             return self.services_grid(user_id, page=_int(parts[1], 0) if len(parts) == 2 else 0)
