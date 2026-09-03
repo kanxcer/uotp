@@ -127,6 +127,10 @@ class CommandRouter:
         #: OTP is delivered or the wait is abandoned. Kept in memory: the wait
         #: only spans a single order's lifetime, never a redeploy.
         self._awaiting: dict[str, tuple[str, str, object]] = {}
+        #: token -> final Reply for a genuinely-resolved (delivered/refunded)
+        #: order, so a background auto-poller only ever edits with a real
+        #: outcome and never overwrites an OTP a manual tap already delivered.
+        self._terminal: dict[str, object] = {}
 
     # -- helpers ---------------------------------------------------------
     def balance_of(self, user_id: str) -> Money:
@@ -508,19 +512,35 @@ class CommandRouter:
         rather than replying instantly with nothing. The transport runs this
         off the event loop (deferred), so a longer wait is fine.
         """
+        _terminal, reply = self.poll_once(token, wait_seconds=wait_seconds)
+        return reply
+
+    def poll_once(self, token: str, *, wait_seconds: int = 0):
+        """One bounded poll of a waiting order.
+
+        Returns ``(terminal, reply)`` where ``terminal`` is True when the order
+        has reached a FINAL state (OTP delivered, or refunded/timed out) and
+        False when it is still waiting for the SMS. The transport uses this to
+        auto-deliver the code in the background, so the customer does not have
+        to keep tapping 💰 Check OTP; a button tap just calls the same thing
+        via :meth:`check_otp`. ``wait_seconds`` defaults to the full OTP window
+        (it must never be set short here, or we would refund a number that is
+        merely seconds away from delivering).
+        """
         entry = self._awaiting.get(token)
         if entry is not None:
             user_id, slug, result = entry
             wait = wait_seconds if wait_seconds > 0 else self.engine.config.otp_timeout_seconds
             result = self.engine.poll_otp(result, timeout_seconds=wait)
-            return self._after_check(token, user_id, slug, result)
+            reply = self._after_check(token, user_id, slug, result)
+            return (result.success or result.refunded.paise > 0), reply
         # Restart-safe: re-enter the wait straight from the DB row.
         active = self._active_by_token(token)
         if active is None:
-            return Reply(
+            return True, Reply(
                 "That order has finished or is no longer waiting. "
                 "See 🧾 My numbers.",
-                ok=False, rows=((("🧾 My numbers", "o"), ("🏠 Menu", "m")),),
+                ok=False, rows=(((("🧾 My numbers", "o"), ("🏠 Menu", "m")),),),
             )
         wait = wait_seconds if wait_seconds > 0 else self.engine.config.otp_timeout_seconds
         result = self.engine.resume_otp(
@@ -529,14 +549,19 @@ class CommandRouter:
             gross=active.gross, phone=active.phone, allocated_ts=active.ts,
             timeout_seconds=wait,
         )
-        return self._after_check(token, active.user_id, active.slug, result)
+        reply = self._after_check(token, active.user_id, active.slug, result)
+        return (result.success or result.refunded.paise > 0), reply
+
+    def terminal_reply(self, token: str) -> Optional[object]:
+        """The genuine final Reply for a token resolved this process, or None."""
+        return self._terminal.get(token)
 
     def _after_check(self, token: str, user_id: str, slug: str, result) -> Reply:
         """Shared tail of check_otp: deliver the OTP, refund on timeout, or wait."""
         if result.success and result.otp:
             self._awaiting.pop(token, None)
             self._record_order(user_id, slug, result.order.gross_price, result)
-            return Reply(
+            reply = Reply(
                 f"✅ OTP for {self.catalog.get(slug).name}: `{result.otp}`\n"
                 f"📱 Number: {result.phone}\n\n"
                 f"Charged {result.order.gross_price} · Balance {self.balance_of(user_id)}",
@@ -545,6 +570,8 @@ class CommandRouter:
                     (("🏠 Menu", "m"),),
                 ),
             )
+            self._terminal[token] = reply
+            return reply
         # Still waiting (or timed out to a refund).  If poll_otp refunded, reflect it.
         if result.refunded.paise > 0:
             self.credit(user_id, result.refunded)
@@ -552,12 +579,14 @@ class CommandRouter:
             # Terminal (timed out / refunded) -- clear it and the active number.
             self._awaiting.pop(token, None)
             self._record_order(user_id, slug, result.order.gross_price, result)
-            return Reply(
+            reply = Reply(
                 f"⚠️ No OTP arrived for {slug}. Refunded {result.refunded} in "
                 f"full; balance {self.balance_of(user_id)}.",
                 ok=False,
                 rows=((("🧾 My numbers", "o"), ("🏠 Menu", "m")),),
             )
+            self._terminal[token] = reply
+            return reply
         return self.await_reply(token, result)
 
     def _active_by_token(self, token: str) -> Optional[object]:

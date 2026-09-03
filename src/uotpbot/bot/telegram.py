@@ -87,6 +87,9 @@ class TelegramFrontend:
         # /buy (typed) and button buys must agree on maintenance mode:
         # the flag lives in the UI's store; the router just consults it.
         self.router.maintenance_fn = self.ui.maintenance_on
+        #: Per-token single-flight guards for the background OTP auto-poller.
+        self._auto_polling: set[str] = set()
+        self._auto_done: set[str] = set()
 
     async def on_message(self, update: Any, context: Any = None) -> None:
         """Handle any incoming message and reply with the UI's answer.
@@ -157,6 +160,48 @@ class TelegramFrontend:
             )
             return
         await self._safe_edit(message, final)
+        # Auto-deliver the OTP in the background once the SMS lands, so the
+        # customer does not have to keep tapping 💰 Check OTP. Only ever edits
+        # with a genuine terminal outcome; disabled per-config if not wanted.
+        engine_cfg = getattr(self.router.engine, "config", None)
+        if engine_cfg is not None and getattr(engine_cfg, "auto_poll_otp", False):
+            token = self._wait_token(final)
+            if token:
+                self._schedule_auto_poll(message, token)
+
+    def _wait_token(self, reply) -> Optional[str]:
+        """The co:<token> from a reply, or None (no active number in it)."""
+        for row in getattr(reply, "rows", ()) or ():
+            for _label, data in row:
+                if isinstance(data, str) and data.startswith("co:"):
+                    return data.split(":", 1)[1]
+        return None
+
+    def _schedule_auto_poll(self, message: Any, token: str) -> None:
+        """Schedule one background OTP poller per active order (single-flight)."""
+        if token in self._auto_polling or token in self._auto_done:
+            return
+        self._auto_polling.add(token)
+        asyncio.get_running_loop().create_task(self._auto_poll(message, token))
+
+    async def _auto_poll(self, message: Any, token: str) -> None:
+        """Wait (off the event loop) for the OTP and edit in the outcome.
+
+        Delivers the code as soon as the SMS arrives, or refunds at the window
+        end. Only ever overwrites the message with a *genuine* terminal result
+        (``terminal_reply``) so it never clobbers an OTP a manual Check tap
+        already showed; a stale token resolves to nothing and we stop silently.
+        """
+        try:
+            _terminal, _reply = await asyncio.to_thread(self.router.poll_once, token)
+            stored = self.router.terminal_reply(token)
+            if stored is not None:
+                await self._safe_edit(message, stored)
+            self._auto_done.add(token)
+        except Exception as exc:  # noqa: BLE001 - never crash the poller
+            log.exception("auto OTP poll failed: %s", exc)
+        finally:
+            self._auto_polling.discard(token)
 
     async def on_photo(self, update: Any, context: Any = None) -> None:
         """A photo arrives: payment screenshot, owner's payment QR, or noise.

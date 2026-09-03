@@ -254,3 +254,39 @@ def test_resend_without_provider_method_degrades_gracefully(rig):
     res = router.resend_sms(token)
     assert res.ok or not res.ok
     assert "Check OTP" in res.text  # always offers a path forward
+
+
+def test_poll_once_reports_terminal_only_on_resolution(rig):
+    """poll_once must flag terminal=True only for a real outcome (OTP or
+    refund) and False while still waiting, so the background auto-poller only
+    ever overwrites the message with a genuine result."""
+    router, provider, _ = rig
+    # Deliver: push a code into the mock so the OTP arrives.
+    provider.set_success_rate("telegram", 1.0)
+    router.credit(USER, INR(100))
+    reply = router.alloc_and_wait(USER, "telegram")
+    token = next(d for row in reply.rows for _b, d in row if d.startswith("co:")).split(":")[1]
+    terminal, final = router.poll_once(token, wait_seconds=2)
+    assert terminal is True
+    assert final.ok and "OTP for" in final.text
+    assert router.terminal_reply(token) is not None
+    # A stale/unknown token resolves terminal=True with no cached reply (so the
+    # auto-poller safely does not overwrite anything).
+    t2, f2 = router.poll_once("nonexistent")
+    assert t2 is True and router.terminal_reply("nonexistent") is None
+
+
+def test_poll_once_refunds_on_full_window_and_caches(rig):
+    """On the default (full) wait, a silent number is terminal only at the end
+    of the window and the genuine refund reply is cached for the auto-poller to
+    edit with; it never marks terminal early."""
+    router, provider, _ = rig
+    provider.set_success_rate("telegram", 0.0)  # silent
+    router.credit(USER, INR(100))
+    reply = router.alloc_and_wait(USER, "telegram")
+    token = next(d for row in reply.rows for _b, d in row if d.startswith("co:")).split(":")[1]
+    terminal, final = router.poll_once(token)  # full (default) wait
+    assert terminal is True
+    assert not final.ok and "Refund" in final.text
+    assert router.terminal_reply(token) is not None
+    assert router.balance_of(USER) == INR(100)

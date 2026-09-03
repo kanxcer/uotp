@@ -201,6 +201,7 @@ def from_environment(env_file: Optional[Path | str] = None) -> Settings:
         otp_timeout_seconds=float(_get("ENGINE_OTP_TIMEOUT", "290")),
         poll_interval=float(_get("ENGINE_POLL_INTERVAL", "3")),
         auto_refund=_bool("ENGINE_AUTO_REFUND", True),
+        auto_poll_otp=_bool("ENGINE_AUTO_POLL_OTP", True),
         topup_headroom=_decimal("ENGINE_TOPUP_HEADROOM", "5"),
         default_country=_get("ENGINE_DEFAULT_COUNTRY", "22")  # uotp.store handler_api: India,
     )

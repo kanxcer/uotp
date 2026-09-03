@@ -44,6 +44,9 @@ class EngineConfig:
     poll_interval: float = 3.0
     #: Refund the customer automatically when no OTP arrives.
     auto_refund: bool = True
+    #: Deliver the OTP automatically in the background once the SMS lands
+    #: (no need to keep tapping 💰 Check OTP). Harmless to disable.
+    auto_poll_otp: bool = True
     #: Top the provider wallet up to this multiple of the order price when it
     #: runs dry, so a single order is never blocked by a Rs.2 shortfall.
     topup_headroom: Decimal = Decimal("5")
