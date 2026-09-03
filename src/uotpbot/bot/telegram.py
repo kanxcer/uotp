@@ -150,9 +150,10 @@ class TelegramFrontend:
             kind = type(exc).__name__
             await self._safe_edit_text(
                 message,
-                f"⚠️ Something failed mid-order ({kind}). "
-                "If money was deducted it is already back in your balance. "
-                "Please try again.",
+                f"⚠️ Order could not be completed ({kind}). "
+                "Please do not retry yet — your payment and any supplier "
+                "activation are being reconciled. Contact support if your "
+                "balance does not update shortly.",
             )
             return
         await self._safe_edit(message, final)

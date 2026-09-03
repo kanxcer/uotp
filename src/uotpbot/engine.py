@@ -14,7 +14,7 @@ from typing import Callable, Optional
 
 from .catalog import Catalog
 from .economics import EconomicsError, FeeModel, OrderEconomics
-from .ledger import COGS, OWNER, WALLET, Ledger
+from .ledger import COGS, OWNER, WALLET, Ledger, LedgerError
 from .money import Money
 from .orders import Order, OrderState, RetryDecision, retry_policy
 from .pricing import Pricer
@@ -322,11 +322,42 @@ class BotEngine:
                 order.note(f"purchase error: {exc}")
                 break
 
-            order.record_attempt(alloc.charged or sticker, alloc.order_id)
-            order.phone = alloc.phone
-            self.ledger.record_number_purchase(
-                alloc.charged or sticker, ref=ref, memo=f"{service} attempt {order.attempts}"
-            )
+            # The provider is an external side effect. If the database write
+            # fails after ACCESS_NUMBER, the activation is already live on the
+            # supplier and must be cancelled before we return any customer
+            # money. Previously this exception escaped to Telegram, leaving a
+            # purchased number active while the customer saw a misleading
+            # generic error.
+            try:
+                order.record_attempt(alloc.charged or sticker, alloc.order_id)
+                order.phone = alloc.phone
+                self.ledger.record_number_purchase(
+                    alloc.charged or sticker, ref=ref,
+                    memo=f"{service} attempt {order.attempts}"
+                )
+            except LedgerError as exc:
+                order.note(f"internal booking failure after provider purchase: {exc}")
+                try:
+                    strict_cancel = getattr(self.provider, "cancel_strict", None)
+                    if callable(strict_cancel):
+                        strict_cancel(alloc.order_id)
+                    else:
+                        self.provider.cancel(alloc.order_id)
+                except ProviderError as cancel_exc:
+                    # Never claim a refund while a live number may still be
+                    # active. Support/reconciliation must handle this case.
+                    order.note(f"rollback could not cancel activation: {cancel_exc}")
+                    return self._fail(
+                        result, order,
+                        "payment was received but the supplier activation is still "
+                        "being reconciled; please contact support",
+                        refund_customer=False,
+                    )
+                return self._fail(
+                    result, order,
+                    "internal booking failed; the supplier activation was cancelled "
+                    "and your balance was restored",
+                )
             order.transition(OrderState.AWAITING_OTP)
 
             otp = self.provider.wait_for_otp(
@@ -360,12 +391,21 @@ class BotEngine:
 
         return self._fail(result, order, order.notes[-1] if order.notes else "no OTP delivered")
 
-    def _fail(self, result: FulfilResult, order: Order, message: str) -> FulfilResult:
-        """Close an order as failed, refunding the customer if configured."""
+    def _fail(
+        self, result: FulfilResult, order: Order, message: str, *,
+        refund_customer: bool = True,
+    ) -> FulfilResult:
+        """Close an order as failed, refunding only when it is safe.
+
+        ``refund_customer=False`` is reserved for an activation whose
+        cancellation could not be confirmed; returning wallet credit in that
+        state would create a free customer refund while the supplier number
+        remains spendable.
+        """
         if not order.state.is_terminal:
             order.transition(OrderState.FAILED)
         result.message = message
-        if self.config.auto_refund:
+        if self.config.auto_refund and refund_customer:
             refund = order.gross_price
             self.ledger.record_customer_refund(refund, ref=order.order_id, memo="no OTP")
             result.refunded = refund

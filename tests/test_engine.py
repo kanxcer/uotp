@@ -226,3 +226,24 @@ def test_wallet_never_goes_negative_on_a_real_order(stack):
     # profit term is the classic way this check gets written wrong.
     assets = ledger.balance(WALLET) + ledger.balance(CASH)
     assert assets == ledger.balance(OWNER) + pnl.net_profit
+
+
+def test_database_failure_after_provider_purchase_rolls_back_live_activation(stack):
+    """Never leave a supplier number active behind a LedgerError."""
+    engine, ledger, provider, _ = stack
+    provider.force_next(MockOutcome("success", otp="123456"))
+
+    class FailingLedger(Ledger):
+        def record_number_purchase(self, cost, *, ref, memo=""):
+            from uotpbot.ledger import LedgerError
+            raise LedgerError("simulated database failure")
+
+    failing = FailingLedger()
+    engine.ledger = failing
+    result = engine.fulfil("cust-ledger-failure", "telegram")
+    assert not result.success
+    assert result.refunded == result.order.gross_price
+    assert provider.cancellations, "the live provider activation must be cancelled"
+    assert "cancelled" in result.message
+    failing.verify()
+    failing.close()

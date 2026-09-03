@@ -621,20 +621,25 @@ class UotpProvider:
                 return OtpResult(None, None, attempts, time.monotonic() - started, True)
             time.sleep(min(poll_interval, max(deadline - time.monotonic(), 0.1)))
 
-    def cancel(self, order_id: str) -> Money:
-        """Release a number (``setStatus`` with the cancel code).
+    def cancel_strict(self, order_id: str) -> Money:
+        """Release an activation and propagate failure to the caller.
 
-        The protocol does not report the refund amount, so this returns zero
-        and lets the caller reconcile from the next ``getBalance``. Inventing a
-        figure here would corrupt the ledger.
+        Normal cleanup is best-effort, but rollback after a database failure
+        must know whether the live activation was actually released.
         """
         c = self.config
         activation = order_id.split("|")[0]
+        self._request(c.action_set_status, id=activation, status=c.status_cancel)
+        # The protocol does not report the refund amount. Reconcile the
+        # provider wallet separately instead of inventing a number.
+        return Money(0)
+
+    def cancel(self, order_id: str) -> Money:
+        """Release a number; best-effort for ordinary timeout cleanup."""
         try:
-            self._request(c.action_set_status, id=activation, status=c.status_cancel)
+            return self.cancel_strict(order_id)
         except ProviderError:
             return Money(0)
-        return Money(0)
 
     def complete(self, order_id: str) -> None:
         """Mark an activation finished so the number is freed."""
