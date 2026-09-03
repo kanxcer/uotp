@@ -44,6 +44,11 @@ class EngineConfig:
     poll_interval: float = 3.0
     #: Refund the customer automatically when no OTP arrives.
     auto_refund: bool = True
+    #: Minimum wait after a number is allocated before it can be cancelled
+    #: (provider policy, not a guess from an error string). On uotp.store a
+    #: fresh activation must sit out 2 minutes from allocation; before that the
+    #: provider returns EARLY_CANCEL_DENIED.
+    cancel_cooldown_seconds: float = 120.0
     #: Deliver the OTP automatically in the background once the SMS lands
     #: (no need to keep tapping 💰 Check OTP). Harmless to disable.
     auto_poll_otp: bool = True

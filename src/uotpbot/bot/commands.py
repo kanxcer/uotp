@@ -23,6 +23,7 @@ from ..ledger import Ledger
 from ..money import INR, Money
 from ..pricing import Pricer
 from ..ratelimit import RateLimitConfig, RateLimiter
+from ..refund import DurableRefund
 from ..whitelabel import PlatformFee, SubBotRegistry
 
 __all__ = ["CommandRouter", "HELP_TEXT"]
@@ -78,6 +79,10 @@ class Reply:
     photo: Optional[str] = None
     notify: tuple[tuple[str, str], ...] = ()
     forward_photo: bool = False
+    #: Ask the transport to also show a persistent bottom menu
+    #: (ReplyKeyboardMarkup) so the core actions are one tap away without
+    #: typing. Only meaningful for main-menu/welcome-style replies.
+    persistent_menu: bool = False
 
 
 class CommandRouter:
@@ -144,8 +149,21 @@ class CommandRouter:
             self._rate_limiter.set_user_override(_uid)
         #: EARLY_CANCEL_DENIED hidden-cost tracker (feed burn rate + owner report).
         self._cancel_tracker = CancelTracker()
+        #: Durable, retried customer refunds (outbox). No refund is ever lost.
+        self.refunds = DurableRefund(self)
 
     # -- helpers ---------------------------------------------------------
+    def start_refund_worker(self) -> None:
+        """Boot the durable-refund retry worker (also sweeps pending rows)."""
+        if getattr(self, "refunds", None) is not None:
+            self.refunds.start()
+
+    def refund_pending_count(self) -> int:
+        """Outstanding refunds awaiting credit (owner can see on /metrics)."""
+        if getattr(self, "refunds", None) is not None:
+            return self.refunds.pending_count()
+        return 0
+
     def phase1_snapshot(self) -> dict:
         """Subsystem stats for /metrics (Phase 1: P3 rate limiter, P4 tracker)."""
         try:
@@ -236,6 +254,39 @@ class CommandRouter:
             return int(remaining // 60)
         except Exception:  # noqa: BLE001
             return None
+
+    @staticmethod
+    def _alloc_epoch(alloc) -> Optional[float]:
+        """The absolute allocation time (epoch seconds) of a number, however
+        its source is shaped: a live NumberAllocation carries an ISO
+        ``allocated_at``; a persisted ActiveNumber carries ``ts``."""
+        try:
+            raw = getattr(alloc, "allocated_at", None)
+            if isinstance(raw, str) and raw:
+                from datetime import datetime
+                return datetime.fromisoformat(raw).timestamp()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            ts = getattr(alloc, "ts", None)
+            if ts is not None:
+                return float(ts)
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    def _cancel_cooldown_left(self, alloc) -> Optional[float]:
+        """Seconds remaining before this number is cancellable (0 = now).
+
+        Computed from the actual allocation timestamp + the provider's cooldown
+        (``EngineConfig.cancel_cooldown_seconds``), NOT from the OTP window or a
+        parsed error string. Returns None when no timing information exists.
+        """
+        epoch = self._alloc_epoch(alloc)
+        if epoch is None:
+            return None
+        eligible = epoch + self.engine.config.cancel_cooldown_seconds
+        return max(0.0, eligible - time.time())
 
     @staticmethod
     def _retryable(reason: str) -> bool:
@@ -630,10 +681,34 @@ class CommandRouter:
             if alloc is None:
                 active = self._active_by_token(token)
                 alloc = active
-            left = self._otp_window_minutes(alloc)
-            timer = f"\n\n⏳ You can tap ♻️ Cancel again in about {self._minute_text(left)}, "\
-                    f"or tap 💰 Check OTP and it refunds automatically if no " \
-                    f"code arrives before then."
+            # Show the REAL cancel cooldown (2 min from allocation), not the OTP
+            # window -- the provider locks cancellation for a fixed cooldown even
+            # though the window is ~5 min, so "~4 min" was simply wrong.
+            cooldown = self._cancel_cooldown_left(alloc)
+            if cooldown is None:
+                timer = (
+                    "\n\n⏳ You can tap ♻️ Cancel again shortly, or tap 💰 Check "
+                    "OTP and it refunds automatically if no code arrives."
+                )
+            elif cooldown <= 0:
+                timer = (
+                    "\n\n♻️ Cancel is unlocked now — tap ♻️ Cancel again to "
+                    "release it and get refunded."
+                )
+            else:
+                secs = int(round(cooldown))
+                cool_s = int(round(self.engine.config.cancel_cooldown_seconds))
+                cool_min = max(1, round(cool_s / 60)) if cool_s >= 60 else 0
+                wait = f"~{secs}s" if secs < 60 else self._minute_text(secs // 60)
+                cooldown_desc = (
+                    f"{cool_min} min" if cool_min else f"{cool_s} seconds"
+                )
+                timer = (
+                    f"\n\n⏳ A number must sit out {cooldown_desc} after it's "
+                    f"allocated before it can be released. **{wait} left.**\n\n"
+                    "Try ♻️ Cancel again after that, or tap 💰 Check OTP — "
+                    "it refunds automatically if no code arrives."
+                )
             return Reply(
                 "♻️ This number can't be cancelled yet." + timer
                 + (f"\n\n({refused})" if refused else ""),
@@ -649,12 +724,23 @@ class CommandRouter:
             except Exception:  # noqa: BLE001
                 pass
         gross = result.order.gross_price if result is not None and result.order else Money(0)
-        self.credit(user_id, gross)
+        # GUARANTEED refund: post the ledger line + wallet credit through the
+        # durable outbox, so a confirmed release can never leave the customer
+        # silently out of pocket (and the books stay accurate).
+        ok, _ = self.refunds.request(user_id, gross, token, reason="user_cancelled")
+        self._record_cancel(user_id, slug, gross)
         name = self.catalog.get(slug).name if self.catalog.has(slug) else slug
+        if ok:
+            return Reply(
+                f"♻️ Cancelled — {name} number released and {gross} "
+                f"returned to your balance ({self.balance_of(user_id)}).",
+                rows=((("🧾 My numbers", "o"), ("🏠 Menu", "m")),),
+            )
         return Reply(
-            f"♻️ Cancelled — {name} number released and {gross} "
-            f"returned to your balance ({self.balance_of(user_id)}).",
-            rows=((("🧾 My numbers", "o"), ("🏠 Menu", "m")),),
+            f"♻️ Cancel confirmed — the number was released, and {gross} is on "
+            "its way back to your balance. It will appear shortly (a refund is "
+            "being retried automatically).",
+            rows=((("💰 Wallet", "w"), ("🧾 My numbers", "o"), ("🏠 Menu", "m")),),
         )
 
     def check_otp(self, token: str, *, wait_seconds: int = 0) -> Reply:
@@ -705,6 +791,61 @@ class CommandRouter:
         reply = self._after_check(token, active.user_id, active.slug, result)
         return (result.success or result.refunded.paise > 0), reply
 
+    def poll_new_otp(self, token: str) -> Reply:
+        """💰 Check new OTP: poll a DELIVERED number for an additional code.
+
+        A number is valid ~20 minutes and can legitimately receive several
+        codes (the service "resends", or the customer logs in twice). The first
+        token is delivered by the normal flow; this keeps the number alive and
+        returns any *newer* code the provider now has, without re-delivering
+        the already-shown one.
+        """
+        active = self._active_by_token(token)
+        if active is None or not active.provider_order_id:
+            return Reply("That number has finished or is no longer waiting. "
+                         "See 🧾 My numbers.", ok=False,
+                         rows=((("🧾 My numbers", "o"),),))
+        name = self.catalog.get(active.slug).name if self.catalog.has(active.slug) \
+            else active.slug
+        mins = int(round(active.seconds_left / 60)) if active.seconds_left else 0
+        get_sms = getattr(self.engine.provider, "get_sms", None)
+        if not callable(get_sms):
+            return Reply(
+                f"💰 Check new OTP isn't available for {name} right now.",
+                ok=False, rows=((("🧾 My numbers", "o"),),))
+        try:
+            msgs = list(get_sms(active.provider_order_id))
+            codes = [m.extract_otp() for m in msgs if m.extract_otp()]
+        except Exception as exc:  # noqa: BLE001 - provider hiccup, retryable
+            return Reply(
+                "Couldn't reach the provider right now. Tap 💰 Check new OTP "
+                "again in a moment — your number is still valid.",
+                ok=False,
+                rows=((("💰 Check new OTP", f"nx:{token}"),), (("🏠 Menu", "m"),)),
+            )
+        code = (codes[-1] if codes else "").strip()
+        last = (active.otp or "").strip()
+        if code and code != last:
+            upd = getattr(self.wallets, "update_active", None)
+            if callable(upd):
+                try:
+                    upd(active.provider_order_id, otp=code)
+                except Exception:  # noqa: BLE001 - display cache, non-fatal
+                    pass
+            return Reply(
+                f"📬 *New OTP for {name}*: `{code}`\n📱 {active.phone}\n\n"
+                f"⏳ Number valid ~{max(1, mins)} min — you can request another "
+                "code on the service and tap 💰 Check new OTP again.",
+                rows=((("💰 Check new OTP", f"nx:{token}"),),
+                      (("🧾 My numbers", "o"), ("🏠 Menu", "m"))),
+            )
+        return Reply(
+            f"⏳ No new code yet for {name}. The number is valid "
+            f"~{max(1, mins)} min.\n\nRequest the code on the target app, then "
+            "tap 💰 Check new OTP — a second code lands here on the same number.",
+            rows=((("💰 Check new OTP", f"nx:{token}"),), (("🏠 Menu", "m"),)),
+        )
+
     def terminal_reply(self, token: str) -> Optional[object]:
         """The genuine final Reply for a token resolved this process, or None."""
         return self._terminal.get(token)
@@ -713,7 +854,10 @@ class CommandRouter:
         """Shared tail of check_otp: deliver the OTP, refund on timeout, or wait."""
         if result.success and result.otp:
             self._awaiting.pop(token, None)
-            self._record_order(user_id, slug, result.order.gross_price, result)
+            # Keep the number in the live set (storing this OTP) so the customer
+            # can receive MORE codes on it during its validity window (Fix #2).
+            self._record_order(user_id, slug, result.order.gross_price, result,
+                               keep_active=True)
             left = self._remaining_otp_minutes(getattr(result, "_alloc", None))
             valid = ""
             if left is not None:
@@ -762,6 +906,20 @@ class CommandRouter:
         except Exception:  # noqa: BLE001
             return None
 
+    def active_valid_remaining(self, token: str) -> Optional[float]:
+        """Seconds the number is still valid, or -1 / None when it's gone.
+
+        Lets the background auto-poller know when to stop listening for the
+        extra OTPs a number can still receive during its validity window.
+        """
+        try:
+            active = self._active_by_token(token)
+            if active is None:
+                return -1.0
+        except Exception:  # noqa: BLE001
+            return -1.0
+        return float(active.seconds_left)
+
     def active_owner(self, token: str) -> Optional[str]:
         """The user_id that owns a wait-token, from memory or the DB.
 
@@ -799,12 +957,16 @@ class CommandRouter:
         except Exception:  # noqa: BLE001 - a display cache must not block delivery
             pass
 
-    def _record_order(self, user_id: str, slug: str, price: Money, result) -> None:
+    def _record_order(self, user_id: str, slug: str, price: Money, result,
+                      *, keep_active: bool = False) -> None:
         """Persist a durable order row for history + per-order profit.
 
         Display cache ONLY -- the ledger stays the source of truth for money;
         this exists so /metrics, history and the owner panel can answer
         "what happened per order" without parsing journal lines.
+        ``keep_active`` leaves the number in the live set so the customer can
+        keep receiving MORE OTPs on it during its validity window (Fix: a
+        number is valid ~20 min and can get several codes).
         """
         store = self.wallets
         rec = getattr(store, "record_order", None)
@@ -826,15 +988,42 @@ class CommandRouter:
         except Exception:  # never let the receipt printer block a delivery
             pass
         # The order is now terminal (delivered or refunded): remove it from the
-        # live/active set so it no longer shows as an active number.
+        # live/active set so it no longer shows as an active number -- unless the
+        # customer still wants to receive more OTPs on it, in which case we keep
+        # it alive and remember the code it already got.
         finish = getattr(store, "finish_active", None)
         alloc = getattr(result, "_alloc", None)
         provider_id = getattr(alloc, "order_id", "") if alloc else ""
+        if keep_active:
+            upd = getattr(store, "update_active", None)
+            if callable(upd) and provider_id and result.otp:
+                try:
+                    upd(provider_id, otp=result.otp)
+                except Exception:  # noqa: BLE001 - display cache, non-fatal
+                    pass
+            return
         if callable(finish) and provider_id:
             try:
                 finish(provider_id)
             except Exception:  # noqa: BLE001 - display cache, non-fatal
                 pass
+
+    def _record_cancel(self, user_id: str, slug: str, gross: Money) -> None:
+        """Persist a cancelled order so it appears in My numbers history.
+
+        Display cache (like ``_record_order``); the ledger stays the source of
+        truth for the money, which the durable refund already posted.
+        """
+        store = self.wallets
+        rec = getattr(store, "record_order", None)
+        if not callable(rec):
+            return
+        try:
+            rec(user_id=user_id, slug=slug, amount=gross, success=False,
+                status="cancelled", reason="cancelled by user", refunded=gross,
+                balance_after=self.balance_of(user_id))
+        except Exception:  # noqa: BLE001 - display cache, non-fatal
+            pass
 
     # -- white-label -----------------------------------------------------
     def cmd_createbot(self, user_id: str, args: list[str]) -> Reply:
@@ -952,6 +1141,9 @@ class CommandRouter:
         ]
         if order_lines:
             lines.append("\n" + order_lines[0])
+        pending_refunds = self.refund_pending_count()
+        if pending_refunds:
+            lines.append(f"↩️ Refunds awaiting credit: {pending_refunds}")
         pinfo = getattr(self.pricer, "target_margin", None)
         if pinfo is not None:
             lines.append(f"🎯 Target margin: {pinfo:.0%}" if hasattr(pinfo, "__truediv__") else f"🎯 Target margin: {pinfo}")

@@ -83,6 +83,22 @@ _CATEGORY_EMOJI: dict[str, str] = {
 # copy cannot silently drift from engine reality.
 _VALIDITY = "20 minutes"
 
+#: The label -> callback pair(s) for the persistent bottom menu
+#: (ReplyKeyboardMarkup). Customers tap these without typing; Telegram delivers
+#: the button text as a normal message, so ``text()`` routes it here.
+_REPLY_MENU: tuple[tuple[tuple[str, str], ...], ...] = (
+    (("🛒 Buy Number", "l"), ("🧾 My Numbers", "o")),
+    (("💰 Wallet", "w"), ("❓ Help", "h")),
+    (("⚙️ Admin Panel", "a"),),
+)
+REPLY_MENU_LABELS: dict[str, str] = {
+    label: cb for row in _REPLY_MENU for label, cb in row
+}
+#: Case-insensitive lookup (a Telegram reply-keyboard press arrives lowercased).
+REPLY_MENU_LABELS_LOW: dict[str, str] = {
+    label.lower(): cb for label, cb in REPLY_MENU_LABELS.items()
+}
+
 
 def _emoji(slug: str) -> str:
     return _EMOJI.get(slug, "🔹")
@@ -179,12 +195,21 @@ class MenuUI:
         """
         body = (body or "").strip()
         low = body.lower()
+        # Persistent bottom-menu taps arrive as plain text ("🛒 Buy Number").
+        # Route them straight to the same screen their inline-tap twin opens.
+        # The reply keyboard reaches us lowercased, so match case-insensitively.
+        if low in REPLY_MENU_LABELS_LOW:
+            # Reuse the inline-tap dispatcher so a menu tap and an inline tap
+            # can never diverge (same authorisation, same screen, same layout).
+            self._wizard.pop(user_id, None)
+            return self.button(user_id, REPLY_MENU_LABELS_LOW[low])
+        if low in ("/admin", "/owner", "/panel", "⚙️ admin panel", "admin panel",
+                   "⚙ owner panel", "owner panel"):
+            self._wizard.pop(user_id, None)
+            return self.admin_panel(user_id)
         if low in ("/start", "/help"):
             self._wizard.pop(user_id, None)
             return self.main_menu(user_id)
-        if low in ("/admin", "/owner", "/panel"):
-            self._wizard.pop(user_id, None)
-            return self.admin_panel(user_id)
         # "My numbers" as a typed command or phrase must go to the SAME screen
         # as the 🧾 My numbers button, not fall through to search (which returns
         # the menu and looks like "not working").
@@ -257,8 +282,10 @@ class MenuUI:
             "✳️ YCOTP Numbers\n\n"
             f"⚡ {count:,} services · 🇮🇳 real SIMs · 🛟 auto-refund if no OTP\n"
             f"💰 Your balance: {balance}\n\n"
-            "What would you like to do? (or just type a service name)",
+            "What would you like to do? (or just type a service name)\n\n"
+            "💡 The buttons at the bottom of the chat stay here — no need to type.",
             rows=tuple(rows),
+            persistent_menu=True,
         )
 
     def services_grid(
@@ -637,7 +664,7 @@ class MenuUI:
                     lines.append(f"\n⏳ {name} · {a.gross} · {mins} min left")
                     lines.append(f"    📱 {a.phone}")
                 btns = [[("💰 Check OTP", f"co:{a.token}")]
-                        if not a.has_otp else [("✅ Got it", "nop")]
+                        if not a.has_otp else [("💰 New OTP", f"nx:{a.token}")]
                         ]
                 btns[0].append(("🔁 Resend", f"rs:{a.token}"))
                 btns[0].append(("♻️ Cancel", f"cx:{a.token}"))
@@ -940,7 +967,9 @@ class MenuUI:
                 return Reply("Owner only.", ok=False, rows=((("🏠 Menu", "m"),),))
             action = parts[1]
             if action in {"users", "orders", "metrics", "provider", "sunkcost"}:
-                return self.router.handle(user_id, f"/{action}")
+                # Command replies render fine but carry no navigation; wrap
+                # them so the owner never gets stuck (Fix: back button everywhere).
+                return self._with_back(self.router.handle(user_id, f"/{action}"))
             if action in {"credit", "debit", "ban", "broadcast"}:
                 return self._admin_input_prompt(user_id, action)
             return self._badtap()
@@ -978,7 +1007,7 @@ class MenuUI:
             # a slot and was refunded) and re-runs the same money path.
             server = parts[2] if len(parts) == 3 else ""
             return self._begin_purchase(user_id, parts[1], server, retry=True)
-        if kind in ("co", "rs", "cx") and len(parts) == 2:
+        if kind in ("co", "rs", "cx", "nx") and len(parts) == 2:
             token = parts[1]
             owner = self.router.active_owner(token)
             if owner is None or owner != user_id:
@@ -986,6 +1015,9 @@ class MenuUI:
                              rows=((("🏠 Menu", "m"),),))
             if kind == "co":
                 return self._check_waiting(user_id, token)
+            if kind == "nx":
+                # 💰 New OTP on an already-delivered number (multi-OTP window).
+                return self.router.poll_new_otp(token)
             if kind == "rs":
                 return self.router.resend_sms(token)
             reply = self.router.cancel_wait(token)
@@ -1092,6 +1124,23 @@ class MenuUI:
 
     def _can_createbot(self) -> bool:
         return self.router.subbots is not None
+
+    @staticmethod
+    def _with_back(reply: Reply, *, back_data: str = "a",
+                   back_label: str = "◀️ Owner panel") -> Reply:
+        """Guarantee a Back button on a screen that came from the owner panel.
+
+        Command replies (``/metrics``, ``/orders``, ...) can be long and useful
+        but carry no navigation, so an owner tapping one from the panel could
+        get stuck without typing. Appends a Back row unless one already exists.
+        """
+        rows = getattr(reply, "rows", ()) or ()
+        if rows:
+            for row in rows:
+                if any(data == back_data for _label, data in row):
+                    return reply  # already navigable
+            return replace(reply, rows=rows + ((back_label, back_data),))
+        return replace(reply, buttons=((back_label, back_data),))
 
     @staticmethod
     def _badtap() -> Reply:

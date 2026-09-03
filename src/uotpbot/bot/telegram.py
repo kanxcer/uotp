@@ -24,23 +24,35 @@ from typing import Any, Optional
 
 from ..config import Settings
 from .commands import CommandRouter
-from .ui import MenuUI
+from .ui import MenuUI, _REPLY_MENU
 
 __all__ = ["TelegramFrontend", "run_bot", "build_from_settings"]
 
 log = logging.getLogger("uotpbot.telegram")
 
 
-# Long-running off-loop work (OTP waits, buys, polls) runs on this dedicated
-# pool. ``asyncio.to_thread`` would use asyncio's DEFAULT executor, which is
-# only ``min(32, cpu_count + 4)`` -- 6 threads on a small box -- so more than a
-# handful of concurrent orders would starve it and freeze every button press.
-# Sized from BOT_WORKERS (default 32) so it comfortably holds many in-flight
-# waits. Threads mostly *sleep* on poll intervals, so a big pool is cheap and
-# is the difference between "50k users / 10+ concurrent orders" working and the
-# bot going unresponsive.
+# TWO pools, deliberately separate. This is the difference between "My numbers"
+# freezing and staying responsive during a purchase.
+#
+# 1. _EXECUTOR (fast): menu navigation, button dispatch, plain text/photo
+#    screens. These return in milliseconds -- provider calls here are bounded
+#    (a cancel/resend setStatus is ~1s). Sized BOT_WORKERS so a flood of taps
+#    never queues.
+# 2. _SLOW_EXECUTOR (slow): DEFFERED jobs and the background OTP auto-poller.
+#    A 💰 Check OTP / ✅ Buy "wait" blocks for the FULL ~5-minute OTP window.
+#    If those shared the fast pool, a handful of concurrent orders would
+#    occupy every thread and a "My numbers" tap would sit queued behind them
+#    until an order refunded -- exactly the reported freeze. On their own pool
+#    they can use all its threads without starving navigation.
+#
+# ``asyncio.to_thread`` would put everything on asyncio's DEFAULT executor
+# (min(32, cpu+4) = 6 threads on a small box), so 10+ concurrent orders starve
+# it. Both pools are sized from BOT_WORKERS (default 32) because threads mostly
+# *sleep* on poll intervals, so a big pool is cheap.
 _EXECUTOR: Optional[ThreadPoolExecutor] = None
 _EXECUTOR_LOCK = threading.Lock()
+_SLOW_EXECUTOR: Optional[ThreadPoolExecutor] = None
+_SLOW_EXECUTOR_LOCK = threading.Lock()
 
 
 def _int_env(name: str, default: int) -> int:
@@ -51,27 +63,58 @@ def _int_env(name: str, default: int) -> int:
 
 
 def _get_executor() -> ThreadPoolExecutor:
-    """The bot's worker pool for off-loop work (created once, lazily)."""
+    """The FAST pool for navigation (menu, buttons, screens). Created lazily."""
     global _EXECUTOR
     if _EXECUTOR is None:
         with _EXECUTOR_LOCK:
             if _EXECUTOR is None:
-                # Cap so a runaway value can't spawn thousands of threads.
-                workers = max(8, min(_int_env("BOT_WORKERS", 32), 128))
+                workers = _worker_count()
                 _EXECUTOR = ThreadPoolExecutor(
-                    max_workers=workers, thread_name_prefix="uotp-worker"
+                    max_workers=workers, thread_name_prefix="uotp-nav"
                 )
     return _EXECUTOR
 
 
-async def _run_offloop(fn, *args):
-    """Run ``fn`` on the sized bot executor, never the 6-thread default pool.
+def _get_slow_executor() -> ThreadPoolExecutor:
+    """The SLOW pool for multi-minute OTP waits and the auto-poller.
 
-    This is what lets many concurrent orders wait on their OTP simultaneously
-    instead of queueing behind each other and freezing the button surface.
+    Kept separate from ``_get_executor`` so long waits only ever occupy this
+    pool's threads and can never starve the navigation that keeps the button
+    surface alive (the reported freeze: everything sharing one pool).
+    """
+    global _SLOW_EXECUTOR
+    if _SLOW_EXECUTOR is None:
+        with _SLOW_EXECUTOR_LOCK:
+            if _SLOW_EXECUTOR is None:
+                _SLOW_EXECUTOR = ThreadPoolExecutor(
+                    max_workers=_worker_count(), thread_name_prefix="uotp-wait"
+                )
+    return _SLOW_EXECUTOR
+
+
+def _worker_count() -> int:
+    """BOT_WORKERS, floored so a crazy value can't spawn thousands of threads."""
+    return max(8, min(_int_env("BOT_WORKERS", 32), 128))
+
+
+async def _run_offloop(fn, *args):
+    """Run ``fn`` on the FAST navigation pool.
+
+    Use for menu/button/screen work that must never queue behind a multi-minute
+    OTP wait. Never the 6-thread asyncio default pool.
     """
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(_get_executor(), fn, *args)
+
+
+async def _run_slow(fn, *args):
+    """Run a long off-loop callable (an OTP wait / buy) on the SLOW pool.
+
+    These occupy their own threads so concurrent orders wait in parallel and
+    navigation (``_run_offloop``) stays free.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_get_slow_executor(), fn, *args)
 
 
 try:  # pragma: no cover - exercised only when the dependency is installed
@@ -88,6 +131,27 @@ try:  # pragma: no cover - exercised only when the dependency is installed
     HAS_TELEGRAM = True
 except ImportError:  # pragma: no cover
     HAS_TELEGRAM = False
+
+
+def _reply_menu_markup() -> object:
+    """The always-visible bottom menu (ReplyKeyboardMarkup).
+
+    Lives at the bottom of the chat so a customer never has to type. Only one
+    ``reply_markup`` fits per message, and it cannot be an inline keyboard at
+    the same time, so it is only attached to the persistent-menu welcome and
+    never to an edit (an edit keeps the inline buttons; Telegram keeps the
+    keyboard in the client once sent).
+    """
+    if not HAS_TELEGRAM:
+        return None
+    from telegram import KeyboardButton, ReplyKeyboardMarkup
+
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(label) for label, _cb in row] for row in _REPLY_MENU],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Tap a button or type /help",
+    )
 
 
 def _reply_markup(reply) -> object:
@@ -137,6 +201,7 @@ class TelegramFrontend:
         #: Per-token single-flight guards for the background OTP auto-poller.
         self._auto_polling: set[str] = set()
         self._auto_done: set[str] = set()
+        self._auto_extra: set[str] = set()  # tokens already listening for more OTPs
 
     async def on_message(self, update: Any, context: Any = None) -> None:
         """Handle any incoming message and reply with the UI's answer.
@@ -208,9 +273,10 @@ class TelegramFrontend:
             await self._send_notifications(context, reply)
             return
         # Purchase (or any slow step): placeholder now, outcome when done.
+        # Runs on the SLOW pool so a long OTP wait never starves navigation.
         await self._safe_edit(message, reply)
         try:
-            final = await _run_offloop(deferred, user_id)
+            final = await _run_slow(deferred, user_id)
         except Exception as exc:  # never leave the customer staring at a spinner
             log.exception("deferred step failed")
             kind = type(exc).__name__
@@ -256,15 +322,52 @@ class TelegramFrontend:
         already showed; a stale token resolves to nothing and we stop silently.
         """
         try:
-            _terminal, _reply = await _run_offloop(self.router.poll_once, token)
+            _terminal, _reply = await _run_slow(self.router.poll_once, token)
             stored = self.router.terminal_reply(token)
             if stored is not None:
                 await self._safe_edit(message, stored)
+                # The first OTP is delivered; keep listening for ADDITIONAL
+                # codes on the same number during its validity window (multi-OTP).
+                remaining = await _run_slow(self.router.active_valid_remaining, token)
+                if remaining is not None and remaining > 0:
+                    self._schedule_auto_extra(message, token)
             self._auto_done.add(token)
         except Exception as exc:  # noqa: BLE001 - never crash the poller
             log.exception("auto OTP poll failed: %s", exc)
         finally:
             self._auto_polling.discard(token)
+
+    def _schedule_auto_extra(self, message: Any, token: str) -> None:
+        """Start one background listener for extra OTPs on this number."""
+        if token in self._auto_extra:
+            return
+        self._auto_extra.add(token)
+        asyncio.get_running_loop().create_task(self._auto_extra_listener(message, token))
+
+    async def _auto_extra_listener(self, message: Any, token: str) -> None:
+        """Keep checking for newer OTPs until the number expires.
+
+        Sends a fresh message only when a genuinely-new code arrives, so it
+        never edits (and can never clobber) the OTP the manual tap already
+        showed. Stops when the number is no longer valid.
+        """
+        try:
+            while True:
+                remaining = await _run_slow(self.router.active_valid_remaining, token)
+                if remaining is None or remaining <= 0:
+                    return
+                reply = await _run_slow(self.router.poll_new_otp, token)
+                if reply.ok and "New OTP" in reply.text:
+                    try:
+                        await message.reply_text(reply.text, reply_markup=_reply_markup(reply))
+                    except Exception:  # noqa: BLE001
+                        log.warning("could not deliver an extra OTP to %s", token)
+                    return  # one extra delivered; user can tap Check for more
+                await asyncio.sleep(25)
+        except Exception as exc:  # noqa: BLE001 - never crash
+            log.exception("extra OTP listener failed: %s", exc)
+        finally:
+            self._auto_extra.discard(token)
 
     async def on_photo(self, update: Any, context: Any = None) -> None:
         """A photo arrives: payment screenshot, owner's payment QR, or noise.
@@ -297,15 +400,21 @@ class TelegramFrontend:
 
     # -- send/edit plumbing -----------------------------------------------
     async def _deliver_reply(self, message: Any, reply) -> None:
-        """Text reply, or a photo message when the reply carries one (QR)."""
+        """Text reply, or a photo message when the reply carries one (QR).
+
+        A reply that opts into the persistent bottom menu carries the
+        ReplyKeyboardMarkup instead of inline buttons (the two cannot share a
+        message); every other reply keeps its inline keyboard.
+        """
         photo = getattr(reply, "photo", None)
         if photo:
             await message.reply_photo(
-                photo=photo, caption=reply.text[:1024],
-                reply_markup=_reply_markup(reply),
+                photo=photo, caption=reply.text[:1024], reply_markup=_reply_markup(reply),
             )
             return
-        await message.reply_text(reply.text, reply_markup=_reply_markup(reply))
+        markup = _reply_menu_markup() if getattr(reply, "persistent_menu", False) \
+            else _reply_markup(reply)
+        await message.reply_text(reply.text, reply_markup=markup)
 
     async def _send_notifications(self, context: Any, reply) -> None:
         """Deliver any (chat_id, text) notifications a reply carries."""
@@ -361,6 +470,9 @@ def build_from_settings(settings: Settings, router_factory: Any) -> Any:
         support_contact=getattr(settings, "support_contact", ""),
         pay_upi_id=getattr(settings, "pay_upi_id", ""),
     )
+    # Durable refunds: boot the retry worker so any refund left pending by an
+    # earlier crash/redeploy is credited now (idempotent; safe on rebuilds).
+    frontend.router.start_refund_worker()
     # ``concurrent_updates`` is load-bearing for responsiveness.
     #
     # By default python-telegram-bot processes updates SEQUENTIALLY: it awaits

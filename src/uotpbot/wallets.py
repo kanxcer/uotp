@@ -19,6 +19,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -137,6 +138,21 @@ class ScopedWallets(WalletStore):
     def finish_active(self, provider_order_id: str):
         return self._inner.finish_active(provider_order_id)
 
+    def write_refund(self, *, user_id, amount, order_token="", reason="", scope=""):
+        # Refunds are recorded at the platform scope; the credit itself stays
+        # scoped to this bot via ``adjust``, so a sub-bot never loses a refund.
+        return self._inner.write_refund(user_id=user_id, amount=amount,
+                                        order_token=order_token, reason=reason, scope="")
+
+    def get_refund(self, order_token, *, scope=""):
+        return self._inner.get_refund(order_token, scope="")
+
+    def pending_refunds(self, *, scope="", max_attempts: int = 5):
+        return self._inner.pending_refunds(scope="", max_attempts=max_attempts)
+
+    def mark_refund_result(self, refund_id, *, done, error="", scope=""):
+        return self._inner.mark_refund_result(refund_id, done=done, error=error, scope="")
+
     def float_stats(self):
         return self._inner.float_stats(scope=self._scope)
 
@@ -212,6 +228,30 @@ _KV_SCHEMA = """
 CREATE TABLE IF NOT EXISTS {t} (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
+)
+"""
+
+#: Durable refund outbox. A refund is written here BEFORE the wallet credit or
+#: ledger post is attempted, so if that credit ever fails the refund is never
+#: silently lost -- a background worker retries the pending rows (and a redeploy
+#: re-reads them), guaranteeing a customer who was actually refunded gets their
+#: money. One row per order_token (a cancel can only ever refund once).
+_REFUND_SCHEMA = """
+CREATE TABLE IF NOT EXISTS {t} (
+    {pk}
+    scope TEXT NOT NULL DEFAULT '',
+    refund_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    amount_paise INTEGER NOT NULL CHECK (amount_paise > 0),
+    order_token TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'done')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT '',
+    created_ts REAL NOT NULL,
+    done_ts REAL,
+    UNIQUE(scope, order_token)
 )
 """
 
@@ -304,6 +344,28 @@ class ActiveNumber:
         return bool(self.otp)
 
 
+@dataclass(frozen=True, slots=True)
+class RefundRow:
+    """One durable refund-outbox row awaiting (or past) credit.
+
+    A refund is written here before any money moves; if the credit or ledger
+    post fails the row stays 'pending' and a retry worker (or a redeploy)
+    re-attempts until it succeeds, so a confirmed customer refund is never
+    silently lost.
+    """
+
+    id: int
+    refund_id: str
+    user_id: str
+    amount: Money
+    order_token: str
+    reason: str
+    status: str
+    attempts: int
+    last_error: str
+    created_ts: float
+
+
 class SqliteWallets(WalletStore):
     """File-backed store for local/dev runs.
 
@@ -328,6 +390,8 @@ class SqliteWallets(WalletStore):
                 t="activenumbers", pk="id INTEGER PRIMARY KEY AUTOINCREMENT,"))
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_active ON activenumbers(scope, user_id)")
+            self._conn.execute(_REFUND_SCHEMA.format(
+                t="refund_outbox", pk="id INTEGER PRIMARY KEY AUTOINCREMENT,"))
             self._migrate_orders()
             self._conn.commit()
 
@@ -405,6 +469,56 @@ class SqliteWallets(WalletStore):
                 "DELETE FROM activenumbers WHERE provider_order_id = ?",
                 (provider_order_id,),
             )
+
+    # -- refund outbox -----------------------------------------------------
+    def write_refund(self, *, user_id: str, amount: Money, order_token: str = "",
+                     reason: str = "", scope: str = "") -> str:
+        """Durably record a refund before any money moves. Idempotent per order."""
+        refund_id = uuid.uuid4().hex
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO refund_outbox(scope, refund_id, user_id, "
+                " amount_paise, order_token, reason, created_ts) "
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (scope, refund_id, user_id, amount.paise, order_token, reason, time.time()),
+            )
+        return refund_id
+
+    def get_refund(self, order_token: str, *, scope: str = "") -> Optional[RefundRow]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, refund_id, user_id, amount_paise, order_token, reason, status,"
+                " attempts, COALESCE(last_error, ''), created_ts FROM refund_outbox"
+                " WHERE scope = ? AND order_token = ?",
+                (scope, order_token)).fetchone()
+        return self._refund_from(row) if row else None
+
+    def pending_refunds(self, *, scope: str = "", max_attempts: int = 5) -> list[RefundRow]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, refund_id, user_id, amount_paise, order_token, reason, status,"
+                " attempts, COALESCE(last_error, ''), created_ts FROM refund_outbox"
+                " WHERE scope = ? AND status = 'pending' AND attempts < ? ORDER BY id",
+                (scope, max_attempts)).fetchall()
+        return [self._refund_from(r) for r in rows]
+
+    def mark_refund_result(self, refund_id: str, *, done: bool, error: str = "",
+                           scope: str = "") -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE refund_outbox SET status = ?, attempts = attempts + 1,"
+                " last_error = ?, done_ts = ? WHERE scope = ? AND refund_id = ?",
+                ("done" if done else "pending", error,
+                 time.time() if done else None, scope, refund_id),
+            )
+
+    @staticmethod
+    def _refund_from(row) -> RefundRow:
+        return RefundRow(
+            id=row[0], refund_id=row[1], user_id=row[2], amount=Money(row[3]),
+            order_token=row[4], reason=row[5], status=row[6], attempts=row[7],
+            last_error=row[8], created_ts=row[9],
+        )
 
     @staticmethod
     def _active_from(row) -> ActiveNumber:
@@ -628,6 +742,9 @@ class PostgresWallets(WalletStore):
             self._ta = f"{schema}.activenumbers"
             self._conn.execute(_ACTIVE_SCHEMA.format(
                 t=self._ta, pk="id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"))
+            self._tr = f"{schema}.refund_outbox"
+            self._conn.execute(_REFUND_SCHEMA.format(
+                t=self._tr, pk="id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"))
             safe = schema.replace("-", "_").replace('"', "")
             self._conn.execute(
                 f'CREATE INDEX IF NOT EXISTS "idx_active_{safe}" ON {self._ta}(scope, user_id)')
@@ -684,6 +801,55 @@ class PostgresWallets(WalletStore):
                 f"DELETE FROM {self._ta} WHERE provider_order_id = %s",
                 (provider_order_id,),
             )
+
+    # -- refund outbox -----------------------------------------------------
+    def write_refund(self, *, user_id: str, amount: Money, order_token: str = "",
+                     reason: str = "", scope: str = "") -> str:
+        refund_id = uuid.uuid4().hex
+        with self._lock:
+            self._conn.execute(
+                f"INSERT INTO {self._tr}(scope, refund_id, user_id, amount_paise,"
+                f" order_token, reason, created_ts) VALUES (%s, %s, %s, %s, %s, %s, %s)"
+                " ON CONFLICT(scope, order_token) DO NOTHING",
+                (scope, refund_id, user_id, amount.paise, order_token, reason, time.time()),
+            )
+        return refund_id
+
+    def get_refund(self, order_token: str, *, scope: str = "") -> Optional[RefundRow]:
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT id, refund_id, user_id, amount_paise, order_token, reason, status,"
+                f" attempts, COALESCE(last_error, ''), created_ts FROM {self._tr}"
+                " WHERE scope = %s AND order_token = %s",
+                (scope, order_token)).fetchone()
+        return self._refund_from(row) if row else None
+
+    def pending_refunds(self, *, scope: str = "", max_attempts: int = 5) -> list[RefundRow]:
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT id, refund_id, user_id, amount_paise, order_token, reason, status,"
+                f" attempts, COALESCE(last_error, ''), created_ts FROM {self._tr}"
+                " WHERE scope = %s AND status = 'pending' AND attempts < %s ORDER BY id",
+                (scope, max_attempts)).fetchall()
+        return [self._refund_from(r) for r in rows]
+
+    def mark_refund_result(self, refund_id: str, *, done: bool, error: str = "",
+                           scope: str = "") -> None:
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE {self._tr} SET status = %s, attempts = attempts + 1,"
+                f" last_error = %s, done_ts = %s WHERE scope = %s AND refund_id = %s",
+                ("done" if done else "pending", error,
+                 time.time() if done else None, scope, refund_id),
+            )
+
+    @staticmethod
+    def _refund_from(row) -> RefundRow:
+        return RefundRow(
+            id=row[0], refund_id=row[1], user_id=row[2], amount=Money(row[3]),
+            order_token=row[4], reason=row[5], status=row[6], attempts=row[7],
+            last_error=row[8], created_ts=row[9],
+        )
 
     @staticmethod
     def _active_from(row) -> ActiveNumber:
