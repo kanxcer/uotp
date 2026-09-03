@@ -30,7 +30,7 @@ OWNER, USER = "1", "2"
 
 # ------------------------------------------------------------- uotp provider
 def _fake_opener(*bodies):
-    from test_provider import FakeOpener
+    from tests.test_provider import FakeOpener
 
     return FakeOpener(*bodies)
 
