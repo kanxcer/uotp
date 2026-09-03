@@ -15,12 +15,14 @@ import uuid
 from typing import Optional
 
 from ..catalog import Catalog
+from ..cancel_tracker import CancelTracker
 from ..createbot import CreateBotFlow, CreateBotResult
 from ..economics import EconomicsError
 from ..engine import BotEngine
 from ..ledger import Ledger
 from ..money import INR, Money
 from ..pricing import Pricer
+from ..ratelimit import RateLimitConfig, RateLimiter
 from ..whitelabel import PlatformFee, SubBotRegistry
 
 __all__ = ["CommandRouter", "HELP_TEXT"]
@@ -95,6 +97,7 @@ class CommandRouter:
         subbots: Optional[SubBotRegistry] = None,
         platform_fee: Optional[PlatformFee] = None,
         maintenance_fn: Optional[Callable[[], bool]] = None,
+        rate_limit: Optional[RateLimitConfig] = None,
     ) -> None:
         self.engine = engine
         # Owner panel sets this to pause buying during provider incidents:
@@ -131,8 +134,29 @@ class CommandRouter:
         #: order, so a background auto-poller only ever edits with a real
         #: outcome and never overwrites an OTP a manual tap already delivered.
         self._terminal: dict[str, object] = {}
+        #: Per-user buy rate limiter (anti-spam / anti-burn). Floats on the
+        #: wallet store's KV so the window survives a redeploy.
+        self._rate_limiter = RateLimiter(
+            rate_limit or RateLimitConfig(), store=wallets,
+        )
+        #: Owner's copy so the transport can exempt its own account.
+        for _uid in (owner_id,) if owner_id else ():
+            self._rate_limiter.set_user_override(_uid)
+        #: EARLY_CANCEL_DENIED hidden-cost tracker (feed burn rate + owner report).
+        self._cancel_tracker = CancelTracker()
 
     # -- helpers ---------------------------------------------------------
+    def phase1_snapshot(self) -> dict:
+        """Subsystem stats for /metrics (Phase 1: P3 rate limiter, P4 tracker)."""
+        try:
+            cancel = self._cancel_tracker.summary()
+            rate = self._rate_limiter.stats()
+        except Exception as exc:  # noqa: BLE001 - metrics must never break
+            return {"phase1_error": str(exc)}
+        return {
+            "cancel_denied": cancel,
+            "rate_limiter": rate,
+        }
     def balance_of(self, user_id: str) -> Money:
         if self.wallets is not None:
             return self.wallets.balance(user_id)
@@ -161,6 +185,26 @@ class CommandRouter:
 
     def _is_owner(self, user_id: str) -> bool:
         return bool(self.owner_id) and user_id == self.owner_id
+
+    @staticmethod
+    def _retryable(reason: str) -> bool:
+        """Whether a failed buy is worth a one-tap retry.
+
+        No-stock / per-operator rejections are transient: a Retry makes a fresh
+        allocation without re-navigating. Administrative failures (maintenance,
+        auth, config) are NOT retryable and the customer should not be nudged to
+        hammer them.
+        """
+        low = (reason or "").lower()
+        return any(
+            frag in low for frag in
+            ("no stock", "bad_service", "bad_operator", "no number", "no_numbers")
+        )
+
+    @staticmethod
+    def _retry_row(slug: str, server: str = "") -> tuple[tuple[str, str], ...]:
+        """The Retry inline button (row) for a refunded buy."""
+        return (("🔄 Retry", f"ry:{slug}:{server}"),)
 
     # -- dispatch --------------------------------------------------------
     def handle(self, user_id: str, text: str) -> Reply:
@@ -198,6 +242,8 @@ class CommandRouter:
             "status": self.cmd_status,
             # Owner/admin commands.
             "metrics": self.cmd_metrics,
+            "admin": self.cmd_admin,
+            "sunkcost": self.cmd_sunkcost,
             "provider": self.cmd_provider,
             "credit": self.cmd_credit,
             "debit": self.cmd_debit,
@@ -281,7 +327,8 @@ class CommandRouter:
             return Reply("Usage: /buy <service>", ok=False)
         return self.purchase(user_id, args[0])
 
-    def purchase(self, user_id: str, slug: str, *, server: str = "") -> Reply:
+    def purchase(self, user_id: str, slug: str, *, server: str = "",
+                 retry: bool = False) -> Reply:
         """THE money path -- /buy and every ✅ Buy tap both end up here.
 
         Single entry point on purpose: wallet guard, debit, fulfilment,
@@ -290,6 +337,16 @@ class CommandRouter:
         """
         if not self.catalog.has(slug):
             return Reply(f"Unknown service {slug!r}. Try /list.", ok=False)
+
+        # Phase-1 per-user buy throttle: a spammy user burns provider calls and
+        # credit for nothing. Owner operators are exempt. A Retry-button press
+        # is excluded: the failed attempt was refunded, so it is a second
+        # chance, not a spam pattern.
+        if not retry:
+            allowed, why = self._rate_limiter.check(user_id)
+            if not allowed:
+                return Reply(why, ok=False)
+            self._rate_limiter.record(user_id)
 
         if (self.maintenance_fn and self.maintenance_fn()
                 and not self._is_owner(user_id)):
@@ -319,6 +376,7 @@ class CommandRouter:
             )
 
         # Debit first: if the purchase then fails, the refund path restores it.
+        self._rate_limiter.record(user_id)
         self._debit(user_id, price)
         result = self.engine.fulfil(user_id, slug, gross_price=price,
                                     server=server or None)
@@ -334,14 +392,20 @@ class CommandRouter:
             self.credit(user_id, result.refunded)
         reason = getattr(result, "message", "") or ""
         detail = f"\n\nWhy: {reason}" if reason else ""
+        rows = ()
+        # A no-stock / operator rejection is transient: offer a one-tap Retry
+        # rather than making the customer re-navigate to the service.
+        if self._retryable(reason):
+            rows = (self._retry_row(slug, server), (("🏠 Menu", "m"),))
         return Reply(
             f"⚠️ Couldn't deliver {slug}. Refunded {result.refunded} in full; "
             f"balance {self.balance_of(user_id)}.{detail}",
             ok=False,
+            rows=rows,
         )
 
     def alloc_and_wait(
-        self, user_id: str, slug: str, *, server: str = ""
+        self, user_id: str, slug: str, *, server: str = "", retry: bool = False
     ) -> Reply:
         """Validate, debit, allocate a number, and start waiting for its OTP.
 
@@ -349,9 +413,22 @@ class CommandRouter:
         can request the OTP on the target service, and (b) carries an
         ``await_token`` so the transport can re-invoke :meth:`check_otp` on
         demand. If the number cannot be allocated the customer is refunded.
+
+        ``retry=True`` marks a Retry-button press on a refunded no-stock/operator
+        failure, so the per-user buy throttle is not applied to the customer's
+        second chance (the failed attempt already spent a window slot and was
+        refunded).
         """
         if not self.catalog.has(slug):
             return Reply(f"Unknown service {slug!r}. Try /list.", ok=False)
+
+        # Phase-1 per-user buy throttle: a spammy user burns provider calls and
+        # credit for nothing. Owner/white-label operators are exempt.
+        if not retry:
+            allowed, why = self._rate_limiter.check(user_id)
+            if not allowed:
+                return Reply(why, ok=False)
+            self._rate_limiter.record(user_id)
 
         if (self.maintenance_fn and self.maintenance_fn()
                 and not self._is_owner(user_id)):
@@ -489,6 +566,15 @@ class CommandRouter:
                 released = False
                 refused = str(exc)
         if not released:
+            # Phase-4: this refusal leaves a live, chargeable number. Record the
+            # sunk cost so it feeds the burn model and the owner's /metrics.
+            cost = 0
+            if result is not None and result.order is not None:
+                cost = result.order.gross_price.paise
+            self._cancel_tracker.record_denied(
+                service=slug or "", server=provider_id.split("|")[-1] if provider_id else "",
+                order_id=provider_id, cost_paise=cost,
+            )
             return Reply(
                 "♻️ The provider won't release this number yet — a fresh "
                 "activation must wait out its window before it can be cancelled "
@@ -810,6 +896,19 @@ class CommandRouter:
             lines.append(f"🎯 Target margin: {pinfo:.0%}" if hasattr(pinfo, "__truediv__") else f"🎯 Target margin: {pinfo}")
         return Reply("\n".join(lines))
 
+    def cmd_admin(self, user_id: str, args: list[str]) -> Reply:
+        """📊 Owner panel. Opens the same panel as the ⚙️ Owner button."""
+        if not self._is_owner(user_id):
+            return Reply("Owner only.", ok=False, buttons=(("🏠 Menu", "m"),))
+        from .ui import MenuUI  # local: avoids an import cycle at module level
+        return MenuUI(self).admin_panel(user_id)
+
+    def cmd_sunkcost(self, user_id: str, args: list[str]) -> Reply:
+        """🕳 Hidden cost of EARLY_CANCEL_DENIED refusals (Phase-1 P4)."""
+        if not self._is_owner(user_id):
+            return Reply("Owner only.", ok=False)
+        return Reply(self._cancel_tracker.report())
+
     def cmd_provider(self, user_id: str, args: list[str]) -> Reply:
         """🏦 Supplier wallet + which operator/pool the rail is using."""
         if not self._is_owner(user_id):
@@ -964,19 +1063,31 @@ class CommandRouter:
         )
 
     def cmd_setmargin(self, user_id: str, args: list[str]) -> Reply:
-        """🎯 /setmargin <fraction> — set the live pricing margin (0.35 = 35%)."""
+        """🎯 /setmargin <fraction> — set the live pricing margin (0.35 = 35%).
+
+        In the deployed ``exact_markup`` strategy the owner's lever is the
+        markup, not the margin, so this command sets the markup rate (0.45 =
+        45% price = cost x 1.45). In the legacy ``target_margin`` strategy it
+        sets the margin as before.
+        """
         if not self._is_owner(user_id):
             return Reply("Owner only.", ok=False)
+        markup_mode = getattr(self.pricer, "strategy", None) is not None \
+            and str(self.pricer.strategy.value) == "exact_markup"
         if not args:
-            cur = getattr(self.pricer, "target_margin", None)
-            return Reply(f"Current target margin: {cur}" if cur else "Margin unavailable.")
+            if markup_mode:
+                return Reply(f"Current markup: {getattr(self.pricer, 'markup', '?')}")
+            return Reply(f"Current target margin: {getattr(self.pricer, 'target_margin', '?')}")
         try:
             from decimal import Decimal
             new = Decimal(args[0])
         except Exception:  # noqa: BLE001
-            return Reply("Bad margin. Use a fraction, e.g. 0.35 (35%).", ok=False)
+            return Reply("Bad value. Use a fraction, e.g. 0.45 (45% markup).", ok=False)
         if not (0 < new <= 2):
-            return Reply("Margin must be between 0 and 2 (e.g. 0.35).", ok=False)
+            return Reply("Value must be between 0 and 2 (e.g. 0.45).", ok=False)
+        if markup_mode:
+            setattr(self.pricer, "markup", new)
+            return Reply(f"🎯 Markup set to {new} — prices are now cost x {1 + new}.")
         setattr(self.pricer, "target_margin", new)
         return Reply(f"🎯 Target margin set to {new} ({new:.0%}).")
 

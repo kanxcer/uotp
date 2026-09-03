@@ -335,3 +335,65 @@ def test_admin_setmargin(rig):
     router, _, _ = rig
     r = router.handle(OWNER, "/setmargin 0.4")
     assert r.ok and "0.4" in r.text
+
+
+# -- Phase-1 (TITAN v2.0) ------------------------------------------------
+def test_rate_limit_gates_buys(rig):
+    """A user above the buy budget is throttled with a friendly message."""
+    from uotpbot.ratelimit import RateLimitConfig
+    router, provider, ledger = rig
+    # Rebuild with a tight budget for the test.
+    router = CommandRouter(router.engine, router.catalog, router.pricer,
+                           router.ledger, owner_id=OWNER,
+                           allowed_users=(OWNER, USER),
+                           rate_limit=RateLimitConfig(max_buys=1, window_seconds=60,
+                                                      cooldown_seconds=0))
+    router.credit(USER, INR(5000))
+    r = router.handle(USER, "/buy telegram 1")
+    assert r.ok
+    r2 = router.handle(USER, "/buy telegram 1")
+    assert not r2.ok and "wait" in r2.text.lower()
+
+
+def test_sunkcost_command_owner_only(rig):
+    router, _, _ = rig
+    assert "Owner only" in router.handle(USER, "/sunkcost").text
+    r = router.handle(OWNER, "/sunkcost")
+    assert r.ok and "EARLY_CANCEL_DENIED" in r.text
+
+
+def test_phase1_snapshot_shape(rig):
+    router, _, _ = rig
+    snap = router.phase1_snapshot()
+    assert "cancel_denied" in snap and "rate_limiter" in snap
+    assert "tracked_users" in snap["rate_limiter"]
+
+
+# -- Retry button + /admin -----------------------------------------------
+def test_no_stock_failure_offers_retry(rig):
+    """A no-stock / BAD_SERVICE buy failure must carry a 🔄 Retry button."""
+    from uotpbot.provider.base import NumberUnavailable
+    router, provider, _ = rig
+    router.credit(USER, INR(5000))
+    # Force the provider to say there is no stock for 'binance'.
+    original = provider.buy_number
+
+    def no_stock(*a, **k):
+        raise NumberUnavailable("no stock for binance (BAD_SERVICE)")
+
+    provider.buy_number = no_stock  # type: ignore[assignment]
+    try:
+        r = router.purchase(USER, "binance")
+    finally:
+        provider.buy_number = original
+    assert not r.ok and "Retry" in r.text or any(
+        "Retry" in (lbl) for row in r.rows for lbl, _ in row
+    )
+
+
+def test_admin_command_opens_panel(rig):
+    router, _, _ = rig
+    r = router.handle(USER, "/admin")
+    assert "Owner only" in r.text
+    r = router.handle(OWNER, "/admin")
+    assert r.ok and "Owner panel" in r.text

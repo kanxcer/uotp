@@ -36,6 +36,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Optional, Sequence
 
+from ..adaptive import AdaptivePollConfig, adaptive_poll_interval
 from ..catalog import PROVIDER_VALIDITY_MINUTES
 from ..money import Money, quantize_money
 from .base import (
@@ -508,15 +509,16 @@ class UotpProvider:
         # ``operator`` is REQUIRED (BAD_OPERATOR without it, verified live).
         # Operator ids are stock pools; a "no stock" answer on one says
         # nothing about the others, so one tap may try several. Ordered by
-        # the harvested per-service price table, cheapest first; an explicit
-        # config override is tried ahead of the list. CRITICAL: the walk
-        # stops on PurchaseTimedOut -- a timed-out request may already hold
-        # the charge, and trying the next operator could buy two numbers.
-        ops = list(self._handler_ops.get(slug.lower(), []))
-        if c.operator:
-            ops = [c.operator] + [o for o in ops if o != c.operator]
-        if not ops:
-            ops = list(c.operator_order)
+        # the harvested per-service price table, cheapest first, then the
+        # generic operator_order to close any gap a partial/stale harvest
+        # leaves -- otherwise a service whose real stock sits on a pool the
+        # harvest missed is wrongly declared out of stock. An explicit config
+        # override is tried ahead of both. CRITICAL: the walk stops on
+        # PurchaseTimedOut -- a timed-out request may already hold the charge,
+        # and trying the next operator could buy two numbers.
+        ops = list(dict.fromkeys(
+            [*self._handler_ops.get(slug.lower(), []), *c.operator_order]
+        ))
         if c.operator and c.operator not in ops:
             ops.insert(0, c.operator)
 
@@ -627,12 +629,18 @@ class UotpProvider:
         timeout_seconds: float = 290.0,
         poll_interval: float = 3.0,
         expect: Optional[str] = None,
+        adaptive: bool = False,
     ) -> OtpResult:
         """Poll ``getStatus`` until a code arrives, the number is canceled, or
         the lease expires.
 
         Returns early on ``STATUS_CANCEL`` -- the number is dead and continuing
         to poll would waste the remaining window while forfeiting the refund.
+
+        With ``adaptive=True`` the interval between polls grows as the order
+        ages and as consecutive empty answers pile up (see
+        :mod:`uotpbot.adaptive`), instead of hammering the provider at a fixed
+        3s the whole window.
         """
         if poll_interval <= 0:
             raise ValueError("poll_interval must be positive")
@@ -640,7 +648,9 @@ class UotpProvider:
         activation = allocation.order_id.split("|")[0]
         budget = min(timeout_seconds, max(allocation.seconds_left(), 0.0))
         deadline = time.monotonic() + budget
+        adapt_cfg = AdaptivePollConfig() if adaptive else None
         attempts = 0
+        consecutive_waits = 0
         started = time.monotonic()
         while True:
             attempts += 1
@@ -662,9 +672,21 @@ class UotpProvider:
                         )
                 if parsed.status == c.canceled_prefix:
                     return OtpResult(None, None, attempts, time.monotonic() - started, True)
+            # Reaching here = a waiting (or transient-failed) answer; count it.
+            consecutive_waits += 1
             if time.monotonic() >= deadline:
                 return OtpResult(None, None, attempts, time.monotonic() - started, True)
-            time.sleep(min(poll_interval, max(deadline - time.monotonic(), 0.1)))
+            # Adaptive backoff: as the order ages and empty answers pile up the
+            # gap grows, so a 20-active-order deployment is not ~7 req/s at a
+            # fixed 3s for the whole window.
+            interval = poll_interval
+            if adaptive:
+                elapsed = time.monotonic() - started
+                interval = adaptive_poll_interval(
+                    age_seconds=elapsed, consecutive_waits=consecutive_waits,
+                    config=adapt_cfg,
+                )
+            time.sleep(min(interval, max(deadline - time.monotonic(), 0.1)))
 
     def cancel_strict(self, order_id: str) -> Money:
         """Release an activation and propagate failure to the caller.

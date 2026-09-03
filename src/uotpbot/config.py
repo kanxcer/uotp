@@ -87,6 +87,14 @@ def _bool(name: str, default: bool) -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+def _int(name: str, default: int) -> int:
+    raw = _get(name, str(default))
+    try:
+        return int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{name}={raw!r} is not a valid integer") from exc
+
+
 @dataclass(slots=True)
 class Settings:
     """Everything the bot needs to start."""
@@ -128,6 +136,13 @@ class Settings:
     #: strategy). 0.10 = you keep ~10% of each sale after every cost. Deliberately
     #: an env var: this is a business decision, not a code constant.
     pricing_target_margin: Decimal = Decimal("0.35")
+    #: How the shelf price is derived from cost. "exact_markup" (default) sets
+    #: price = actual per-number cost x (1 + pricing_markup_rate), exactly, on
+    #: every service and server; "target_margin" keeps the old margin model.
+    #: This is a business decision, so it's an env var, not a code constant.
+    pricing_strategy: str = "exact_markup"
+    #: Markup for "exact_markup" (0.45 => a Rs.10 service sells at Rs.14.50).
+    pricing_markup_rate: Decimal = Decimal("0.45")
     #: Who customers contact to add money to their wallet (e.g. "@you" or a
     #: link). Shown on the balance screen; empty falls back to "the bot owner".
     support_contact: str = ""
@@ -135,6 +150,13 @@ class Settings:
     #: Add Money screen. The visual QR is set by the owner from inside the bot
     #: (📊 Owner panel → 🖼 Payment QR) so it survives redeploys.
     pay_upi_id: str = ""
+    #: Phase-1 per-user buy rate limiter: max buys within ``rate_limit_window``
+    #: seconds before a user is throttled. Anti-spam, protects provider calls.
+    rate_limit_max_buys: int = 3
+    #: Size of the rate-limit window in seconds.
+    rate_limit_window: int = 30
+    #: How often the provider-wallet monitor (P2) polls the balance, in seconds.
+    wallet_monitor_seconds: int = 120
 
     @property
     def has_telegram(self) -> bool:
@@ -202,6 +224,7 @@ def from_environment(env_file: Optional[Path | str] = None) -> Settings:
         poll_interval=float(_get("ENGINE_POLL_INTERVAL", "3")),
         auto_refund=_bool("ENGINE_AUTO_REFUND", True),
         auto_poll_otp=_bool("ENGINE_AUTO_POLL_OTP", True),
+        poll_mode=_get("ENGINE_POLL_MODE", "adaptive"),
         topup_headroom=_decimal("ENGINE_TOPUP_HEADROOM", "5"),
         default_country=_get("ENGINE_DEFAULT_COUNTRY", "22")  # uotp.store handler_api: India,
     )
@@ -224,8 +247,13 @@ def from_environment(env_file: Optional[Path | str] = None) -> Settings:
         whitelabel_enabled=_bool("WHITELABEL_ENABLED", False),
         platform_fee_rate=_fee_rate(_get("PLATFORM_FEE_RATE", "0.05")),
         pricing_target_margin=_fraction("PRICING_TARGET_MARGIN", "0.35"),
+        pricing_strategy=_get("PRICING_STRATEGY", "exact_markup"),
+        pricing_markup_rate=_decimal("PRICING_MARKUP_RATE", "0.45"),
         support_contact=_get("SUPPORT_CONTACT", ""),
         pay_upi_id=_get("PAY_UPI_ID", ""),
+        rate_limit_max_buys=_int("RATE_LIMIT_MAX_BUYS", 3),
+        rate_limit_window=_int("RATE_LIMIT_WINDOW", 30),
+        wallet_monitor_seconds=_int("WALLET_MONITOR_SECONDS", 120),
     )
 
 

@@ -50,6 +50,10 @@ class EngineConfig:
     #: Top the provider wallet up to this multiple of the order price when it
     #: runs dry, so a single order is never blocked by a Rs.2 shortfall.
     topup_headroom: Decimal = Decimal("5")
+    #: "adaptive" (default) grows the poll gap as an order ages and waits pile
+    #: up, cutting provider load under concurrency; "fixed" keeps the old
+    #: constant ENGINE_POLL_INTERVAL.
+    poll_mode: str = "adaptive"
     #: Country code in the provider's vocabulary. On uotp.store's dashboard
     #: API India is code "22" (dial 91); the old sms-activate-style "in"
     #: returns BAD_COUNTRY through the legacy handler.
@@ -378,6 +382,7 @@ class BotEngine:
                 alloc,
                 timeout_seconds=self.config.otp_timeout_seconds,
                 poll_interval=self.config.poll_interval,
+                adaptive=str(self.config.poll_mode).lower() == "adaptive",
             )
             if otp.success and otp.code:
                 order.otp = otp.code
@@ -541,10 +546,12 @@ class BotEngine:
         remaining: float, auto_refund: bool,
     ) -> FulfilResult:
         """Shared body for poll_otp / resume_otp."""
+        adaptive = str(self.config.poll_mode).lower() == "adaptive"
         otp = self.provider.wait_for_otp(
             alloc,
             timeout_seconds=remaining,
             poll_interval=self.config.poll_interval,
+            adaptive=adaptive,
         )
         if otp.success and otp.code:
             order.otp = otp.code

@@ -280,7 +280,7 @@ def test_zero_priced_number_books_sticker_not_zero(stack):
             return []
 
         def wait_for_otp(self, allocation, *, timeout_seconds=290.0,
-                         poll_interval=3.0, expect=None):
+                         poll_interval=3.0, expect=None, adaptive=False):
             from uotpbot.provider.base import OtpResult
             from uotpbot.provider.base import SmsMessage
             return OtpResult(

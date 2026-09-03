@@ -212,3 +212,43 @@ def test_slug_lookup_is_forgiving():
     assert catalog.get("Google").slug == "google"
     assert catalog.get(" IRCTC ").slug == "irctc"
     assert "paytm" in catalog
+
+
+# ------------------------------------------------------------------ exact markup
+def test_exact_markup_is_cost_x_dot_45():
+    """The owner's 45% rule: Rs.10 -> Rs.14.50, Rs.22 -> Rs.31.90, EXACTLY."""
+    pricer = Pricer(cat(), strategy=Strategy.EXACT_MARKUP, markup=rate("0.45"))
+    adv = pricer.price(cat().get("telegram"))  # list_price 10
+    assert adv.gross_price == INR("14.50")
+    adv2 = pricer.price(cat().get("binance"))  # list_price 22
+    assert adv2.gross_price == INR("31.90")
+
+
+def test_exact_markup_does_not_snap_to_a_rung():
+    """Exact markup must NOT snap 14.50 to the ladder rung 15."""
+    pricer = Pricer(cat(), strategy=Strategy.EXACT_MARKUP, markup=rate("0.45"))
+    adv = pricer.price(cat().get("telegram"))
+    assert adv.gross_price == INR("14.50")
+    assert adv.reason.startswith("strategy=exact_markup")
+
+
+def test_exact_markup_uses_list_price_not_amortized_cost():
+    """Even a high-retry service is priced off its real per-number charge, so
+    the 1.45x is on the website/actual cost, not an inflated delivery cost."""
+    high = ServiceCost("t", "T", "m", INR(10),
+                       Decimal("0.40"), Decimal("0.50"), Decimal("0.40"))
+    pricer = Pricer(Catalog({"t": high}), strategy=Strategy.EXACT_MARKUP,
+                    markup=rate("0.45"))
+    adv = pricer.price(high)
+    assert adv.gross_price == INR("14.50")
+
+
+def test_exact_markup_per_server():
+    """A server's own price (list_price override) is the base, so each server
+    is marked up individually."""
+    from uotpbot.catalog import ServerOption
+    c = cat()
+    over = c.get("telegram").with_overrides(list_price=INR(20), server="8")
+    pricer = Pricer(cat(), strategy=Strategy.EXACT_MARKUP, markup=rate("0.45"))
+    adv = pricer.price(over, sticker=INR(20))
+    assert adv.gross_price == INR("29.00")

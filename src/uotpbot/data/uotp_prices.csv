@@ -26,9 +26,9 @@ facebook,Facebook,social,10.00,0.88,0.07,0.90,3
 hpgas,HP Gas,other,10.00,0.88,0.07,0.90,2
 flipkart,Flipkart,shopping,10.00,0.88,0.07,0.90,5
 91club,91Club,betting,10.00,0.88,0.07,0.90,7
-swarail,Swarail (RailOne),other,10.00,0.88,0.07,0.90,11
+swarail,Swarail (RailOne),other,11.00,0.88,0.07,0.90,11
 kamaikendra,Kamai Kendra,other,10.00,0.88,0.07,0.90,3
-flipkartold,Flipkart Old,shopping,10.00,0.88,0.07,0.90,11
+flipkartold,Flipkart Old,shopping,12.00,0.88,0.07,0.90,11
 jiomart,JioMart,shopping,10.00,0.88,0.07,0.90,11
 ajio,AJIO,shopping,10.00,0.88,0.07,0.90,4
 acko,Acko,other,10.00,0.88,0.07,0.90,7
@@ -379,7 +379,7 @@ mbet,Mbet,other,10.00,0.88,0.07,0.90,11
 vfs,VFS,other,10.00,0.88,0.07,0.90,7
 amway,Amway,other,10.00,0.88,0.07,0.90,3
 drivebison,drivebison,other,10.00,0.88,0.07,0.90,5
-phonepe,phonepe,payments,10.00,0.88,0.07,0.90,11
+phonepe,phonepe,payments,16.00,0.88,0.07,0.90,11
 rummyclubb,rummy club-1,betting,10.00,0.88,0.07,0.90,3
 zillybuy,Zilly Buy,other,10.00,0.88,0.07,0.90,3
 okmm,Okmm.com,other,10.00,0.88,0.07,0.90,2
@@ -578,7 +578,7 @@ jumpp,jumpp,other,10.00,0.88,0.07,0.90,11
 hercules,Hercules,other,10.00,0.88,0.07,0.90,5
 vymo,vymo,other,10.00,0.88,0.07,0.90,11
 pronto,pronto,other,10.00,0.88,0.07,0.90,3
-jio,My jio,other,10.00,0.88,0.07,0.90,11
+jio,My jio,other,13.00,0.88,0.07,0.90,11
 smc,smc,other,10.00,0.88,0.07,0.90,7
 moneybazar,moneybazar,other,10.00,0.88,0.07,0.90,5
 billcut,Billcut,other,10.00,0.88,0.07,0.90,3
@@ -718,7 +718,7 @@ vmm,vmm,other,10.00,0.88,0.07,0.90,11
 ons,ons,other,10.00,0.88,0.07,0.90,4
 myhq,myhq,other,10.00,0.88,0.07,0.90,3
 blinkrloan,blinkrloan,other,10.00,0.88,0.07,0.90,5
-bjp,BJP SARAL,other,10.00,0.88,0.07,0.90,11
+bjp,BJP SARAL,other,13.00,0.88,0.07,0.90,11
 icicidirect,icicidirect,payments,10.00,0.88,0.07,0.90,3
 goplay11,goplay11,gaming,10.00,0.88,0.07,0.90,4
 360game,360game,other,10.00,0.88,0.07,0.90,3
@@ -1032,18 +1032,18 @@ creditmantri,Creditmantri,other,9.91,0.88,0.07,0.90,8
 indiapolls,Indiapolls,other,9.91,0.88,0.07,0.90,8
 magicbricks,Magicbricks,other,9.28,0.88,0.07,0.90,8
 uber,Uber,travel,9.00,0.88,0.07,0.90,8
-pvr,Pvr,other,9.00,0.88,0.07,0.90,12
+pvr,Pvr,other,10.00,0.88,0.07,0.90,12
 paytm,Paytm,payments,8.57,0.88,0.07,0.90,8
 orientfame,Oriflame,other,8.57,0.88,0.07,0.90,8
 paypal,PayPal,payments,8.57,0.88,0.07,0.90,8
 playkaro,playkaro,other,8.57,0.88,0.07,0.90,8
 spincrush,Spincrush,other,8.57,0.88,0.07,0.90,8
 wingo,WIngo,betting,8.57,0.88,0.07,0.90,8
-rrp,RRP,other,8.00,0.88,0.07,0.90,11
-cisplt,Cisplt,other,8.00,0.88,0.07,0.90,11
+rrp,RRP,other,10.00,0.88,0.07,0.90,11
+cisplt,Cisplt,other,10.00,0.88,0.07,0.90,11
 yonorose,yonorose,other,8.00,0.88,0.07,0.90,11
 amarujala,Amarujala,other,8.00,0.88,0.07,0.90,11
-digicredit,Digi Credit,other,7.70,0.88,0.07,0.90,12
+digicredit,Digi Credit,other,10.00,0.88,0.07,0.90,12
 teenpattigame,teenpattigame,betting,7.20,0.88,0.07,0.90,5
 trutzee,Trutzee,other,7.20,0.88,0.07,0.90,5
 sajjalcash,Sajjal Cash,other,7.20,0.88,0.07,0.90,3

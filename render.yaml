@@ -75,5 +75,17 @@ services:
         value: "0"
       - key: FEE_GST_RATE
         value: "0"
+      - key: PRICING_STRATEGY
+        value: "exact_markup"
+      - key: PRICING_MARKUP_RATE
+        value: "0.45"
       - key: ENGINE_RETRY_CAP
         value: "3"
+      - key: ENGINE_POLL_MODE
+        value: "adaptive"
+      - key: RATE_LIMIT_MAX_BUYS
+        value: "3"
+      - key: RATE_LIMIT_WINDOW
+        value: "30"
+      - key: WALLET_MONITOR_SECONDS
+        value: "120"

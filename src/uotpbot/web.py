@@ -79,11 +79,17 @@ class HealthServer:
         poller: Optional[Callable[[], None]] = None,
         cache_seconds: float = 30.0,
         subbots: Optional[Any] = None,
+        wallet_monitor: Optional[Any] = None,
+        subsystem_stats: Optional[Callable[[], dict]] = None,
     ) -> None:
         self.engine = engine
         self.ledger = ledger
         self.port = port if port is not None else int(os.environ.get(PORT_ENV, DEFAULT_PORT))
         self._poller = poller
+        #: Phase-1 provider wallet monitor (P2), for /readyz + /metrics.
+        self._wallet_monitor = wallet_monitor
+        #: Phase-1 subsystem stats (rate limiter, cancel tracker) from the router.
+        self._subsystem_stats = subsystem_stats
         #: White-label sub-bot manager. Reported by /readyz and /metrics but
         #: deliberately never allowed to flip readiness: one sub-bot with a
         #: revoked token must not cause the platform to restart this process
@@ -167,6 +173,14 @@ class HealthServer:
         health = self.subbot_health()
         if health is not None:
             body["subbots"] = health
+        # Phase-1 subsystem stats.
+        if self._wallet_monitor is not None:
+            body["provider_wallet"] = self._wallet_monitor.state()
+        if self._subsystem_stats is not None:
+            try:
+                body["phase1"] = self._subsystem_stats()
+            except Exception as exc:  # noqa: BLE001 - metrics never break
+                body["phase1"] = {"error": str(exc)}
         return 200, body
 
     # -- HTTP ------------------------------------------------------------

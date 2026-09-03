@@ -182,6 +182,9 @@ class MenuUI:
         if low in ("/start", "/help"):
             self._wizard.pop(user_id, None)
             return self.main_menu(user_id)
+        if low in ("/admin", "/owner", "/panel"):
+            self._wizard.pop(user_id, None)
+            return self.admin_panel(user_id)
         flow = self.router._createbot_flow  # pending-token funnel lives there
         if flow is not None and flow.pending(user_id) and not body.startswith("/"):
             return self.router.handle(user_id, body)
@@ -879,6 +882,12 @@ class MenuUI:
         if kind == "y" and len(parts) >= 2:
             server = parts[2] if len(parts) == 3 else ""
             return self._begin_purchase(user_id, parts[1], server)
+        if kind == "ry" and len(parts) >= 2:
+            # 🔄 Retry on a refunded no-stock / operator failure. Bypasses the
+            # per-user buy throttle (the customer's first attempt already spent
+            # a slot and was refunded) and re-runs the same money path.
+            server = parts[2] if len(parts) == 3 else ""
+            return self._begin_purchase(user_id, parts[1], server, retry=True)
         if kind in ("co", "rs", "cx") and len(parts) == 2:
             token = parts[1]
             owner = self.router.active_owner(token)
@@ -897,13 +906,17 @@ class MenuUI:
                      rows=((("🏠 Menu", "m"),),))
 
     # -- purchase --------------------------------------------------------
-    def _begin_purchase(self, user_id: str, slug: str, server: str = "") -> Reply:
+    def _begin_purchase(self, user_id: str, slug: str, server: str = "",
+                        retry: bool = False) -> Reply:
         """Answer the ✅ Buy tap instantly; the real work runs deferred.
 
         ``deferred`` is the transport's contract: edit the placeholder,
         run this callable off the event loop, edit the message again with
         its Reply. Spending happens inside ``router.purchase`` -- the one
         and only money path -- never re-implemented here.
+
+        ``retry=True`` is the 🔄 Retry press on a refunded no-stock/operator
+        failure; it re-runs the same flow without the per-user buy throttle.
         """
         if not self.catalog.has(slug):
             return Reply("That service just left the catalogue. Refreshed list:",
@@ -927,14 +940,14 @@ class MenuUI:
         where = f" · server {server}" if server else ""
 
         def job(uid: str) -> Reply:
-            reply = self.router.alloc_and_wait(uid, slug, server=server)
+            reply = self.router.alloc_and_wait(uid, slug, server=server, retry=retry)
             self._record(uid, slug, reply)
             # Number-first: alloc_and_wait already returns the number (or a
             # clean refund). For the success case we keep its Check OTP buttons;
             # for a failure we wrap it like the old outcome so tests stay valid.
             if reply.ok:
                 return reply
-            return self._outcome(slug, reply)
+            return self._outcome(slug, reply, server)
 
         return Reply(
             f"⏳ Reserving a {cost.name} number for {price}…\n\n"
@@ -972,11 +985,19 @@ class MenuUI:
         entries.insert(0, (self._now(), slug, reply.ok, first[:120]))
         del entries[self._history_size:]
 
-    def _outcome(self, slug: str, reply: Reply) -> Reply:
-        rows = (
-            ((f"🔁 Another {_emoji(slug)}", f"s:{slug}"), ("🧾 My numbers", "o")),
-            (("🏠 Menu", "m"),),
-        )
+    def _outcome(self, slug: str, reply: Reply, server: str = "") -> Reply:
+        # A refunded no-stock / operator failure gets a one-tap 🔄 Retry that
+        # re-runs the same money path without the per-user buy throttle.
+        if CommandRouter._retryable(reply.text):
+            rows = (
+                (("🔄 Retry", f"ry:{slug}:{server}"), ("🧾 My numbers", "o")),
+                (("🏠 Menu", "m"),),
+            )
+        else:
+            rows = (
+                ((f"🔁 Another {_emoji(slug)}", f"s:{slug}"), ("🧾 My numbers", "o")),
+                (("🏠 Menu", "m"),),
+            )
         return replace(reply, rows=rows)
 
     def _can_createbot(self) -> bool:

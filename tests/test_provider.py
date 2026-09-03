@@ -404,6 +404,15 @@ def test_wait_for_otp_rejects_nonpositive_poll():
         p.wait_for_otp(alloc, poll_interval=0)
 
 
+def test_wait_for_otp_adaptive_still_delivers():
+    """Adaptive mode must not delay delivery of an OTP that arrives."""
+    p, _ = make("STATUS_WAIT_CODE", "STATUS_OK:555000")
+    alloc = NumberAllocation("555", "+919", "telegram", "in", INR(10))
+    result = p.wait_for_otp(alloc, timeout_seconds=5, poll_interval=0.01,
+                            adaptive=True)
+    assert result.success and result.code == "555000"
+
+
 # ---------------------------------------------------------------- lifecycle
 def test_cancel_sends_the_cancel_status():
     p, opener = make("STATUS_CANCEL")
@@ -691,3 +700,26 @@ def test_buy_number_aborts_if_all_operators_bad_service():
         pass  # expected: all operators rejected the service
     except ProviderError as exc:
         raise AssertionError(f"unexpected ProviderError: {exc}")
+
+
+def test_buy_number_walks_past_a_partial_harvest():
+    """A partial/stale harvest must not hide a pool that actually carries stock.
+
+    The walk unions the per-service harvested operator list with
+    ``operator_order``; without that, a service whose harvested pools all
+    answer BAD_SERVICE is declared out of stock even when a fallback pool
+    (omitted from the harvest) has the number.
+    """
+    bodies = ["BAD_SERVICE", "ACCESS_NUMBER:aaa:917000000002:10"]
+    p, opener = make(*bodies, operator_order=("2", "3"))
+    # Simulate a service whose harvest lists only operator 1 (stale/partial),
+    # while the real stock sits on operator 2.
+    p._handler_map["bestsms"] = "bestSMS"
+    p._handler_ops["bestsms"] = ["1"]
+    alloc = p.buy_number("bestsms", "22")
+    assert alloc.phone == "917000000002"
+    number_calls = [c["url"] for c in opener.calls if "getNumber" in c["url"]]
+    # Walk was op=1 (BAD_SERVICE) then op=2 (success) -- reached the fallback.
+    assert len(number_calls) == 2
+    assert "operator=1" in number_calls[0]
+    assert "operator=2" in number_calls[1]

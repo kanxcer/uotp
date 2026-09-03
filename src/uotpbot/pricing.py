@@ -52,6 +52,18 @@ class Strategy(str, Enum):
     PEER_MULTIPLE = "peer_multiple"
     """Price = provider sticker x a multiple. Rough but predictable."""
 
+    EXACT_MARKUP = "exact_markup"
+    """Price = the service's actual per-number cost x (1 + markup), exactly.
+
+    This is the owner's 45% rule: a Rs.10 service sells at Rs.14.50, a Rs.20
+    server at Rs.29.00. No break-even floor and no snapping to a round rung --
+    the price IS the exact figure. The base is ``list_price``, the provider's
+    per-number charge for that service / server (NOT the amortized
+    ``cost_per_successful_delivery``, which a high retry rate inflates). So the
+    price* scale is bounded by the stated base, and a per-server quote uses
+    that server's own ``list_price``.
+    """
+
 
 @dataclass(frozen=True, slots=True)
 class PriceLadder:
@@ -155,6 +167,13 @@ class Pricer:
             return probe.cost_per_successful_delivery + self.fixed_spread
         if self.strategy is Strategy.PEER_MULTIPLE:
             return quantize_money(Decimal(sticker.rupees) * self.peer_multiple, ROUND_CEILING)
+        if self.strategy is Strategy.EXACT_MARKUP:
+            # Base = the service's actual per-number charge (list_price), NOT
+            # the amortized cost_per_successful_delivery which a high retry
+            # rate inflates. Exact figure, no ladding/snapping.
+            return quantize_money(
+                Decimal(cost.list_price.rupees) * (_ONE + self.markup), ROUND_CEILING
+            )
         raise ValueError(f"unknown strategy {self.strategy!r}")
 
     def price(self, cost: ServiceCost, *, sticker: Optional[Money] = None) -> PricingAdvice:
@@ -179,6 +198,26 @@ class Pricer:
         )
         ladder_floor = self.ladder.rungs[0]
         target = self.raw_target(cost, sticker)
+
+        if self.strategy is Strategy.EXACT_MARKUP:
+            # Owner's exact markup rule: the price IS cost x (1+markup), to the
+            # paise, on every service and server. No break-even floor and no
+            # snapping to a round rung -- the owner decides the margin, not the
+            # ladder. (break_even/econ are still computed for reporting.)
+            gross = target
+            reason = (
+                f"strategy={self.strategy.value}: {cost.list_price} x "
+                f"{_ONE + self.markup} = {gross}"
+            )
+            econ = OrderEconomics.for_service(
+                cost, gross, fees=self.fees, wallet_multiplier=self._multiplier,
+                retry_cap=self.retry_cap, sticker_price=sticker,
+            )
+            return PricingAdvice(
+                service=cost, gross_price=gross, break_even=break_even,
+                econ=econ, reason=reason,
+            )
+
         floor = max(buffered, ladder_floor, key=lambda m: m.paise)
         chosen_raw = max(target, floor, key=lambda m: m.paise)
         gross = self.ladder.snap_up(chosen_raw)

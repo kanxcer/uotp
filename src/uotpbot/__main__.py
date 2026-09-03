@@ -65,9 +65,12 @@ def _build(settings: Settings):
     if not settings.database_url:
         # With Postgres the durability story is the database's, not the disk's.
         _warn_if_ephemeral(settings.ledger_path)
+    from .pricing import Strategy
     pricer = Pricer(
         catalog, fees=settings.fees,
         target_margin=Rate(str(settings.pricing_target_margin)),
+        strategy=Strategy(settings.pricing_strategy),
+        markup=Rate(str(settings.pricing_markup_rate)),
     )
     engine = BotEngine(
         catalog, provider, ledger, pricer, fees=settings.fees, config=settings.engine
@@ -75,7 +78,7 @@ def _build(settings: Settings):
     return catalog, provider, ledger, pricer, engine
 
 
-def _make_poller(settings: Settings, router_factory):
+def _make_poller(settings: Settings, router_factory, *, owner_alert=None):
     """Return a callable that runs the Telegram poller, or None."""
     if not settings.has_telegram:
         log.warning(
@@ -91,7 +94,7 @@ def _make_poller(settings: Settings, router_factory):
             "Install with: pip install '.[telegram]'"
         )
         return None
-    return lambda: run_bot(settings, router_factory)
+    return lambda: run_bot(settings, router_factory, owner_alert=owner_alert)
 
 
 def _serve(settings: Settings) -> int:
@@ -116,16 +119,39 @@ def _serve(settings: Settings) -> int:
     wallets = make_wallets(settings)
     subbots = _make_whitelabel(settings, catalog, ledger, pricer, wallets)
 
-    def router_factory() -> CommandRouter:
-        return CommandRouter(
-            engine, catalog, pricer, ledger,
-            owner_id=settings.owner_id, allowed_users=settings.allowed_users,
-            wallets=wallets,
-            subbots=subbots.registry if subbots else None,
-            platform_fee=_platform_fee(settings),
-        )
+    # One persistent router for the platform bot (sub-bots each get their own
+    # inside _make_whitelabel). Holding it lets the health server read Phase-1
+    # subsystem stats (rate limiter + cancel tracker) on /metrics.
+    from .ratelimit import RateLimitConfig
 
-    poller = _make_poller(settings, router_factory)
+    main_router = CommandRouter(
+        engine, catalog, pricer, ledger,
+        owner_id=settings.owner_id, allowed_users=settings.allowed_users,
+        wallets=wallets,
+        subbots=subbots.registry if subbots else None,
+        platform_fee=_platform_fee(settings),
+        rate_limit=RateLimitConfig(
+            max_buys=settings.rate_limit_max_buys,
+            window_seconds=settings.rate_limit_window,
+        ),
+    )
+
+    def router_factory() -> CommandRouter:
+        return main_router
+
+    # Phase-1 provider wallet monitor (P2): alert the owner BEFORE the wallet
+    # runs dry, so an order never dies to NO_BALANCE mid-bulk.
+    from .bot.alerts import OwnerAlert
+    from .wallet_monitor import WalletMonitor
+
+    owner_alert = OwnerAlert(settings.owner_id)
+    wallet_monitor = WalletMonitor(
+        provider, notify_owner=owner_alert.send,
+        check_interval=float(settings.wallet_monitor_seconds),
+    )
+    wallet_monitor.start()
+
+    poller = _make_poller(settings, router_factory, owner_alert=owner_alert)
     if subbots is not None:
         started = subbots.manager.start_all()
         log.info("white-label: %d sub-bot(s) registered, started %d",
@@ -151,8 +177,13 @@ def _serve(settings: Settings) -> int:
         engine, ledger,
         poller=poller,
         subbots=subbots.manager if subbots else None,
+        wallet_monitor=wallet_monitor,
+        subsystem_stats=main_router.phase1_snapshot,
     )
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        wallet_monitor.stop()
     if subbots is not None:
         subbots.manager.stop_all()
         subbots.registry.close()

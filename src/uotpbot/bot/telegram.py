@@ -324,8 +324,13 @@ def _start_polling(app: Any) -> None:
     app.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=())
 
 
-def run_bot(settings: Settings, router_factory: Any) -> None:  # pragma: no cover
+def run_bot(settings: Settings, router_factory: Any,
+            *, owner_alert: Any = None) -> None:  # pragma: no cover
     """Start long-polling. Blocking; meant for a real deployment."""
     app = build_from_settings(settings, router_factory)
+    # Phase-1: hand the alert bridge to the wallet monitor thread so it can
+    # reach the owner through this app's event loop.
+    if owner_alert is not None:
+        owner_alert.attach(app)
     log.info("bot starting")
     _start_polling(app)

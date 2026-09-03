@@ -145,6 +145,7 @@ class MockProvider:
         timeout_seconds: float = 300.0,
         poll_interval: float = 3.0,
         expect: Optional[str] = None,
+        adaptive: bool = False,
     ) -> OtpResult:
         for msg in self.get_sms(allocation.order_id):
             code = msg.extract_otp()
