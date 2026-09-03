@@ -247,3 +247,66 @@ def test_database_failure_after_provider_purchase_rolls_back_live_activation(sta
     assert "cancelled" in result.message
     failing.verify()
     failing.close()
+
+
+def test_zero_priced_number_books_sticker_not_zero(stack):
+    """Regression: uotp.store's ACCESS_NUMBER carries no price, so the
+    provider returns a NumberAllocation with charged=Money(0). The old
+    ``alloc.charged or sticker`` idiom fails here because ``Money`` is a
+    dataclass: ``Money(0)`` is TRUTHY, so ``or`` yields Money(0) instead of
+    the sticker fallback, and posting a zero amount raises LedgerError --
+    aborting a live (already-charged) activation. The booking must fall back
+    to the sticker price and the order must deliver.
+    """
+    from uotpbot.provider.base import NumberAllocation
+    from uotpbot.provider.mock import MockProvider
+
+    class NoPriceProvider(MockProvider):
+        """Mock that hands back a number with no price (charged=Money(0)),
+        exactly like the live handler's ACCESS_NUMBER:id:phone with no price
+        field."""
+
+        def buy_number(self, service, country, *, idempotency_key="", server=""):
+            alloc = super().buy_number(service, country, idempotency_key=idempotency_key)
+            return NumberAllocation(
+                order_id=alloc.order_id, phone=alloc.phone,
+                service=service, country=country,
+                charged=Money(-1) if False else Money(0),  # no price reported
+                validity_minutes=alloc.validity_minutes,
+            )
+
+        def get_sms(self, order_id):
+            # Always deliver -- the test is about the booking, not OTP timing.
+            return []
+
+        def wait_for_otp(self, allocation, *, timeout_seconds=290.0,
+                         poll_interval=3.0, expect=None):
+            from uotpbot.provider.base import OtpResult
+            from uotpbot.provider.base import SmsMessage
+            return OtpResult(
+                "246810",
+                SmsMessage("", "246810", "2026-09-03T00:00:00+00:00"),
+                1, 0.01, False,
+            )
+
+    catalog = Catalog({"telegram": ServiceCost("telegram", "Telegram", "messaging",
+                                               INR(10), Decimal("0.94"))})
+    ledger = Ledger()
+    provider = NoPriceProvider({s.slug: catalog.sticker_price(s.slug)
+                                for s in catalog.services()}, balance=INR(5000), seed=7)
+    engine = BotEngine(catalog, provider, ledger, Pricer(catalog),
+                       config=EngineConfig(retry_cap=3, otp_timeout_seconds=1.0,
+                                           poll_interval=0.01))
+    res = engine.fulfil("buyer", "telegram")
+    assert res.success, res.message
+    assert res.order.net_spend == INR(10)  # booked at the sticker, NOT zero
+    # the COGS posting used the sticker cost, so profit is real money
+    assert ledger.balance(COGS) == INR(10)
+    ledger.close()
+
+
+def test_money_if_zero_falls_back_only_when_zero():
+    from uotpbot.money import INR, Money
+    assert Money(0).if_zero(INR(18)) == INR(18)
+    assert INR(18).if_zero(INR(10)) == INR(18)
+    assert Money(0).if_zero(INR(0)) == INR(0)

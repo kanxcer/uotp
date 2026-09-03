@@ -172,6 +172,23 @@ class Money:
     def __neg__(self) -> "Money":
         return Money(-self.paise)
 
+    def if_zero(self, fallback: "Money") -> "Money":
+        """``fallback`` when this is zero, else ``self``.
+
+        Deliberately not the ``x or y`` idiom: ``Money`` is a dataclass, so a
+        ``Money(0)`` instance is *truthy* even though its value is zero, and
+        ``Money(0) or sticker`` silently yields ``Money(0)`` instead of the
+        fallback. This is how a number the provider did not quote a price for
+        (``alloc.charged`` stays ``Money(0)`` on a live ``ACCESS_NUMBER`` that
+        carries no price) ends up posted to the ledger as a zero amount -- which
+        then trips the ``refusing to record a zero posting`` guard and aborts a
+        successfully-purchased activation. Use this so the caller's intent is
+        explicit and safe at zero.
+        """
+        if self.paise == 0:
+            return fallback
+        return self
+
     def __mul__(self, factor: Union[int, Decimal, Rate]) -> "Money":
         """Multiply by an exact integer, or by a ratio with explicit rounding.
 

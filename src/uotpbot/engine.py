@@ -329,10 +329,15 @@ class BotEngine:
             # purchased number active while the customer saw a misleading
             # generic error.
             try:
-                order.record_attempt(alloc.charged or sticker, alloc.order_id)
+                # ``if_zero`` not ``or``: Money(0) is a truthy dataclass, so
+                # ``alloc.charged or sticker`` yields Money(0) for a number the
+                # provider did not quote a price for, and a zero posting is
+                # rejected -- aborting a live activation. Explicit zero-check.
+                cost = alloc.charged.if_zero(sticker)
+                order.record_attempt(cost, alloc.order_id)
                 order.phone = alloc.phone
                 self.ledger.record_number_purchase(
-                    alloc.charged or sticker, ref=ref,
+                    cost, ref=ref,
                     memo=f"{service} attempt {order.attempts}"
                 )
             except LedgerError as exc:
