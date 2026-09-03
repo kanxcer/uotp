@@ -277,6 +277,18 @@ class Catalog:
             return None
         return min((s.list_price for s in self._services.values()), key=lambda m: m.paise)
 
+    def cheapest_sticker(self) -> Optional[Money]:
+        """Lowest *floored* sticker price (list_price, never below min_charge).
+
+        This is the true cheapest thing a customer can buy with the catalogue
+        as configured. Cheap O(1)-ish; unlike a full ``price_book`` it does not
+        run the economics model on every service, so it is safe to call from a
+        menu/wallet screen on every tap.
+        """
+        if not self._services:
+            return None
+        return max(self.cheapest_price(), self.min_charge, key=lambda m: m.paise)
+
     def effective_multiplier(self, pack: Optional[WalletPack] = None) -> Decimal:
         """Real-money cost per rupee of wallet credit.
 

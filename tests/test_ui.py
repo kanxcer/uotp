@@ -261,3 +261,25 @@ def test_createbot_conversation_is_not_hijacked_by_the_menu(rig):
     assert "token" in step.text.lower() or "valid" in step.text.lower()
     # The menu did hide when it should but not swallow the answer.
     assert "What would you like to do" not in step.text
+
+
+def test_low_balance_wallet_card_shows_add_money_nudge(rig):
+    """A wallet balance below the cheapest floored sticker gets a clear
+    'add at least ₹X' nudge on the wallet card, so a near-empty balance is
+    never a silent dead end."""
+    ui, router, *_ = rig
+    router.credit(USER, INR(5))
+    card = ui.button(USER, "w")
+    assert "Add at least" in card.text
+    # the add-money button is on the card (rows, not text)
+    labels = [label for row in card.rows for label, _ in row]
+    assert "➕ Add money" in labels
+
+
+def test_cheapest_sticker_floors_at_min_charge():
+    from uotpbot.catalog import Catalog, ServiceCost, PROVIDER_MIN_CHARGE
+    from uotpbot.money import INR
+    from decimal import Decimal
+    cat = Catalog({"cheap": ServiceCost("cheap", "Cheap", "x", INR(1), Decimal("0.9"))},
+                  min_charge=INR(2))
+    assert cat.cheapest_sticker() == INR(2)  # 1.00 floored up to min_charge 2.00

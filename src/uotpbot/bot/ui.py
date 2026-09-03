@@ -405,10 +405,20 @@ class MenuUI:
         )
 
     def wallet_card(self, user_id: str) -> Reply:
+        balance = self.router.balance_of(user_id)
+        floor = self.catalog.cheapest_sticker()
+        nudge = ""
+        if floor is not None and balance.paise < floor.paise:
+            short = Money(floor.paise - balance.paise)
+            nudge = (
+                f"\n\n⚠️ Your balance is below the cheapest service (from {floor}). "
+                f"Add at least {short} to start buying.\n"
+                "Top up via UPI — it is credited after a quick check."
+            )
         return Reply(
-            f"💰 Your balance: {self.router.balance_of(user_id)}\n\n"
+            f"💰 Your balance: {balance}\n\n"
             "Every successful top-up is credited here and never expires.\n"
-            "Refunds land here automatically.",
+            "Refunds land here automatically." + nudge,
             rows=(
                 (("➕ Add money", "t"), ("🛒 Buy a number", "l")),
                 (("🏠 Menu", "m"),),
