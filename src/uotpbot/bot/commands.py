@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+import logging
+import threading
 import time
 import uuid
 from typing import Optional
@@ -27,6 +29,8 @@ from ..ratelimit import RateLimitConfig, RateLimiter
 from ..refund import DurableRefund
 from ..tz import format_ts
 from ..whitelabel import PlatformFee, SubBotRegistry
+
+log = logging.getLogger("uotpbot.commands")
 
 __all__ = ["CommandRouter", "HELP_TEXT"]
 
@@ -141,6 +145,13 @@ class CommandRouter:
         #: order, so a background auto-poller only ever edits with a real
         #: outcome and never overwrites an OTP a manual tap already delivered.
         self._terminal: dict[str, object] = {}
+        #: Per-token single-flight: only ONE poller (background auto-poll OR a
+        #: manual 💰 Check OTP tap) may wait on an order at a time. Without this,
+        #: every Check tap stacked another ~5-minute OTP-window wait on its own
+        #: thread, so "My numbers" appeared frozen until the number was cancelled
+        #: or expired. A duplicate tap now returns instantly and never blocks.
+        self._poll_guard = threading.Lock()
+        self._polling_tokens: set[str] = set()
         #: Per-user buy rate limiter (anti-spam / anti-burn). Floats on the
         #: wallet store's KV so the window survives a redeploy.
         self._rate_limiter = RateLimiter(
@@ -682,9 +693,12 @@ class CommandRouter:
                     strict(provider_id)
                 else:
                     self.engine.provider.cancel(provider_id)
-            except Exception as exc:  # noqa: BLE001 - surface provider refusal
+            except Exception as exc:  # noqa: BLE001 - provider refusal
                 released = False
                 refused = str(exc)
+                # Logged for diagnosis, never shown to the customer (the
+                # cooldown timer below tells them everything they need).
+                log.debug("cancel refused for %s: %s", provider_id, refused)
         if not released:
             # Phase-4: this refusal leaves a live, chargeable number. Record the
             # sunk cost so it feeds the burn model and the owner's /metrics.
@@ -727,9 +741,11 @@ class CommandRouter:
                     "Try ♻️ Cancel again after that, or tap 💰 Check OTP — "
                     "it refunds automatically if no code arrives."
                 )
+            # The raw provider error (e.g. EARLY_CANCEL_DENIED) is internal and
+            # pointless to the customer; the cooldown timer above already says
+            # exactly what to do. Never leak the provider response into chat.
             return Reply(
-                "♻️ This number can't be cancelled yet." + timer
-                + (f"\n\n({refused})" if refused else ""),
+                "♻️ This number can't be cancelled yet." + timer,
                 ok=False,
                 rows=((("💰 Check OTP", f"co:{token}"),), (("🏠 Menu", "m"),)),
             )
@@ -799,7 +815,30 @@ class CommandRouter:
         via :meth:`check_otp`. ``wait_seconds`` defaults to the full OTP window
         (it must never be set short here, or we would refund a number that is
         merely seconds away from delivering).
+
+        Single-flight: only ONE poll at a time per order. The background
+        auto-poller and a manual Check tap both come through here; without a
+        guard each would stack its own ~5-minute OTP-window wait on its own
+        thread, so the button surface sat behind a second poll and "My numbers"
+        appeared frozen until the number was cancelled or expired. A duplicate
+        tap now returns instantly and never blocks.
         """
+        with self._poll_guard:
+            if token in self._polling_tokens:
+                return False, Reply(
+                    "⏳ Already checking this number — the code will be sent "
+                    "here as soon as it arrives. You don't need to tap again.",
+                    ok=False,
+                    rows=((( "🧾 My numbers", "o"), ("🏠 Menu", "m")),),
+                )
+            self._polling_tokens.add(token)
+        try:
+            return self._poll_once_inner(token, wait_seconds)
+        finally:
+            with self._poll_guard:
+                self._polling_tokens.discard(token)
+
+    def _poll_once_inner(self, token: str, wait_seconds: int):
         entry = self._awaiting.get(token)
         if entry is not None:
             user_id, slug, result = entry
@@ -813,7 +852,7 @@ class CommandRouter:
             return True, Reply(
                 "That order has finished or is no longer waiting. "
                 "See 🧾 My numbers.",
-                ok=False, rows=(((("🧾 My numbers", "o"), ("🏠 Menu", "m")),),),
+                ok=False, rows=((("🧾 My numbers", "o"), ("🏠 Menu", "m")),),
             )
         wait = wait_seconds if wait_seconds > 0 else self.engine.config.otp_timeout_seconds
         result = self.engine.resume_otp(

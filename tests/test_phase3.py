@@ -354,3 +354,48 @@ def test_cancel_then_timeout_poll_does_not_double_refund():
                     and "cash" in str(h[2])
                     and int(h[4]) > 0]
     assert len(refund_lines) == 1, f"expected 1 customer refund, got {len(refund_lines)}"
+
+
+# ── #5b "My numbers freezes while a number is active" ────────────────────
+def test_duplicate_check_otp_returns_instantly_not_a_second_wait():
+    """Only one poll may wait on an order at a time. A duplicate Check tap
+    (or the manual Check racing the background auto-poller) must return
+    immediately, never stacking another ~5-minute OTP-window wait on its own
+    thread (which is what made 'My numbers' freeze until the number expired)."""
+    import threading
+    router, _, _, _ = _rig()
+    provider = router.engine.provider
+    provider.force_next(MockOutcome("success", otp="555555"))
+    r = router.alloc_and_wait(USER, "telegram")
+    token = _wait_token(r)
+    assert token
+    # Claim the token as if the background auto-poller already owns the wait.
+    with router._poll_guard:
+        router._polling_tokens.add(token)
+    try:
+        terminal, reply = router.poll_once(token, wait_seconds=0)
+    finally:
+        with router._poll_guard:
+            router._polling_tokens.discard(token)
+    # Duplicate: NOT terminal, no engine wait, fast friendly reply.
+    assert terminal is False
+    assert "already checking" in reply.text.lower()
+    # And no waiting started: a normal poll of the same token still works after
+    # the lock is released (single-flight is not a permanent block).
+    provider.force_next(MockOutcome("success", otp="666666"))
+    terminal2, reply2 = router.poll_once(token, wait_seconds=0)
+    assert terminal2 is True
+
+
+def test_cancel_before_time_does_not_leak_provider_error():
+    """The EARLY_CANCEL_DENIED string must never reach the customer."""
+    router, _, _, _ = _rig(deny_cancel=True)
+    provider = router.engine.provider
+    provider.force_next(MockOutcome("success", otp="555555"))
+    r = router.alloc_and_wait(USER, "telegram")
+    token = _wait_token(r)
+    reply = router.cancel_wait(token)
+    # Provider refused; the message shows the cooldown but NO internal error.
+    assert "2 min" in reply.text
+    assert "EARLY_CANCEL_DENIED" not in reply.text
+    assert "provider returned" not in reply.text.lower()
