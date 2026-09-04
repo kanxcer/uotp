@@ -137,10 +137,11 @@ class MenuUI:
         #: change it live from the admin panel, which persists an override in
         #: the wallet store's kv table; ``support_contact`` reads that first.
         self._support_default = support_contact.strip()
-        #: UPI VPA customers pay to (owner sets PAY_UPI_ID). The QR image is
-        #: set by the owner from inside the bot and persisted in the wallet
-        #: store's kv table -- it survives redeploys, unlike disk files.
-        self.pay_upi_id = pay_upi_id.strip()
+        #: Default UPI VPA (from PAY_UPI_ID env). The owner can edit it live
+        #: from the admin panel ("💳 UPI ID"), which persists an override in
+        #: the wallet store's kv table so it survives redeploys; ``pay_upi_id``
+        #: reads that override first. The QR image is a separate admin setting.
+        self._upi_default = pay_upi_id.strip()
         self._maintenance_memory = False  # in-memory fallback if no kv store
         #: user_id -> [(timestamp, slug, ok, one-line summary)].
         #: Session-scoped by design; say that on the screen.
@@ -233,6 +234,35 @@ class MenuUI:
                 pass
         # In-memory fallback (tests / no kv store).
         self._support_default = value.strip()
+
+    @property
+    def pay_upi_id(self) -> str:
+        """The UPI VPA customers pay to, live-editable by the owner.
+
+        An owner-set override wins (persisted in the wallet kv table, so it
+        survives redeploys); otherwise the PAY_UPI_ID env default is used.
+        """
+        store = self._store_for_kv()
+        if store is not None:
+            try:
+                v = store.kv_get("pay_upi_id")
+                if v:
+                    return v
+            except Exception:  # noqa: BLE001 - fall back to default
+                pass
+        return self._upi_default
+
+    def _set_pay_upi_id(self, value: str) -> None:
+        """Persist the owner-edited UPI VPA."""
+        store = self._store_for_kv()
+        if store is not None:
+            try:
+                store.kv_set("pay_upi_id", value.strip())
+                return
+            except Exception:  # noqa: BLE001
+                pass
+        # In-memory fallback (tests / no kv store).
+        self._upi_default = value.strip()
 
     # -- favourites ------------------------------------------------------
     def _fav_key(self, user_id: str) -> str:
@@ -721,6 +751,10 @@ class MenuUI:
                         "Send the support username customers see on the 🆘 "
                         "Support screen, e.g.\n`@your_support`\n"
                         f"(current: `{self.support_contact or 'not set'}`)"),
+            "upi": ("💳 EDIT UPI ID",
+                    "Send the UPI VPA customers pay into on the ➕ Add Money "
+                    "screen, e.g.\n`yourname@okaxis`\n"
+                    f"(current: `{self.pay_upi_id or 'not set'}`)"),
         }[action]
         self._wizard[user_id] = {"flow": "admin", "action": action, "step": "input"}
         return Reply(f"{prompt[0]}\n\n{prompt[1]}\n\nTap ✖️ Cancel to abort.",
@@ -765,6 +799,18 @@ class MenuUI:
                     f"✅ Support username set to @{val}.\n\n"
                     f"It's now shown on the 🆘 Support screen.",
                     ok=True, rows=((("🆘 Preview Support", "support"),),
+                                   (("📊 Admin Panel", "a"),)),
+                )
+            if action == "upi":
+                val = (body.strip() or "")
+                if "@" not in val:
+                    return Reply("Please send a valid UPI VPA, e.g. `yourname@okaxis`.",
+                                 ok=False, rows=((("✖️ Cancel", "a"),),))
+                self._set_pay_upi_id(val)
+                return Reply(
+                    f"✅ UPI ID set to `{val}`.\n\n"
+                    f"It's now shown on the ➕ Add Money screen.",
+                    ok=True, rows=((("💰 Preview Add Money", "t"),),
                                    (("📊 Admin Panel", "a"),)),
                 )
             self._wizard.pop(user_id, None)
@@ -1009,7 +1055,7 @@ class MenuUI:
                 (("📢 Broadcast", "ax:broadcast"), ("📊 Metrics", "ax:metrics")),
                 (("🛠 Toggle maintenance", "a:mm"), ("🖼 Payment QR", "a:qr")),
                 (("🕳 Sunk cost", "ax:sunkcost"), ("🏦 Provider", "ax:provider")),
-                (("🆘 Support username", "ax:support"),),
+                (("🆘 Support username", "ax:support"), ("💳 UPI ID", "ax:upi")),
                 (("🏠 Menu", "m"),),
             ),
         )
@@ -1192,6 +1238,9 @@ class MenuUI:
             if action == "support":
                 # ✏️ Edit the support username customers see on 🆘 Support.
                 return self._admin_input_prompt(user_id, "support")
+            if action == "upi":
+                # 💳 Edit the UPI VPA customers pay into (Add Money screen).
+                return self._admin_input_prompt(user_id, "upi")
             return self._badtap()
         if kind == "fav":
             return self.favourites_card(user_id)

@@ -1078,10 +1078,20 @@ class CommandRouter:
         # Clamp to the REAL provider validity: the provider's clock / reported
         # validity can skew high and made the UI claim "30 min" when the number
         # is only yours for 20 min, which confused customers.
+        #
+        # Floor to a real validity window: a freshly-allocated number must show
+        # as LIVE in "My numbers" for at least the OTP window, whatever the
+        # provider's allocation clock says. If ``seconds_left`` computes to 0
+        # or negative (a provider skew / misparsed allocated_at), we still grant
+        # the platform validity window -- otherwise the number would be recorded
+        # with valid_until in the past and filtered straight out of "My numbers"
+        # (the persistent "bought it but it never appears" bug).
         from ..catalog import PROVIDER_VALIDITY_MINUTES
         max_valid = PROVIDER_VALIDITY_MINUTES * 60
         if alloc is not None:
-            seconds_left = min(max(alloc.seconds_left(), 0), max_valid)
+            seconds_left = min(max(alloc.seconds_left(), 0), max_valid) \
+                or PROVIDER_VALIDITY_MINUTES * 60  # non-zero floor
+            seconds_left = max(seconds_left, self.engine.config.otp_timeout_seconds)
             valid_until = time.time() + seconds_left
         else:
             valid_until = time.time() + max_valid  # provider validity default

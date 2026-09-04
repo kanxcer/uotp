@@ -518,3 +518,57 @@ def test_remaining_time_capped_at_20_minutes_not_provider_30(rig):
     # And every screen renders <= 20 min, never 30.
     reply = ui.history_card(USER)
     assert "30 min" not in reply.text, f"history must not claim 30 min: {reply.text!r}"
+
+
+# -- 💳 UPI VPA editor (owner) --------------------------------------------
+
+def test_admin_can_set_upi_id_and_it_shows_on_add_money(rig):
+    from uotpbot.wallets import SqliteWallets
+    ui, router, _provider, _ledger = rig
+    router.wallets = SqliteWallets(":memory:")
+    # No UPI yet.
+    assert ui.pay_upi_id == ""
+    assert "not configured" in ui.topup_card(USER).text
+    # Admin panel has the UPI edit button.
+    panel = ui.admin_panel(OWNER)
+    assert "ax:upi" in datas(panel), "admin needs a UPI edit button"
+    # Owner edits it; it persists and appears on the Add Money screen.
+    r = ui.button(OWNER, "ax:upi")
+    assert "EDIT UPI ID" in r.text
+    r2 = ui.text(OWNER, "owner@okaxis")
+    assert "✅" in r2.text
+    assert ui.pay_upi_id == "owner@okaxis"
+    assert "owner@okaxis" in ui.topup_card(USER).text
+    # A customer cannot edit it.
+    assert ui.button(USER, "ax:upi").text.startswith("Owner only")
+
+
+def test_upi_id_requires_valid_vpa(rig):
+    ui, _router, _provider, _ledger = rig
+    ui.button(OWNER, "ax:upi")
+    r = ui.text(OWNER, "notanemail")
+    assert "valid UPI" in r.text
+    assert ui.pay_upi_id == ""
+
+
+# -- freshly-purchased number always shows live ---------------------------
+
+def test_record_active_never_stores_zero_validity(rig):
+    from uotpbot.wallets import SqliteWallets
+    ui, router, _provider, _ledger = rig
+    store = SqliteWallets(":memory:")
+    router.wallets = store
+
+    class _Alloc:
+        order_id = "alloc1"
+        def seconds_left(self):  # provider clock says 0 (skewed / bad allocated_at)
+            return 0
+
+    class _Result:
+        phone = "+919000000000"
+        _alloc = _Alloc()
+
+    router._record_active(USER, "telegram", INR(15), _Result(), "tok-t")
+    active = store.active_numbers(user_id=USER)
+    assert active, "a freshly-bought number must appear under My numbers"
+    assert active[0].seconds_left > 0, f"must have positive validity, got {active[0].seconds_left}"
