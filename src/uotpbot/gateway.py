@@ -150,7 +150,12 @@ class FamGateway:
                  if v is not None and v != ""}
         query["api_key"] = self.api_key
         url = f"{self.base_url}{path}?{urllib.parse.urlencode(query)}"
-        req = urllib.request.Request(url, method="GET")
+        req = urllib.request.Request(url, method="GET", headers={
+            # FamGateway rejects requests whose user-agent is urllib's default
+            # ("Python-urllib/3.x") with a 403. A real client name is required
+            # so the gateway's bot-abuse filter lets the request through.
+            "User-Agent": "uotpbot/1.0 (payment gateway client)",
+        })
         try:
             with self._opener.urlopen(req, timeout=self.timeout) as resp:  # type: ignore[attr-defined]
                 raw = resp.read()

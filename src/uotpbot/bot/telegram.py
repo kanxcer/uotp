@@ -309,7 +309,11 @@ class TelegramFrontend:
             reply = self.router.handle_callback(user_id, data)
             if message is not None:
                 await self._safe_edit(message, reply)
-            await query.answer("OK" if reply.ok else "Rejected")
+            # Answer with NO text so no toast popup appears. Telegram still
+            # requires answering the callback (else the button spinner hangs),
+            # but an empty answer suppresses the "OK"/"Rejected" toast that
+            # users found noisy on every navigation tap.
+            await query.answer()
             return
 
         # ``ui.button`` handles token buttons (💰 Check OTP / 🔁 Resend / ♻️
@@ -321,7 +325,7 @@ class TelegramFrontend:
             reply = await _run_offloop(self.ui.button, user_id, data)
         except Exception:  # noqa: BLE001 - never freeze a tap
             log.exception("button handler failed")
-            await query.answer("Hmm")
+            await query.answer()
             if message is not None:
                 await self._safe_edit_text(
                     message,
@@ -329,7 +333,9 @@ class TelegramFrontend:
                     "tap again — nothing was charged.",
                 )
             return
-        await query.answer("OK" if reply.ok else "Hmm")
+        # No-toast answer: the screen (edited below) is the feedback, not a
+        # popup. An empty answer suppresses the "OK"/"Hmm" toast entirely.
+        await query.answer()
         if message is None:
             return
         deferred = getattr(reply, "deferred", None)

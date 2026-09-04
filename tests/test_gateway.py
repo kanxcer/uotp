@@ -62,3 +62,38 @@ try:
 except FamGatewayError as e:
     print("error mapping OK:", e)
 print("ALL GATEWAY TESTS PASSED")
+
+
+def test_request_sends_a_real_user_agent():
+    """FamGateway rejects urllib's default 'Python-urllib/*' user-agent with a
+    403, so the client must send a browser-ish UA on every request. This guards
+    against the fix being dropped (which made 'Add money -> create payment'
+    fail with 'Could not create your payment')."""
+    import json
+
+    class _Resp:
+        def __init__(self, b):
+            self._b = b
+        def read(self):
+            return self._b
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            pass
+
+    class _Opener:
+        def __init__(self):
+            self.req = None
+            self.ua = None
+        def urlopen(self, req, timeout=12):
+            self.req = req
+            self.ua = req.get_header("User-agent")
+            return _Resp(json.dumps({"status": "success", "data": {
+                "order_id": "fg_UA", "amount": "50",
+                "payable_amount": "50"}}).encode())
+
+    op = _Opener()
+    fg = FamGateway("k", opener=op)
+    fg.create_order(50)
+    assert op.ua and "Python-urllib" not in op.ua, \
+        f"must not use urllib's blocked UA; got {op.ua!r}"

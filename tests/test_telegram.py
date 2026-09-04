@@ -216,3 +216,62 @@ def test_famgateway_amount_message_delivers_qr_photo():
         assert msg.reply_text.await_count == 1, "placeholder sent once"
 
     asyncio.run(run())
+
+
+def test_callback_answer_has_no_popup_toast():
+    """Navigation taps (Support, My numbers, Buy, ...) must answer the
+    callback with EMPTY text so no 'OK' toast popup shows -- the edited screen
+    is the feedback. Telegram still requires answering (else the button
+    spinner hangs)."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    from uotpbot.bot.commands import CommandRouter
+    from uotpbot.bot.telegram import TelegramFrontend
+    from uotpbot.bot.ui import MenuUI
+    from uotpbot.catalog import Catalog, ServiceCost, WalletPack
+    from uotpbot.engine import BotEngine, EngineConfig
+    from uotpbot.ledger import Ledger
+    from uotpbot.money import INR
+    from uotpbot.pricing import Pricer
+    from uotpbot.provider.mock import MockProvider
+    from uotpbot.wallets import SqliteWallets
+
+    cat = Catalog(
+        {"telegram": ServiceCost("telegram", "Telegram", "messaging",
+                                 INR(10), Decimal("0.94"), Decimal("0.04"),
+                                 Decimal("0.95"))},
+        (WalletPack("Pro", INR(1000), INR(1150)),))
+    ledger = Ledger()
+    pricer = Pricer(cat)
+    prov = MockProvider({s.slug: cat.sticker_price(s.slug) for s in cat.services()},
+                        balance=INR(5000), seed=7)
+    eng = BotEngine(cat, prov, ledger, pricer,
+                    config=EngineConfig(retry_cap=3, otp_timeout_seconds=300,
+                                        poll_interval=0.05))
+    w = SqliteWallets(":memory:")
+    router = CommandRouter(eng, cat, pricer, ledger, owner_id="111",
+                           allowed_users=("111", "222"), wallets=w)
+    ui = MenuUI(router, support_contact="@support")
+    fe = TelegramFrontend(router, ui=ui)
+
+    async def tap(data):
+        q = MagicMock()
+        q.from_user.id = 222
+        q.data = data
+        q.message = MagicMock()
+        q.message.edit_text = AsyncMock()
+        q.message.reply_text = AsyncMock()
+        q.answer = AsyncMock()
+        upd = MagicMock()
+        upd.callback_query = q
+        await fe.on_callback(upd)
+        return q
+
+    q1 = asyncio.run(tap("support"))
+    q1.answer.assert_awaited_once_with(), "Support must answer with empty text"
+    q1.message.edit_text.assert_awaited(), "Support must edit the message"
+
+    q2 = asyncio.run(tap("o"))
+    q2.answer.assert_awaited_once_with(), "My numbers must answer with empty text"
+    q2.message.edit_text.assert_awaited(), "My numbers must edit the message"

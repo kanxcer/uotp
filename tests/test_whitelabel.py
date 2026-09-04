@@ -956,6 +956,10 @@ def test_build_from_settings_registers_callback_handler(monkeypatch):
             self._post_init = fn
             return self
 
+        def concurrent_updates(self, flag):  # load-bearing responsiveness toggle
+            self._concurrent = flag
+            return self
+
         def build(self):
             return FakeApp()
 
@@ -992,7 +996,8 @@ def test_on_callback_edits_message_and_answers_query():
     asyncio.run(frontend.on_callback(update, None))
     router.handle_callback.assert_called_once_with("42", "cb:createbot:confirm")
     query.message.edit_text.assert_awaited_once_with("done", reply_markup=None)
-    query.answer.assert_awaited_once_with("OK")
+    # Answer must be empty-text so no "OK" toast popup shows on a tap.
+    query.answer.assert_awaited_once_with()
 
 
 # ---------------------------------------------------------------- encryption
