@@ -395,3 +395,57 @@ def test_cancel_before_time_does_not_leak_provider_error():
     assert "2 min" in reply.text
     assert "EARLY_CANCEL_DENIED" not in reply.text
     assert "provider returned" not in reply.text.lower()
+
+
+# -- #6c My numbers stays responsive during a real OTP wait ------------------
+def test_my_numbers_works_while_otp_wait_runs_after_buy():
+    """Buying shows the number screen ('Your number'), and the My numbers
+    button on it must work WHILE the OTP wait is still running -- not freeze
+    until the number is cancelled/expired (the reported bug)."""
+    import threading
+    import time as _t
+    from uotpbot.provider.base import OtpResult
+    from uotpbot.provider.mock import MockProvider
+    from uotpbot.bot.ui import MenuUI
+
+    class _BlockingProvider(MockProvider):
+        """wait_for_otp really sleeps for its timeout (like the live rail)."""
+        def wait_for_otp(self, allocation, *, timeout_seconds=300.0,
+                         poll_interval=3.0, expect=None, adaptive=False):
+            t0 = _t.time()
+            while _t.time() - t0 < timeout_seconds:
+                for m in self.get_sms(allocation.order_id):
+                    c = m.extract_otp()
+                    if c:
+                        return OtpResult(c, m, 1, 0.4, False)
+                _t.sleep(poll_interval)
+            return OtpResult(None, None, 1, timeout_seconds, True)
+
+    from uotpbot.wallets import SqliteWallets
+    router, _provider, _ledger, _cat = _rig(wallets=SqliteWallets(":memory:"))
+    catalog = router.catalog
+    prov = _BlockingProvider(
+        {s.slug: catalog.sticker_price(s.slug) for s in catalog.services()},
+        balance=INR(5000), seed=7)
+    router.engine.provider = prov
+
+    r = router.alloc_and_wait(USER, "telegram")
+    assert r.ok
+    assert "Your number" in r.text
+    token = _wait_token(r)
+    assert token
+
+    # The background auto-poller starts its wait on its own thread (blocks).
+    def wait():
+        router.poll_once(token, wait_seconds=4)
+    th = threading.Thread(target=wait, daemon=True)
+    th.start()
+    _t.sleep(0.5)
+
+    ui = MenuUI(router, support_contact="@owner", pay_upi_id="o@upi")
+    s = _t.time()
+    mr = ui.button(USER, "o")
+    elapsed = _t.time() - s
+    assert elapsed < 3.0, f"My numbers blocked {elapsed:.2f}s behind the OTP wait"
+    assert "LIVE numbers" in mr.text, f"must show the live number: {mr.text!r}"
+    assert "Telegram" in mr.text
