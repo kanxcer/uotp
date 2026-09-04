@@ -191,8 +191,8 @@ class MenuUI:
                 "For issues, include the order/number and what happened. "
                 "Refunds happen automatically if no OTP arrives."
             )
-            rows = (("🛒 Buy a number", "l"), ("🧾 My numbers", "o"),
-                    ("🏠 Menu", "m"))
+            rows = ((("🛒 Buy a number", "l"), ("🧾 My numbers", "o"),
+                     ("🏠 Menu", "m")),)
             return Reply(lines, rows=rows)
         return Reply(
             "🆘 Need help?\n\n"
@@ -931,7 +931,7 @@ class MenuUI:
                 btns[0].append(("🔁 Resend", f"rs:{a.token}"))
                 btns[0].append(("♻️ Cancel", f"cx:{a.token}"))
                 rows.append(tuple(btns[0]))
-            rows.append(((("📜 Completed history", "h:all"),),))
+            rows.append(("📜 Completed history", "h:all"),)
         else:
             lines.append("No live numbers right now.")
 

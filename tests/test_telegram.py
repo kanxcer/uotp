@@ -12,6 +12,8 @@ The poller died at startup while the health-checked HTTP server kept serving
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 
 pytest.importorskip("telegram", reason="python-telegram-bot not installed")
@@ -43,3 +45,102 @@ def test_polling_accepts_all_update_types():
     from telegram import Update
 
     assert app.calls[0].get("allowed_updates") is Update.ALL_TYPES
+
+
+def test_reply_markup_normalizes_flat_rows():
+    """A Reply whose ``rows`` is a FLAT tuple of (label, data) pairs must render
+    instead of raising. This is exactly the bug that made the 🆘 Support button
+    show only the "OK" popup: _reply_markup used to do
+    ``for label, data in row`` over a bare pair, which unpacked the pair's
+    elements and the transport's swallow hid the failure."""
+    from uotpbot.bot.telegram import _reply_markup
+
+    class R:
+        rows = (("🛒 Buy a number", "l"), ("🧾 My numbers", "o"),
+                ("🏠 Menu", "m"))
+
+    mark = _reply_markup(R())
+    labels = [(b.text, b.callback_data) for row_ in mark.inline_keyboard
+              for b in row_]
+    assert labels == [("🛒 Buy a number", "l"), ("🧾 My numbers", "o"),
+                      ("🏠 Menu", "m")], labels
+
+
+def test_reply_markup_normalizes_over_nested_row():
+    """A single button that was accidentally double-nested must render as a
+    one-button row. This is the bug that made 🧾 My numbers show only the "OK"
+    popup after a purchase."""
+    from uotpbot.bot.telegram import _reply_markup
+
+    class R:
+        rows = (("📜 Completed history", "h:all"),)
+
+    mark = _reply_markup(R())
+    labels = [(b.text, b.callback_data) for row_ in mark.inline_keyboard
+              for b in row_]
+    assert labels == [("📜 Completed history", "h:all")], labels
+
+
+def test_support_and_my_numbers_callback_edit_the_message():
+    """Regression: tapping 🆘 Support or 🧾 My numbers (after a purchase) must
+    actually edit the message, not just fire the 'OK' popup. Previously the
+    broken row shape raised inside _reply_markup and _safe_edit swallowed it."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    from uotpbot.bot.commands import CommandRouter
+    from uotpbot.bot.telegram import TelegramFrontend
+    from uotpbot.bot.ui import MenuUI
+    from uotpbot.catalog import Catalog, ServiceCost, WalletPack
+    from uotpbot.engine import BotEngine, EngineConfig
+    from uotpbot.ledger import Ledger
+    from uotpbot.money import INR
+    from uotpbot.pricing import Pricer
+    from uotpbot.provider.mock import MockProvider
+    from uotpbot.wallets import SqliteWallets
+
+    def build():
+        cat = Catalog(
+            {"telegram": ServiceCost("telegram", "Telegram", "messaging", INR(10),
+                                     Decimal("0.94"), Decimal("0.04"), Decimal("0.95"))},
+            (WalletPack("Pro", INR(1000), INR(1150)),))
+        ledger = Ledger()
+        pricer = Pricer(cat)
+        prov = MockProvider({s.slug: cat.sticker_price(s.slug)
+                             for s in cat.services()}, balance=INR(5000), seed=7)
+        eng = BotEngine(cat, prov, ledger, pricer,
+                        config=EngineConfig(retry_cap=3, otp_timeout_seconds=300,
+                                            poll_interval=0.05))
+        w = SqliteWallets(":memory:")
+        router = CommandRouter(eng, cat, pricer, ledger,
+                               owner_id="111", allowed_users=("111", "222"),
+                               wallets=w)
+        w.adjust("222", INR(500))
+        return router, MenuUI(router, support_contact="TURVEI")
+
+    router, ui = build()
+    router.alloc_and_wait("222", "telegram")  # buy a number (live)
+    fe = TelegramFrontend(router, ui=ui)
+
+    async def tap(data):
+        msg = MagicMock()
+        msg.edit_text = AsyncMock()
+        msg.reply_text = AsyncMock()
+        msg.chat_id = "222"
+        msg.message_id = 1
+        q = MagicMock()
+        q.from_user.id = 222
+        q.data = data
+        q.message = msg
+        q.answer = AsyncMock()
+        upd = MagicMock()
+        upd.callback_query = q
+        await fe.on_callback(upd)
+        return msg
+
+    for data in ("support", "o"):
+        msg = asyncio.run(tap(data))
+        assert msg.edit_text.await_count == 1, \
+            f"{data!r} must edit the message, not only answer the popup"
+        q_args = msg.edit_text.await_args_list[0][0][0]
+        assert q_args, f"{data!r} must edit to non-empty text"

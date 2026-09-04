@@ -154,6 +154,48 @@ def _reply_menu_markup() -> object:
     )
 
 
+def _is_button_pair(x) -> bool:
+    """True when ``x`` is a single ``(label, callback_data)`` pair."""
+    return (
+        isinstance(x, (tuple, list))
+        and len(x) == 2
+        and all(isinstance(v, str) for v in x)
+    )
+
+
+def _normalize_rows(rows) -> list[list[tuple[str, str]]]:
+    """Coerce a Reply's ``rows`` into a list of rows, each a list of
+    ``(label, callback_data)`` pairs.
+
+    The UI contract says ``rows`` is a tuple of *rows*, each row being a
+    tuple of button pairs. Some replies (e.g. the 🆘 Support card) pass a
+    FLAT tuple of pairs by accident, and the 🧾 My numbers history grid used
+    to double-nest a single button row. Both break ``for label, data in row``
+    and -- because the transport swallows the exception -- blanked the screen,
+    leaving only the "OK" popup. Normalising here makes any such shape render
+    instead of silently failing, so a single malformed row can never hide an
+    entire screen.
+    """
+    rows = [r for r in (rows or ()) if r]
+    if not rows:
+        return []
+
+    def pairs_of(row) -> list[tuple[str, str]]:
+        # A bare ``(label, data)`` pair is a lone-button row.
+        if _is_button_pair(row):
+            return [tuple(row)]
+        # Otherwise a row is a sequence of button pairs; keep the valid ones.
+        return [tuple(it) for it in row if _is_button_pair(it)]
+
+    # If every top-level element is itself a single pair, the author passed a
+    # FLAT tuple of buttons ("Buy", "My numbers", "Menu") instead of rows-of-
+    # rows. Bundle them all into one row rather than reading each button as a
+    # whole row (which would try to unpack a string into two vars).
+    if all(_is_button_pair(r) for r in rows):
+        return [list(rows)]
+    return [pairs_of(r) for r in rows]
+
+
 def _reply_markup(reply) -> object:
     """Turn a Reply's buttons into an inline keyboard.
 
@@ -165,12 +207,11 @@ def _reply_markup(reply) -> object:
     """
     if not HAS_TELEGRAM:
         return None
-    rows = getattr(reply, "rows", ()) or ()
+    rows = _normalize_rows(getattr(reply, "rows", ()) or ())
     if rows:
         return InlineKeyboardMarkup([
             [InlineKeyboardButton(label, callback_data=data) for label, data in row]
             for row in rows
-            if row
         ])
     buttons = getattr(reply, "buttons", ()) or ()
     if not buttons:
