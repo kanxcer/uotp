@@ -15,7 +15,8 @@ from decimal import Decimal
 import pytest
 
 from uotpbot.bot.commands import CommandRouter
-from uotpbot.bot.ui import MenuUI, REPLY_MENU_LABELS_LOW
+from uotpbot.bot.ui import MenuUI, REPLY_MENU_LABELS_LOW, WELCOME
+from uotpbot.tz import format_ts
 from uotpbot.catalog import Catalog, ServiceCost, WalletPack
 from uotpbot.engine import BotEngine, EngineConfig
 from uotpbot.ledger import Ledger
@@ -214,3 +215,76 @@ def test_persistent_menu_labels_route():
     # Tapping "🧾 My Numbers" opens the history screen (case-insensitive).
     reply = ui.text(USER, "🧾 My Numbers")
     assert "No live numbers" in reply.text or "No orders yet" in reply.text
+
+
+# ── Welcome copy replaced (no "buttons at the bottom") ────────────────────
+def test_welcome_mentions_buy_or_type():
+    assert "buttons at the bottom" not in WELCOME
+    assert "type the service name" in WELCOME
+
+
+# ── Wallet transaction history shows active number + top-ups ─────────────
+def test_wallet_history_has_transaction_button():
+    wallets = SqliteWallets(":memory:")
+    router, provider, _, _ = _rig(wallets=wallets)
+    ui = MenuUI(router, pay_upi_id="")
+    provider.force_next(MockOutcome("success", otp="987654"))
+    r = ui.button(USER, "y:telegram")
+    r.deferred(USER)  # buy -> allocates the number
+    wh = ui.button(USER, "tx")
+    assert "Transaction history" in wh.text
+    assert "Active purchase" in wh.text
+    assert "Telegram" in wh.text
+    # A top-up appears as a credit.
+    tid = wallets.create_topup(USER, INR(100))
+    wallets.decide_topup(tid, "approved", decided_by=OWNER)
+    wh2 = ui.button(USER, "tx")
+    assert "Credits" in wh2.text and "₹100.00" in wh2.text
+
+
+# ── Timezone is Asia/Kolkata ─────────────────────────────────────────────
+def test_timestamps_render_in_ist():
+    import time
+    s = format_ts(time.time())  # sample real epoch
+    assert "IST" in s
+    assert "+05:30" not in s  # human label, not offset
+    # A hand-crafted epoch should show IST wall clock (UTC+5:30). 2026-01-01
+    # 00:00:00 UTC = 05:30:00 IST.
+    import calendar
+    epoch = calendar.timegm((2026, 1, 1, 0, 0, 0))
+    assert "01 Jan 2026 · 05:30:00 IST" == format_ts(epoch)
+
+
+# ── Exact cancel cooldown wording ────────────────────────────────────────
+def test_exact_duration_wording():
+    assert CommandRouter._exact_duration(70) == "1 minute 10 seconds"
+    assert CommandRouter._exact_duration(10) == "10 seconds"
+    assert CommandRouter._exact_duration(120) == "2 minutes"
+    assert CommandRouter._exact_duration(61) == "1 minute 1 second"
+
+
+def test_cancel_message_shows_exact_time_left():
+    wallets = SqliteWallets(":memory:")
+    catalog = _catalog()
+    ledger = Ledger()
+    pricer = Pricer(catalog)
+    provider = MockProvider(
+        {s.slug: catalog.sticker_price(s.slug) for s in catalog.services()},
+        balance=INR(5000), seed=7)
+    engine = BotEngine(catalog, provider, ledger, pricer,
+                       config=EngineConfig(retry_cap=1, otp_timeout_seconds=1.0,
+                                           poll_interval=0.01))
+    router = CommandRouter(engine, catalog, pricer, ledger,
+                           owner_id=OWNER, allowed_users=(OWNER, USER),
+                           wallets=wallets)
+    wallets.adjust(USER, INR(500))
+    provider.force_next(MockOutcome("success", otp="111111"))
+    r = router.alloc_and_wait(USER, "telegram")
+    token = _wait_token(r)
+    # For a pretend provider that refuses early cancels, the message must give
+    # an EXACT cooldown, not a vague "~4 min".
+    from uotpbot.provider.base import ProviderError
+    provider.cancel_strict = lambda oid: (_ for _ in ()).throw(ProviderError("EARLY_CANCEL_DENIED"))
+    rep = router.cancel_wait(token)
+    assert "You can cancel in" in rep.text
+    assert "minute" in rep.text or "seconds" in rep.text

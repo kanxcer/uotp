@@ -24,6 +24,7 @@ from ..money import INR, Money
 from ..pricing import Pricer
 from ..ratelimit import RateLimitConfig, RateLimiter
 from ..refund import DurableRefund
+from ..tz import format_ts
 from ..whitelabel import PlatformFee, SubBotRegistry
 
 __all__ = ["CommandRouter", "HELP_TEXT"]
@@ -225,6 +226,22 @@ class CommandRouter:
         if mins is None:
             return ""
         return f"~{mins} min" if mins >= 1 else "less than a minute"
+
+    @staticmethod
+    def _exact_duration(seconds_float: float) -> str:
+        """Human-exact duration, e.g. ``1 minute 10 seconds`` / ``10 seconds`` /
+        ``2 minutes``. Used for the cancel-cooldown countdown so a customer
+        knows precisely when they can cancel."""
+        secs = max(0, int(round(seconds_float)))
+        mins, rem = divmod(secs, 60)
+        parts = []
+        if mins:
+            parts.append(f"{mins} minute{'s' if mins != 1 else ''}")
+        if rem:
+            parts.append(f"{rem} second{'s' if rem != 1 else ''}")
+        if not parts:
+            return "0 seconds"
+        return " ".join(parts)
 
     def _otp_window_minutes(self, alloc) -> Optional[int]:
         """Whole minutes left in the OTP window (when the number auto-resolves).
@@ -696,16 +713,16 @@ class CommandRouter:
                     "release it and get refunded."
                 )
             else:
-                secs = int(round(cooldown))
                 cool_s = int(round(self.engine.config.cancel_cooldown_seconds))
                 cool_min = max(1, round(cool_s / 60)) if cool_s >= 60 else 0
-                wait = f"~{secs}s" if secs < 60 else self._minute_text(secs // 60)
                 cooldown_desc = (
-                    f"{cool_min} min" if cool_min else f"{cool_s} seconds"
+                    f"{cool_min} minutes" if cool_min else f"{cool_s} seconds"
                 )
+                wait = self._exact_duration(cooldown)
                 timer = (
                     f"\n\n⏳ A number must sit out {cooldown_desc} after it's "
-                    f"allocated before it can be released. **{wait} left.**\n\n"
+                    f"allocated before it can be released.\n\n"
+                    f"♻️ You can cancel in {wait}\n\n"
                     "Try ♻️ Cancel again after that, or tap 💰 Check OTP — "
                     "it refunds automatically if no code arrives."
                 )
@@ -1263,7 +1280,7 @@ class CommandRouter:
             return Reply(f"No orders{' for ' + uid if uid else ''} yet.")
         lines = [f"📦 Orders ({'user ' + uid if uid else 'all'}):"]
         for o in orders:
-            when = time.strftime("%d %b %H:%M", time.localtime(o.ts))
+            when = format_ts(o.ts, sep=" · ", time_fmt="%H:%M")
             name = self.catalog.get(o.slug).name if self.catalog.has(o.slug) else o.slug
             badge = "✅" if o.success else "♻️"
             lines.append(f"\n{badge} #{o.id} · {name} · {o.gross} · {o.status or ('delivered' if o.success else 'refunded')} · {when}")

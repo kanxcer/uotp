@@ -86,6 +86,9 @@ class ScopedWallets(WalletStore):
     def get_topup(self, topup_id, **kw):
         return self._inner.get_topup(topup_id, scope=self._scope)
 
+    def user_topups(self, user_id):
+        return self._inner.user_topups(user_id, scope=self._scope)
+
     def pending_topups(self):
         return self._inner.pending_topups(scope=self._scope)
 
@@ -552,6 +555,17 @@ class SqliteWallets(WalletStore):
             ).fetchone()
         return self._topup_from(row) if row else None
 
+    def user_topups(self, user_id: str, *, scope: str = "") -> list[Topup]:
+        """Every top-up a user submitted (any status), newest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, user_id, amount_paise, note, photo_file_id, status, created_ts,"
+                " COALESCE(decided_by, '') FROM topups"
+                " WHERE scope = ? AND user_id = ? ORDER BY id DESC",
+                (scope, user_id),
+            ).fetchall()
+        return [self._topup_from(r) for r in rows]
+
     def pending_topups(self, *, scope: str = "") -> list[Topup]:
         with self._lock:
             rows = self._conn.execute(
@@ -882,6 +896,17 @@ class PostgresWallets(WalletStore):
                 (topup_id, scope),
             ).fetchone()
         return self._topup_from(row) if row else None
+
+    def user_topups(self, user_id: str, *, scope: str = "") -> list[Topup]:
+        """Every top-up a user submitted (any status), newest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT id, user_id, amount_paise, note, photo_file_id, status, created_ts,"
+                f" COALESCE(decided_by, '') FROM {self._tt}"
+                " WHERE scope = %s AND user_id = %s ORDER BY id DESC",
+                (scope, user_id),
+            ).fetchall()
+        return [self._topup_from(r) for r in rows]
 
     def pending_topups(self, *, scope: str = "") -> list[Topup]:
         with self._lock:

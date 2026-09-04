@@ -24,6 +24,7 @@ from typing import Callable, Optional
 from ..catalog import Catalog
 from ..money import Money
 from ..pricing import Pricer
+from ..tz import format_ts
 from .commands import CommandRouter, Reply
 
 __all__ = ["MenuUI", "WELCOME"]
@@ -34,7 +35,7 @@ Get a real phone number, receive your OTP in Telegram, pay only on success.
 Prices include everything — no hidden fees, and a failed order refunds itself
 automatically within seconds.
 
-Tap 🛒 Buy a number to start."""
+Tap 🛒 Buy a number below, or just type the service name (e.g. `zomato`)."""
 
 _HELP = """ℹ️ How it works
 
@@ -282,8 +283,8 @@ class MenuUI:
             "✳️ YCOTP Numbers\n\n"
             f"⚡ {count:,} services · 🇮🇳 real SIMs · 🛟 auto-refund if no OTP\n"
             f"💰 Your balance: {balance}\n\n"
-            "What would you like to do? (or just type a service name)\n\n"
-            "💡 The buttons at the bottom of the chat stay here — no need to type.",
+            "Tap 🛒 Buy a number below, or just type the service name "
+            "(e.g. `zomato`) to search.",
             rows=tuple(rows),
             persistent_menu=True,
         )
@@ -457,10 +458,82 @@ class MenuUI:
             "Every successful top-up is credited here and never expires.\n"
             "Refunds land here automatically." + nudge,
             rows=(
-                (("➕ Add money", "t"), ("🛒 Buy a number", "l")),
+                (("➕ Add money", "t"), ("🧾 Transaction history", "tx")),
+                (("🛒 Buy a number", "l"),),
                 (("🏠 Menu", "m"),),
             ),
         )
+
+    def wallet_history(self, user_id: str) -> Reply:
+        """🧾 Transaction history: every top-up, purchase and refund for this
+        customer, plus any LIVE purchased number, newest first. IST timestamps.
+        """
+        balance = self.router.balance_of(user_id)
+        store = self._store
+        lines = [f"🧾 *Transaction history*\n\n💰 Balance: {balance}\n"]
+        rows: list[tuple[tuple[str, str], ...]] = []
+
+        # LIVE purchased numbers are the most important "transaction" while they
+        # are sitting in the user's pocket -- surface them at the top.
+        live = self._active_numbers(user_id)
+        if live:
+            lines.append("📱 Active purchase:")
+            for a in live:
+                mins = max(1, int(round(a.seconds_left / 60)))
+                try:
+                    name = self.catalog.get(a.slug).name if self.catalog.has(a.slug) else a.slug
+                except Exception:  # noqa: BLE001
+                    name = a.slug
+                lines.append(f"  {name} · {a.gross} · ~{mins} min left")
+                lines.append(f"  📱 {a.phone}" + (f" · OTP {a.otp}" if a.has_otp else ""))
+                mode = "💰 New OTP" if a.has_otp else "💰 Check OTP"
+                rows.append(((f"{mode}", f"{'nx:' if a.has_otp else 'co:'}{a.token}"),
+                             ("♻️ Cancel", f"cx:{a.token}")))
+            lines.append("")
+
+        # Top-ups (approved / pending / declined), newest first.
+        entries: list[tuple[float, str, str]] = []
+        get_tups = getattr(store, "user_topups", None)
+        if callable(get_tups):
+            try:
+                for t in list(get_tups(user_id)):
+                    badge = {"approved": "🟢 Credits", "pending": "⏳ Pending",
+                             "declined": "🔴 Declined"}.get(t.status, "•")
+                    entries.append((t.created_ts, f"{badge} {t.amount}",
+                                    f"top-up #{t.id}"))
+            except Exception:  # noqa: BLE001 - display only
+                pass
+
+        # Orders (purchases / refunds / cancels), newest first.
+        recent = self._recent_orders(user_id)
+        for o in recent:
+            if hasattr(o, "success"):
+                try:
+                    name = self.catalog.get(o.slug).name if self.catalog.has(o.slug) else o.slug
+                except Exception:  # noqa: BLE001
+                    name = o.slug
+                status = o.status or ("delivered" if o.success else "refunded")
+                label = {"delivered": "🟢 Bought & delivered",
+                         "refunded": "🔵 Refunded",
+                         "cancelled": "🔵 Cancelled — refunded",
+                         "failed": "⚪ Failed — refunded"}.get(status, "•")
+                net = Money(o.gross.paise - o.refunded.paise)
+                entries.append((o.ts, f"{label} {o.gross}", f"{name} · net {net}"))
+
+        entries.sort(key=lambda e: -e[0])
+        if entries:
+            lines.append("📜 Everything:")
+            for ts, amt, note in entries:
+                lines.append(f"  {amt} · {note}")
+                lines.append(f"      {format_ts(ts)}")
+        else:
+            lines.append("No transactions yet. Add money or buy a number to "
+                         "see them here.")
+
+        if live:
+            rows.append((("🧾 My numbers", "o"),))
+        rows.append((("➕ Add money", "t"), ("🛒 Buy a number", "l"), ("🏠 Menu", "m")))
+        return Reply("\n".join(lines), rows=tuple(rows))
 
     # -- top-ups ----------------------------------------------------------
     # Flow: 💰 → ➕ Add money → pay by UPI → ✅ I've paid → amount →
@@ -720,7 +793,7 @@ class MenuUI:
         lines = [
             f"🧾 {name} — receipt #{o.id}",
             f"\n🕒 {when}",
-            f"\n📊 Status: **{status}**",
+            f"\n📊 Status: {status}",
             f"\n📱 Number: {o.phone or '—'}",
         ]
         if o.otp:
@@ -750,10 +823,8 @@ class MenuUI:
 
     @staticmethod
     def _iso(ts: float) -> str:
-        try:
-            return time.strftime("%d %b %Y · %H:%M:%S", time.localtime(ts))
-        except Exception:  # noqa: BLE001
-            return "—"
+        """Render a timestamp as IST (Asia/Kolkata), the bot's timezone."""
+        return format_ts(ts)
 
     def _active_numbers(self, user_id: str) -> list:
         store = self._store
@@ -817,7 +888,7 @@ class MenuUI:
         tot_g = tot_p = 0
         n = 0
         for o in orders:
-            when = time.strftime("%d %b %H:%M", time.localtime(o.ts))
+            when = format_ts(o.ts, sep=" · ", time_fmt="%H:%M")
             if o.success:
                 ratio = o.profit_ratio
                 pct = f" ({ratio:.0%})" if ratio is not None else ""
@@ -848,7 +919,7 @@ class MenuUI:
         lines = ["💳 Waiting for your review (newest first):"]
         rows: list[tuple[tuple[str, str], ...]] = []
         for t in pending:
-            when = time.strftime("%d %b %H:%M", time.localtime(t.created_ts))
+            when = format_ts(t.created_ts, sep=" · ", time_fmt="%H:%M")
             lines.append(f"\n#{t.id} · {t.amount} · user `{t.user_id}` · {when}")
             rows.append((
                 (f"✅ Credit {t.amount} (#{t.id})", f"ap:{t.id}"),
@@ -983,9 +1054,15 @@ class MenuUI:
                                      _int(parts[2], 0) if len(parts) == 3 else 0)
         if kind == "w":
             return self.wallet_card(user_id)
+        if kind == "tx":
+            return self.wallet_history(user_id)
         if kind == "o":
             return self.history_card(user_id)
         if kind == "h" and len(parts) == 2:
+            if parts[1] == "all":
+                # "📜 Completed history" on the My-numbers screen -> the full
+                # transaction history (top-ups + purchases + refunds + active).
+                return self.wallet_history(user_id)
             return self.history_detail(user_id, parts[1])
         if kind == "h":
             return Reply(_HELP, rows=((("🛒 Buy a number", "l"), ("🏠 Menu", "m")),))

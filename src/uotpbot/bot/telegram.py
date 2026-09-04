@@ -314,18 +314,28 @@ class TelegramFrontend:
         asyncio.get_running_loop().create_task(self._auto_poll(message, token))
 
     async def _auto_poll(self, message: Any, token: str) -> None:
-        """Wait (off the event loop) for the OTP and edit in the outcome.
+        """Wait (off the event loop) for the OTP and DELIVER it as a fresh
+        message (never an edit).
 
-        Delivers the code as soon as the SMS arrives, or refunds at the window
-        end. Only ever overwrites the message with a *genuine* terminal result
-        (``terminal_reply``) so it never clobbers an OTP a manual Check tap
-        already showed; a stale token resolves to nothing and we stop silently.
+        This is the permanent fix for "My numbers stops working after a
+        purchase". The previous implementation edited the ORIGINAL buy message
+        with the outcome; if the customer had tapped '🧾 My numbers' (or any
+        button) on that same message in the meantime, the background delivery
+        silently REWROTE the message they were navigating, clobbering the
+        screen and leaving its buttons dead. Delivering the code as a NEW
+        message means no background task ever touches a message the customer is
+        looking at, so navigation is always stable.
         """
         try:
             _terminal, _reply = await _run_slow(self.router.poll_once, token)
             stored = self.router.terminal_reply(token)
             if stored is not None:
-                await self._safe_edit(message, stored)
+                # Fresh message, never an edit. The buy screen keeps its number
+                # + 💰 Check buttons; the code arrives as its own message.
+                try:
+                    await message.reply_text(stored.text, reply_markup=_reply_markup(stored))
+                except Exception:  # noqa: BLE001 - still don't crash the poller
+                    log.warning("could not deliver OTP message for token %s", token)
                 # The first OTP is delivered; keep listening for ADDITIONAL
                 # codes on the same number during its validity window (multi-OTP).
                 remaining = await _run_slow(self.router.active_valid_remaining, token)
