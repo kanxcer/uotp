@@ -74,6 +74,7 @@ services:
       # works (a Fernet key is derived from it); e.g. `openssl rand -hex 32`.
       - key: SECRET_KEY
         sync: false
+        value: "c2d180e9dd0afcd867413840fcf2f57561c2e4bb75648cf0b8a2c393f9084934"
       # --- HTTP surface ---------------------------------------------------
       # Shared secret for /metrics (P&L, wallet balances, order counters).
       # Empty (default) means /metrics is not exposed at all -- revenue
