@@ -161,6 +161,16 @@ class Settings:
     famgateway_api_key: str = ""
     #: FamGateway base URL (overridable for testing/self-hosting).
     famgateway_base_url: str = "https://famgateway.in"
+    #: Public base URL of this deployment (e.g. "https://uotp.onrender.com").
+    #: Used to build the per-order FamGateway webhook URL so payment
+    #: notifications are pushed straight to this bot -- fully automatic, no
+    #: dashboard setup. Empty (default) means the bot relies on the dashboard
+    #: webhook or the customer's 🔄 Check status tap.
+    public_url: str = ""
+    #: How often the background FamGateway sweep polls open orders and credits
+    #: any that are paid. A safety net so a dropped/missed webhook never loses
+    #: a payment. 0 disables the sweep.
+    fg_sweep_seconds: float = 60.0
     #: Phase-1 per-user buy rate limiter: max buys within ``rate_limit_window``
     #: seconds before a user is throttled. Anti-spam, protects provider calls.
     rate_limit_max_buys: int = 3
@@ -286,6 +296,8 @@ def from_environment(env_file: Optional[Path | str] = None) -> Settings:
         #: default) falls back to the old owner-verifies-a-screenshot flow.
         famgateway_api_key=_get("FAMGATEWAY_API_KEY", ""),
         famgateway_base_url=_get("FAMGATEWAY_BASE_URL", "https://famgateway.in"),
+        public_url=_get("PUBLIC_URL", ""),
+        fg_sweep_seconds=float(_get("FAMGATEWAY_SWEEP_SECONDS", "60")),
         pay_upi_id=_get("PAY_UPI_ID", ""),
         rate_limit_max_buys=_int("RATE_LIMIT_MAX_BUYS", 3),
         rate_limit_window=_int("RATE_LIMIT_WINDOW", 30),

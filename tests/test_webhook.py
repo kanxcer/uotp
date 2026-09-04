@@ -98,3 +98,56 @@ def test_webhook_404_when_no_key_at_all():
     code, payload = handler(body, _sig("whatever", body))
     assert code == 400 and payload["status"] == "not_configured"
     assert wallets.balance("222") == Money(0)
+
+
+def test_kv_scan_returns_prefixed_orders():
+    """kv_scan must list open orders so the background sweep can find them."""
+    wallets = SqliteWallets(":memory:")
+    wallets.kv_set("fg_order:fg_1", "222")
+    wallets.kv_set("fg_order:fg_2", "333")
+    wallets.kv_set("fg_amt:fg_1", "50")
+    wallets.kv_set("other", "x")          # not an order
+    orders = wallets.kv_scan("fg_order:")
+    assert orders == {"fg_order:fg_1": "222", "fg_order:fg_2": "333"}
+    assert "other" not in orders
+
+
+def test_sweep_credits_paid_orders_and_skips_unpaid():
+    """The sweep credits a paid-but-no-webhook order and leaves unpaid ones.
+
+    Stubs the gateway so the test never touches the network."""
+    from uotpbot import __main__ as mm
+    import uotpbot.gateway as gw
+    from uotpbot.wallets import SqliteWallets
+
+    wallets = SqliteWallets(":memory:")
+    wallets.kv_set("fg_order:fg_paid", "222")
+    wallets.kv_set("fg_amt:fg_paid", "100")
+    wallets.kv_set("fg_order:fg_wait", "333")
+    wallets.kv_set("fg_amt:fg_wait", "50")
+
+    calls = []
+    class _FakeG:
+        def __init__(self, key, base_url):
+            calls.append((key, base_url))
+        def verify(self, order_id):
+            class S: pass
+            s = S()
+            s.is_paid = order_id == "fg_paid"
+            s.state = "success" if s.is_paid else "pending"
+            s.utr = "4" if s.is_paid else ""
+            s.sender_name = "P" if s.is_paid else ""
+            s.amount = None
+            return s
+
+    orig = gw.FamGateway
+    gw.FamGateway = _FakeG
+    try:
+        mm._famgateway_sweep(wallets, "k", "https://famgateway.in")
+    finally:
+        gw.FamGateway = orig
+
+    assert wallets.balance("222") == Money(10000), "paid order credited"
+    assert wallets.balance("333") == Money(0), "unpaid order not credited"
+    assert wallets.kv_get("fg_credited:fg_paid") == "1"
+    assert ("k", "https://famgateway.in") in calls

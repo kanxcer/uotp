@@ -233,12 +233,14 @@ class TelegramFrontend:
         pay_upi_id: str = "",
         famgateway_api_key: str = "",
         famgateway_base_url: str = "https://famgateway.in",
+        public_url: str = "",
     ) -> None:
         self.router = router
         self.ui = ui or MenuUI(
             router, support_contact=support_contact, pay_upi_id=pay_upi_id,
             famgateway_api_key=famgateway_api_key,
             famgateway_base_url=famgateway_base_url,
+            public_url=public_url,
         )
         # /buy (typed) and button buys must agree on maintenance mode:
         # the flag lives in the UI's store; the router just consults it.
@@ -561,6 +563,7 @@ def build_from_settings(settings: Settings, router_factory: Any) -> Any:
         famgateway_api_key=getattr(settings, "famgateway_api_key", ""),
         famgateway_base_url=getattr(settings, "famgateway_base_url",
                                     "https://famgateway.in"),
+        public_url=getattr(settings, "public_url", ""),
     )
     # Durable refunds: boot the retry worker so any refund left pending by an
     # earlier crash/redeploy is credited now (idempotent; safe on rebuilds).

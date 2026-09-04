@@ -613,7 +613,7 @@ class _FakeClient:
     def __init__(self):
         self.paid = False
         self.verify_calls = 0
-    def create_order(self, amount):
+    def create_order(self, amount, webhook_url=""):
         o = _FakeOrder()
         o.amount = amount
         return o
@@ -668,3 +668,47 @@ def test_famgateway_full_automatic_topup(rig):
     again = r5.deferred(USER) if r5.deferred else r5
     assert "already credited" in again.text.lower()
     assert router.balance_of(USER) == INR(100)
+
+
+def test_famgateway_order_gets_per_order_webhook_url(rig):
+    """With a PUBLIC_URL configured, each FamGateway order carries a per-order
+    webhook_url so payment callbacks are pushed to this bot automatically (no
+    dashboard config). Without it, no webhook_url is sent (dashboard path)."""
+    from uotpbot.wallets import SqliteWallets
+    _ui, router, _p, _l = rig
+    router.wallets = SqliteWallets(":memory:")
+    ui = MenuUI(router, famgateway_api_key="key", public_url="https://uotp.onrender.com")
+    seen = {}
+    class _C:
+        def create_order(self, amount, webhook_url=""):
+            seen["webhook_url"] = webhook_url
+            class O: pass
+            o = O()
+            o.order_id = "fg_w"
+            o.amount = amount
+            o.payable_amount = amount
+            o.qr_url = "https://famgateway.in/x.png"
+            return o
+    ui._fg_client = _C()
+    ui.button(USER, "t:amount")
+    r = ui.text(USER, "50")
+    assert r.deferred is not None
+    r.deferred(USER)   # run the job to create the order
+    assert seen["webhook_url"] == "https://uotp.onrender.com/webhooks/famgateway"
+    # No public_url -> no webhook_url (rely on dashboard webhook / sweeper).
+    ui2 = MenuUI(router, famgateway_api_key="key")
+    seen2 = {}
+    class _C2:
+        def create_order(self, amount, webhook_url=""):
+            seen2["webhook_url"] = webhook_url
+            class O: pass
+            o = O()
+            o.order_id = "fg_w2"
+            o.amount = amount
+            o.payable_amount = amount
+            o.qr_url = "https://famgateway.in/x.png"
+            return o
+    ui2._fg_client = _C2()
+    ui2.button(USER, "t:amount")
+    ui2.text(USER, "50").deferred(USER)
+    assert seen2["webhook_url"] == ""

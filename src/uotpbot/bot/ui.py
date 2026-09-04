@@ -133,6 +133,7 @@ class MenuUI:
         pay_upi_id: str = "",
         famgateway_api_key: str = "",
         famgateway_base_url: str = "https://famgateway.in",
+        public_url: str = "",
         history_size: int = 20,
         now: Optional[Callable[[], float]] = None,
     ) -> None:
@@ -154,6 +155,12 @@ class MenuUI:
         #: order instead of asking customers to screenshot a manual QR.
         self._fg_api_default = famgateway_api_key.strip()
         self._fg_base_url = famgateway_base_url
+        #: Public base URL of this deployment. When set, the FamGateway order is
+        #: created with a per-order ``webhook_url`` so FamGateway pushes the
+        #: payment callback straight to this bot -- fully automatic credit with
+        #: no dashboard config. Empty relies on the dashboard/webhook or the
+        #: customer's 🔄 Check status tap to poll+credit.
+        self.public_url = (public_url or "").rstrip("/")
         self._fg_client = None  # lazy, built from the (possibly kv-overridden) key
         #: order_id -> (user_id, amount Decimal, payable Decimal, created_ts).
         #: Session-scoped: a redeploy loses it, but the customer just re-taps
@@ -980,8 +987,14 @@ class MenuUI:
                     "FamGateway isn't configured right now. Try again shortly.",
                     ok=False, rows=((("🏠 Menu", "m"),),),
                 )
+            # Per-order webhook: FamGateway pushes the payment callback straight
+            # to this bot so the wallet is credited automatically -- no dashboard
+            # setup, no reliance on the customer tapping 🔄 Check status.
+            webhook_url = ""
+            if self.public_url:
+                webhook_url = f"{self.public_url}/webhooks/famgateway"
             try:
-                order = client.create_order(amount_dec)
+                order = client.create_order(amount_dec, webhook_url=webhook_url)
             except Exception as exc:  # noqa: BLE001 - surface to the customer
                 log.error("FamGateway create_order failed: %s", exc)
                 return Reply(

@@ -185,7 +185,7 @@ def test_famgateway_amount_message_delivers_qr_photo():
 
     class _Client:
         api_key = "k"
-        def create_order(self, amount):
+        def create_order(self, amount, webhook_url=""):
             class O: pass
             o = O()
             o.order_id = "fg_T"

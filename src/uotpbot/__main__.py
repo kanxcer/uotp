@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -97,6 +98,113 @@ def _make_poller(settings: Settings, router_factory, *, owner_alert=None):
     return lambda: run_bot(settings, router_factory, owner_alert=owner_alert)
 
 
+def _credit_fg_wallet(store, uid: str, order_id: str, amount_dec) -> bool:
+    """Atomically credit ``amount_dec`` rupees to ``uid`` and mark the order
+    credited. Returns True on success. Idempotent: callers check the
+    ``fg_credited:<order>`` marker first; the marker is (re)set here so two
+    paths (webhook + sweep) can never double-credit."""
+    from decimal import Decimal
+    from .money import Money
+
+    try:
+        money = Money(int(amount_dec * Decimal(100)))
+        store.adjust(f"{uid}", money)
+        set_ = getattr(store, "kv_set", None)
+        if callable(set_):
+            set_(f"fg_credited:{order_id}", "1")
+    except Exception as exc:  # noqa: BLE001
+        log.error("FamGateway credit failed for %s: %s", order_id, exc)
+        return False
+    log.info("FamGateway credited %s to user %s (order %s)", money, uid, order_id)
+    return True
+
+
+def _live_fg_key(store, env_key: str) -> str:
+    """The live FamGateway API key: kv override wins over the env default."""
+    get_ = getattr(store, "kv_get", None)
+    if callable(get_):
+        try:
+            return (get_("famgateway_api_key") or "").strip() or env_key
+        except Exception:  # noqa: BLE001
+            return env_key
+    return env_key
+
+
+def _famgateway_sweep(store, key: str, base_url: str) -> None:
+    """Verify every open (uncredited) order once and credit any that is paid.
+
+    Safety net for the case where a payment webhook is dropped, missed, or the
+    customer pays without the push ever arriving. Each pass scans the
+    ``fg_order:<id>`` mappings and checks the gateway; paid orders are credited
+    through ``_credit_fg_wallet`` (idempotent, same marker the webhook uses).
+    Orders that fail to verify are left for the next pass, so a transient
+    gateway hiccup never loses a payment.
+    """
+    from .gateway import FamGateway
+
+    scan = getattr(store, "kv_scan", None)
+    if not callable(scan):
+        return
+    get_ = getattr(store, "kv_get", None)
+    if not callable(get_):
+        return
+    try:
+        gateway = FamGateway(key, base_url=base_url)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not build FamGateway client for sweep: %s", exc)
+        return
+    for order_key, uid in scan("fg_order:").items():
+        if not uid:
+            continue
+        order_id = order_key.split("fg_order:", 1)[-1]
+        if get_(f"fg_credited:{order_id}"):
+            continue
+        amt_s = get_(f"fg_amt:{order_id}")
+        if not amt_s:
+            continue
+        try:
+            status = gateway.verify(order_id)
+        except Exception as exc:  # noqa: BLE001 - leave for next pass
+            log.warning("sweep verify failed for %s: %s", order_id, exc)
+            continue
+        if status.is_paid:
+            try:
+                from decimal import Decimal
+                amt = Decimal(amt_s)
+            except Exception:  # noqa: BLE001
+                continue
+            _credit_fg_wallet(store, uid, order_id, amt)
+
+
+def _start_fg_sweeper(settings: Settings, wallets, stop: threading.Event,
+                      *, interval: float = 60.0) -> Optional[threading.Thread]:
+    """Start the background FamGateway sweep thread, or return None.
+
+    Returns None when there is no live API key (nothing to poll) or the
+    interval is <= 0. The thread loops: read the live key each pass (so a key
+    set live via the admin panel is honoured), sweep open orders, sleep.
+    """
+    base_url = getattr(settings, "famgateway_base_url",
+                       "https://famgateway.in")
+
+    def run() -> None:
+        while not stop.is_set():
+            key = _live_fg_key(wallets, getattr(settings, "famgateway_api_key", ""))
+            if key:
+                try:
+                    _famgateway_sweep(wallets, key, base_url)
+                except Exception as exc:  # noqa: BLE001 - never kill the thread
+                    log.warning("FamGateway sweep failed: %s", exc)
+            if interval <= 0:
+                return
+            stop.wait(interval)
+
+    thread = threading.Thread(target=run, name="fg-sweep", daemon=True)
+    thread.start()
+    log.info("FamGateway sweep started (every %ss)", interval)
+    return thread
+
+
 def _famgateway_webhook(settings: Settings, wallets):
     """Build the FamGateway webhook handler.
 
@@ -168,16 +276,8 @@ def _famgateway_webhook(settings: Settings, wallets):
             amt_dec = Decimal(amt_s)
         except Exception:  # noqa: BLE001
             return 200, {"status": "bad_amount"}
-        try:
-            from .money import Money
-            money = Money(int(amt_dec * Decimal(100)))
-            store.adjust(f"{uid}", money)
-            set_(f"fg_credited:{order_id}", "1")
-        except Exception as exc:  # noqa: BLE001
-            log.error("FamGateway credit failed for %s: %s", order_id, exc)
+        if not _credit_fg_wallet(store, uid, order_id, amt_dec):
             return 200, {"status": "credit_error"}
-        log.info("FamGateway webhook credited %s to user %s (order %s)",
-                 money, uid, order_id)
         return 200, {"status": "credited"}
 
     return handle
@@ -268,9 +368,18 @@ def _serve(settings: Settings) -> int:
         metrics_token=settings.metrics_token,
         famgateway_webhook=_famgateway_webhook(settings, wallets),
     )
+    # Background FamGateway sweeper: verify open orders and credit any that are
+    # paid, so a dropped/missed webhook never loses a payment. Daemon thread;
+    # dies with the process. Skipped entirely when no API key is available.
+    sweep_stop = threading.Event()
+    sweep_thread = _start_fg_sweeper(
+        settings, wallets, sweep_stop,
+        interval=max(0.0, settings.fg_sweep_seconds),
+    )
     try:
         server.serve_forever()
     finally:
+        sweep_stop.set()
         wallet_monitor.stop()
     if subbots is not None:
         subbots.manager.stop_all()

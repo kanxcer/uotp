@@ -51,6 +51,15 @@ class WalletStore:
     def close(self) -> None:  # pragma: no cover - lifecycle nicety
         pass
 
+    def kv_scan(self, prefix: str) -> dict[str, str]:
+        """Return {key: value} for every stored key starting with ``prefix``.
+
+        Implementations back a small key/value table (payment settings, order
+        mappings). Optional: callers check ``hasattr`` and fall back to scanning
+        nothing when absent.
+        """
+        return {}
+
 
 class ScopedWallets(WalletStore):
     """One bot's view of a shared wallet store.
@@ -101,6 +110,10 @@ class ScopedWallets(WalletStore):
 
     def kv_set(self, key, value):
         self._inner.kv_set(f"{self._scope}:{key}", value)
+
+    def kv_scan(self, prefix: str) -> dict[str, str]:
+        """Return {key: value} for every key starting with ``prefix`` in scope."""
+        return self._inner.kv_scan(f"{self._scope}:{prefix}")
 
     def record_order(self, *, user_id, slug, amount, phone="", otp="",
                      success=False, profit=Money(0), status="", reason="",
@@ -670,6 +683,14 @@ class SqliteWallets(WalletStore):
                 (key, value),
             )
 
+    def kv_scan(self, prefix: str) -> dict[str, str]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT key, value FROM kv WHERE key LIKE ?",
+                (f"{prefix}%",),
+            ).fetchall()
+        return {k: v for k, v in rows}
+
     # -- orders + float stats ----------------------------------------------
     def record_order(self, *, user_id: str, slug: str, amount: Money,
                      phone: str = "", otp: str = "", success: bool = False,
@@ -1025,6 +1046,14 @@ class PostgresWallets(WalletStore):
                 "ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value",
                 (key, value),
             )
+
+    def kv_scan(self, prefix: str) -> dict[str, str]:
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT key, value FROM {self._tk} WHERE key LIKE %s",
+                (f"{prefix}%",),
+            ).fetchall()
+        return {k: v for k, v in rows}
 
     # -- orders + float stats ----------------------------------------------
     def record_order(self, *, user_id: str, slug: str, amount: Money,
