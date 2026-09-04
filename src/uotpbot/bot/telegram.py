@@ -493,15 +493,19 @@ class TelegramFrontend:
         photo_url = getattr(reply, "photo_url", None)
         if photo or photo_url:
             if photo:
-                await message.reply_photo(
+                sent = await message.reply_photo(
                     photo=photo, caption=reply.text[:1024],
                     reply_markup=_reply_markup(reply),
                 )
             else:
-                await message.reply_photo(
+                sent = await message.reply_photo(
                     photo=photo_url, caption=reply.text[:1024],
                     reply_markup=_reply_markup(reply),
                 )
+            # Remember where the FamGateway QR landed so the payment
+            # webhook/sweep can edit THIS message to a success note as soon as
+            # the money is confirmed -- no tap needed from the customer.
+            self._remember_fg_message(sent, reply)
             return
         markup = _reply_menu_markup() if getattr(reply, "persistent_menu", False) \
             else _reply_markup(reply)
@@ -516,6 +520,25 @@ class TelegramFrontend:
                 await context.bot.send_message(chat_id=int(chat_id), text=text)
             except Exception:
                 log.warning("notification to %s failed", chat_id, exc_info=True)
+
+    def _remember_fg_message(self, sent, reply) -> None:
+        """Persist the QR message identity for an order (best-effort).
+
+        ``sent`` is the :class:`Message` returned by ``reply_photo``; it carries
+        the chat id and message id that let the payment notifier edit the QR in
+        place on confirmation. Mocks / non-Telegram transports simply no-op.
+        """
+        try:
+            order_id = self.ui._fg_order_id(reply)
+            if not order_id:
+                return
+            chat_id = getattr(getattr(sent, "chat", None), "id", None)
+            message_id = getattr(sent, "message_id", None)
+            if chat_id is None or message_id is None:
+                return
+            self.ui.remember_fg_message(order_id, chat_id, message_id)
+        except Exception:  # noqa: BLE001 - a nicety, never break delivery
+            pass
 
     @staticmethod
     def _is_photo_message(message: Any) -> bool:
@@ -637,12 +660,16 @@ def _start_polling(app: Any) -> None:
 
 
 def run_bot(settings: Settings, router_factory: Any,
-            *, owner_alert: Any = None) -> None:  # pragma: no cover
+            *, owner_alert: Any = None, payment_notifier: Any = None) -> None:  # pragma: no cover
     """Start long-polling. Blocking; meant for a real deployment."""
     app = build_from_settings(settings, router_factory)
     # Phase-1: hand the alert bridge to the wallet monitor thread so it can
     # reach the owner through this app's event loop.
     if owner_alert is not None:
         owner_alert.attach(app)
+    # Phase-2: hand the payment notifier to the app so the FamGateway
+    # webhook/sweep can edit a customer's QR message the moment payment lands.
+    if payment_notifier is not None:
+        payment_notifier.attach(app)
     log.info("bot starting")
     _start_polling(app)

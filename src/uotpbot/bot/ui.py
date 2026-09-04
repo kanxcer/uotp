@@ -509,6 +509,36 @@ class MenuUI:
         get = getattr(store, "kv_get", None)
         return get("pay_qr_file_id") if callable(get) else None
 
+    def remember_fg_message(self, order_id: str, chat_id, message_id) -> None:
+        """Record where a FamGateway QR message was sent so the webhook/sweep
+        can edit it in place the moment payment is confirmed.
+
+        ``chat_id`` / ``message_id`` let the payment notifier edit the exact
+        message the customer is looking at -- turning it into a success note
+        rather than leaving them to tap a button. Stored in the wallet kv table
+        (``fg_msg:<order>``) like the order/amount mappings, so it survives a
+        redeploy; missing or unparseable values simply skip the edit.
+        """
+        store = self._store
+        set_ = getattr(store, "kv_set", None) if store is not None else None
+        if not callable(set_):
+            return
+        try:
+            set_(f"fg_msg:{order_id}", f"{chat_id}:{message_id}")
+        except Exception:  # noqa: BLE001 - an edit is a nicety, never fatal
+            log.warning("could not persist fg_msg for %s", order_id)
+
+    @staticmethod
+    def _fg_order_id(reply) -> Optional[str]:
+        """The FamGateway order id carried on a reply's buttons, if any."""
+        for row in getattr(reply, "rows", ()) or ():
+            for label, data in row:
+                if isinstance(data, str) and data.startswith("fg:"):
+                    parts = data.split(":")
+                    if len(parts) == 3 and parts[1] in ("pay", "check"):
+                        return parts[2]
+        return None
+
     # -- text entry ------------------------------------------------------
     def text(self, user_id: str, body: str) -> Reply:
         """One funnel for typed messages.

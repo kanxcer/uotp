@@ -206,6 +206,11 @@ def test_famgateway_amount_message_delivers_qr_photo():
         msg.message_id = 5
         msg.reply_text = AsyncMock()
         msg.reply_photo = AsyncMock()
+        # The sent photo message returns a Message with chat + message_id.
+        sent = MagicMock()
+        sent.chat.id = 222
+        sent.message_id = 77
+        msg.reply_photo.return_value = sent
         upd = MagicMock()
         upd.message = msg
         await fe.on_message(upd)
@@ -214,6 +219,9 @@ def test_famgateway_amount_message_delivers_qr_photo():
         assert a[1].get("photo") == "https://famgateway.in/s.png"
         assert "fg_T" in a[1].get("caption", "")
         assert msg.reply_text.await_count == 1, "placeholder sent once"
+        # The QR message identity is persisted so the webhook can edit it in place.
+        assert w.kv_get("fg_msg:fg_T") == "222:77", \
+            "must remember where the QR was sent for on-completion editing"
 
     asyncio.run(run())
 

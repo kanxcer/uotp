@@ -8,7 +8,8 @@ import pytest
 from uotpbot.wallets import SqliteWallets
 from uotpbot.money import Money
 from uotpbot.config import Settings, UotpConfig, FeeModel, EngineConfig
-from uotpbot.__main__ import _famgateway_webhook
+from uotpbot.__main__ import _famgateway_webhook, _credit_fg_wallet, _notify_paid
+from uotpbot.bot.alerts import PaymentNotifier
 
 
 def _settings():
@@ -151,3 +152,87 @@ def test_sweep_credits_paid_orders_and_skips_unpaid():
     assert wallets.balance("333") == Money(0), "unpaid order not credited"
     assert wallets.kv_get("fg_credited:fg_paid") == "1"
     assert ("k", "https://famgateway.in") in calls
+
+
+# -- QR message auto-edit on payment completion ---------------------------
+def test_paid_order_edits_the_qr_message_via_notifier():
+    """Once a payment is credited, the QR message the customer was looking at
+    must be edited to a success note (via the PaymentNotifier bridge) -- no tap
+    needed. Uses a materialised chat:message carried in fg_msg:<order>."""
+    wallets = SqliteWallets(":memory:")
+    # The bot remembered where it sent the QR for this order.
+    wallets.kv_set("fg_order:fg_EDIT", "222")
+    wallets.kv_set("fg_amt:fg_EDIT", "100")
+    wallets.kv_set("fg_msg:fg_EDIT", "222:77")
+
+    edited = {}
+    class _FakeNotifier:
+        def edit_order_message(self, chat_id, message_id, text):
+            edited["call"] = (chat_id, message_id, text)
+            return True
+    notifier = _FakeNotifier()
+
+    ok = _credit_fg_wallet(wallets, "222", "fg_EDIT", Decimal("100"),
+                           notifier=notifier)
+    assert ok is True
+    assert wallets.balance("222") == Money(10000)
+    # The QR message was edited to a success note, not left as a plain QR.
+    assert edited["call"] is not None
+    chat_id, message_id, text = edited["call"]
+    assert (chat_id, message_id) == ("222", 77)
+    assert "Payment received" in text
+    assert "100" in text
+
+
+def test_happy_path_message_not_found_skips_edit():
+    """Without a stored message (e.g. redeploy before the QR was sent, or a
+    sweep-only run) the credit still happens and edit is simply skipped."""
+    wallets = SqliteWallets(":memory:")
+    wallets.kv_set("fg_order:fg_NOEDIT", "222")
+    wallets.kv_set("fg_amt:fg_NOEDIT", "50")
+    edited = []
+    class _FakeNotifier:
+        def edit_order_message(self, chat_id, message_id, text):
+            edited.append((chat_id, message_id, text))
+            return True
+    ok = _credit_fg_wallet(wallets, "222", "fg_NOEDIT", Decimal("50"),
+                           notifier=_FakeNotifier())
+    assert ok is True
+    assert wallets.balance("222") == Money(5000)
+    assert edited == [], "no fg_msg stored -> no edit attempted"
+
+
+def test_payment_notifier_falls_back_to_text_when_caption_edit_fails():
+    """The notifier tries edit_message_caption for the QR photo; if that is
+    rejected (e.g. not actually a photo), it falls back to edit_message_text."""
+    import asyncio
+    from concurrent.futures import Future
+    from unittest.mock import AsyncMock, MagicMock
+    import uotpbot.bot.alerts as alerts_mod
+    app = MagicMock()
+    app.loop = asyncio.new_event_loop()
+    app.bot.edit_message_caption = AsyncMock(side_effect=Exception("cannot edit"))
+    app.bot.edit_message_text = AsyncMock()
+    notifier = PaymentNotifier()
+    notifier.attach(app)
+    # The bridge schedules on the poller loop; run the coroutine inline here
+    # since this test owns a non-running loop.
+    def _run_now(coro, loop):
+        fut = Future()
+        try:
+            loop.run_until_complete(coro)
+            fut.set_result(None)
+        except Exception as exc:  # pragma: no cover
+            fut.set_exception(exc)
+        return fut
+    orig = alerts_mod.asyncio.run_coroutine_threadsafe
+    alerts_mod.asyncio.run_coroutine_threadsafe = _run_now
+    try:
+        ok = notifier.edit_order_message(222, 77, "✅ done")
+    finally:
+        alerts_mod.asyncio.run_coroutine_threadsafe = orig
+        app.loop.close()
+    assert ok is True
+    # Caption edit failed -> text edit used as the fallback.
+    app.bot.edit_message_text.assert_awaited_once_with(
+        chat_id=222, message_id=77, text="✅ done")

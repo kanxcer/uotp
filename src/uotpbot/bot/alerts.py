@@ -52,3 +52,61 @@ class OwnerAlert:
             log.info("owner alert sent: %s", text.splitlines()[0])
         except Exception as exc:  # noqa: BLE001 - never kill a caller
             log.error("owner alert delivery failed: %s", exc)
+
+
+class PaymentNotifier:
+    """Thread-safe bridge that edits a customer's QR payment message in place.
+
+    The FamGateway webhook and the background sweep run on OTHER threads (the
+    HTTP server thread / the sweep daemon). The Telegram ``Application`` runs
+    its event loop on the poller thread. This holder lets those paths hand the
+    app a request to *edit the QR message* once payment is confirmed -- so the
+    customer sees "✅ Payment received" on the very message they just paid on,
+    without tapping anything. Degrades to a log line when no app is present
+    (sweep-only / tests), never raising into the caller.
+    """
+
+    def __init__(self) -> None:
+        self._app = None
+
+    def attach(self, app) -> None:
+        """Called once the Telegram app is built on the poller thread."""
+        self._app = app
+        if app is not None:
+            log.info("payment notifier bridge attached")
+
+    def edit_order_message(self, chat_id, message_id: int, text: str) -> bool:
+        """Edit the QR message in ``chat_id`` to ``text`` (success note).
+
+        The QR is a PHOTO message with a caption + inline keyboard, so we edit
+        the CAPTION (which Telegram allows and keeps the buttons); if that
+        fails we fall back to editing the message text. Returns True when an
+        edit was dispatched.
+        """
+        app = self._app
+        if app is None or chat_id is None or message_id is None:
+            log.info("[no-app] edit payment message for order skipped")
+            return False
+        try:
+            loop = getattr(app, "loop", None)
+            if loop is None:
+                log.warning("[no-loop] edit payment message for order skipped")
+                return False
+            async def _edit() -> None:
+                bot = app.bot
+                try:
+                    await bot.edit_message_caption(
+                        chat_id=int(chat_id), message_id=int(message_id),
+                        caption=text[:1024],
+                    )
+                except Exception:
+                    # Not a photo (or caption not editable): edit the text.
+                    await bot.edit_message_text(
+                        chat_id=int(chat_id), message_id=int(message_id), text=text,
+                    )
+            asyncio.run_coroutine_threadsafe(_edit(), loop)
+            log.info("payment message edited for order in chat %s", chat_id)
+            return True
+        except Exception as exc:  # noqa: BLE001 - never kill a caller
+            log.error("payment message edit failed: %s", exc)
+            return False

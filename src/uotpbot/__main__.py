@@ -79,7 +79,8 @@ def _build(settings: Settings):
     return catalog, provider, ledger, pricer, engine
 
 
-def _make_poller(settings: Settings, router_factory, *, owner_alert=None):
+def _make_poller(settings: Settings, router_factory, *, owner_alert=None,
+                 payment_notifier=None):
     """Return a callable that runs the Telegram poller, or None."""
     if not settings.has_telegram:
         log.warning(
@@ -95,10 +96,11 @@ def _make_poller(settings: Settings, router_factory, *, owner_alert=None):
             "Install with: pip install '.[telegram]'"
         )
         return None
-    return lambda: run_bot(settings, router_factory, owner_alert=owner_alert)
+    return lambda: run_bot(settings, router_factory, owner_alert=owner_alert,
+                           payment_notifier=payment_notifier)
 
 
-def _credit_fg_wallet(store, uid: str, order_id: str, amount_dec) -> bool:
+def _credit_fg_wallet(store, uid: str, order_id: str, amount_dec, *, notifier=None) -> bool:
     """Atomically credit ``amount_dec`` rupees to ``uid`` and mark the order
     credited. Returns True on success. Idempotent: callers check the
     ``fg_credited:<order>`` marker first; the marker is (re)set here so two
@@ -116,7 +118,38 @@ def _credit_fg_wallet(store, uid: str, order_id: str, amount_dec) -> bool:
         log.error("FamGateway credit failed for %s: %s", order_id, exc)
         return False
     log.info("FamGateway credited %s to user %s (order %s)", money, uid, order_id)
+    # Edit the QR message the customer was looking at so they SEE the credit
+    # instantly, without tapping anything.
+    _notify_paid(store, order_id, money, notifier)
     return True
+
+
+def _notify_paid(store, order_id: str, money, notifier) -> None:
+    """Turn the customer's QR message into a 'Payment received' note.
+
+    Fired right after a credit (webhook OR sweep) so the exact message the
+    customer just paid on is edited in place. Best-effort: no notifier, no
+    stored message location, or a failure means we simply don't edit -- the
+    credit is already done and 'Check status' still works.
+    """
+    if notifier is None:
+        return
+    get_ = getattr(store, "kv_get", None)
+    if not callable(get_):
+        return
+    try:
+        loc = get_(f"fg_msg:{order_id}")
+        if not loc or ":" not in loc:
+            return
+        chat_id, msg_id = loc.split(":", 1)
+        text = (
+            "✅ Payment received!\n\n"
+            f"{money} added to your balance.\n\n"
+            "Tap 💰 Balance to see it, or start buying 🛒"
+        )
+        notifier.edit_order_message(chat_id, int(msg_id), text)
+    except Exception as exc:  # noqa: BLE001 - the credit already happened
+        log.warning("could not edit QR message for %s: %s", order_id, exc)
 
 
 def _live_fg_key(store, env_key: str) -> str:
@@ -130,7 +163,7 @@ def _live_fg_key(store, env_key: str) -> str:
     return env_key
 
 
-def _famgateway_sweep(store, key: str, base_url: str) -> None:
+def _famgateway_sweep(store, key: str, base_url: str, *, notifier: object = None) -> None:
     """Verify every open (uncredited) order once and credit any that is paid.
 
     Safety net for the case where a payment webhook is dropped, missed, or the
@@ -173,11 +206,12 @@ def _famgateway_sweep(store, key: str, base_url: str) -> None:
                 amt = Decimal(amt_s)
             except Exception:  # noqa: BLE001
                 continue
-            _credit_fg_wallet(store, uid, order_id, amt)
+            _credit_fg_wallet(store, uid, order_id, amt, notifier=notifier)
 
 
 def _start_fg_sweeper(settings: Settings, wallets, stop: threading.Event,
-                      *, interval: float = 60.0) -> Optional[threading.Thread]:
+                      *, interval: float = 60.0,
+                      notifier: object = None) -> Optional[threading.Thread]:
     """Start the background FamGateway sweep thread, or return None.
 
     Returns None when there is no live API key (nothing to poll) or the
@@ -192,7 +226,7 @@ def _start_fg_sweeper(settings: Settings, wallets, stop: threading.Event,
             key = _live_fg_key(wallets, getattr(settings, "famgateway_api_key", ""))
             if key:
                 try:
-                    _famgateway_sweep(wallets, key, base_url)
+                    _famgateway_sweep(wallets, key, base_url, notifier=notifier)
                 except Exception as exc:  # noqa: BLE001 - never kill the thread
                     log.warning("FamGateway sweep failed: %s", exc)
             if interval <= 0:
@@ -205,7 +239,7 @@ def _start_fg_sweeper(settings: Settings, wallets, stop: threading.Event,
     return thread
 
 
-def _famgateway_webhook(settings: Settings, wallets):
+def _famgateway_webhook(settings: Settings, wallets, *, notifier: object = None):
     """Build the FamGateway webhook handler.
 
     Always registered, so ``POST /webhooks/famgateway`` exists even when the
@@ -276,7 +310,7 @@ def _famgateway_webhook(settings: Settings, wallets):
             amt_dec = Decimal(amt_s)
         except Exception:  # noqa: BLE001
             return 200, {"status": "bad_amount"}
-        if not _credit_fg_wallet(store, uid, order_id, amt_dec):
+        if not _credit_fg_wallet(store, uid, order_id, amt_dec, notifier=notifier):
             return 200, {"status": "credit_error"}
         return 200, {"status": "credited"}
 
@@ -328,17 +362,19 @@ def _serve(settings: Settings) -> int:
 
     # Phase-1 provider wallet monitor (P2): alert the owner BEFORE the wallet
     # runs dry, so an order never dies to NO_BALANCE mid-bulk.
-    from .bot.alerts import OwnerAlert
+    from .bot.alerts import OwnerAlert, PaymentNotifier
     from .wallet_monitor import WalletMonitor
 
     owner_alert = OwnerAlert(settings.owner_id)
+    payment_notifier = PaymentNotifier()
     wallet_monitor = WalletMonitor(
         provider, notify_owner=owner_alert.send,
         check_interval=float(settings.wallet_monitor_seconds),
     )
     wallet_monitor.start()
 
-    poller = _make_poller(settings, router_factory, owner_alert=owner_alert)
+    poller = _make_poller(settings, router_factory, owner_alert=owner_alert,
+                          payment_notifier=payment_notifier)
     if subbots is not None:
         started = subbots.manager.start_all()
         log.info("white-label: %d sub-bot(s) registered, started %d",
@@ -367,7 +403,8 @@ def _serve(settings: Settings) -> int:
         wallet_monitor=wallet_monitor,
         subsystem_stats=main_router.phase1_snapshot,
         metrics_token=settings.metrics_token,
-        famgateway_webhook=_famgateway_webhook(settings, wallets),
+        famgateway_webhook=_famgateway_webhook(settings, wallets,
+                                               notifier=payment_notifier),
     )
     # Background FamGateway sweeper: verify open orders and credit any that are
     # paid, so a dropped/missed webhook never loses a payment. Daemon thread;
@@ -376,6 +413,7 @@ def _serve(settings: Settings) -> int:
     sweep_thread = _start_fg_sweeper(
         settings, wallets, sweep_stop,
         interval=max(0.0, settings.fg_sweep_seconds),
+        notifier=payment_notifier,
     )
     try:
         server.serve_forever()
