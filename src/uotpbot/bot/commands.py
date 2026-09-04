@@ -147,6 +147,10 @@ class CommandRouter:
         #: its token is invalid or the poller crashed) rather than only what the
         #: registry row says. Optional: absent in tests / non-serve deployments.
         self.subbot_manager = subbot_manager
+        #: Live hook the UI sets so /createbot agrees with the "Run your own
+        #: bot" button about whether cloning is enabled. ``None`` means
+        #: enabled (the historical behaviour when no UI owns the flag).
+        self.createbot_enabled_fn: Optional[Callable[[], bool]] = None
         self._createbot_flow: Optional[CreateBotFlow] = (
             CreateBotFlow(subbots, platform_fee,
                           token_verifier=bot_token_verifier)
@@ -234,6 +238,15 @@ class CommandRouter:
         # Ban is a hard NO in every mode (allowlist or anyone), independent of
         # the allowlist so banning one user can never affect the rest.
         if user_id in self._banned:
+            return False
+        # The owner is never shut out, even if the access switch is off or the
+        # allowlist doesn't list them explicitly (they administer the bot).
+        if self._is_owner(user_id):
+            return True
+        # Owner kill-switch ("allow users to use this bot"): when off, only the
+        # owner is authorised. The hook is set by the UI; None = enabled.
+        fn = getattr(self, "bot_enabled_fn", None)
+        if callable(fn) and not fn():
             return False
         return not self.allowed_users or user_id in self.allowed_users
 
@@ -364,6 +377,17 @@ class CommandRouter:
     def handle(self, user_id: str, text: str) -> Reply:
         """Route one incoming message."""
         text = (text or "").strip()
+        # Owner kill-switch ("allow users to use this bot"): shut non-owners out
+        # of the command surface too, with the same friendly message as the UI.
+        if not self._is_owner(user_id):
+            fn = getattr(self, "bot_enabled_fn", None)
+            if callable(fn) and not fn():
+                return Reply(
+                    "🔒 This bot is temporarily switched off by the owner. "
+                    "\n\nYour balance and any active numbers are safe. Please "
+                    "try again later.",
+                    ok=False,
+                )
         # Plain text can be an answer to an in-progress /createbot: bot
         # tokens, provider API keys and yes/no confirmations never start with
         # a slash. This check MUST run before the slash test below -- without
@@ -1188,6 +1212,18 @@ class CommandRouter:
     # -- white-label -----------------------------------------------------
     def cmd_createbot(self, user_id: str, args: list[str]) -> Reply:
         assert self._createbot_flow is not None
+        # Owner can flip "Run your own bot" off from the admin panel; the UI
+        # hides the button, and the command must refuse too so a typed
+        # /createbot can't bypass it.
+        fn = getattr(self, "createbot_enabled_fn", None)
+        if callable(fn) and not fn():
+            return Reply(
+                "🤖 'Run your own bot' is currently turned OFF by the owner. "
+                "You can't create a clone right now.\n\n"
+                "Existing clones keep working. Ask the owner to turn the "
+                "feature back on to create more.",
+                ok=False,
+            )
         if args:
             # `/createbot <token>` is accepted as a shortcut.
             self._createbot_flow.start(user_id)

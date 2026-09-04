@@ -15,6 +15,8 @@ import pytest
 from uotpbot.bot.commands import CommandRouter
 from uotpbot.bot.ui import MenuUI
 from uotpbot.catalog import Catalog, ServiceCost, WalletPack
+from uotpbot.createbot import CreateBotFlow
+from uotpbot.whitelabel import PlatformFee, SubBotRegistry
 from uotpbot.engine import BotEngine, EngineConfig
 from uotpbot.ledger import Ledger
 from uotpbot.money import INR
@@ -737,3 +739,77 @@ def test_famgateway_order_gets_per_order_webhook_url(rig):
     ui2.button(USER, "t:amount")
     ui2.text(USER, "50").deferred(USER)
     assert seen2["webhook_url"] == ""
+
+
+# -- owner toggles: users may use bot / users may clone bot ----------------
+def test_admin_toggle_users_may_use_bot_blocks_customers(rig):
+    """The 'allow users to use this bot' switch, flipped from the admin panel,
+    must shut non-owners out of buttons AND typed commands while never touching
+    the owner. Flipping it back restores access."""
+    ui, router, _provider, _ledger = rig
+    assert ui.bot_enabled() is True
+    assert router.bot_enabled_fn() is True
+
+    # Owner flips access OFF via the panel button.
+    r = ui.button(OWNER, "a:on")
+    assert "**OFF**" in r.text
+    assert ui.bot_enabled() is False
+    assert router.bot_enabled_fn() is False
+
+    # Customers are blocked with a friendly message on both entry points.
+    assert "switched off" in ui.button(USER, "o").text
+    assert "switched off" in ui.text(USER, "hi").text
+    assert router.handle(USER, "/buy telegram").ok is False
+
+    # The owner is never locked out.
+    assert "switched off" not in ui.button(OWNER, "o").text
+
+    # Back on -> customers return.
+    r2 = ui.button(OWNER, "a:on")
+    assert "**ON**" in r2.text
+    assert ui.bot_enabled() is True
+    assert ui.button(USER, "o").ok is True
+
+
+def test_admin_toggle_clonebot_hides_and_blocks(rig):
+    """'Run your own bot' toggle: off hides the menu entry AND refuses a typed
+    /createbot; on restores both. Defaults to on when the registry is present."""
+    from unittest import mock
+    ui, router, _provider, _ledger = rig
+    reg = SubBotRegistry()
+    router.subbots = reg
+    router._createbot_flow = CreateBotFlow(reg, PlatformFee(rate=Decimal("0.10")))
+    # verify_bot_token is a live Telegram call; the toggle flow never reaches
+    # confirm, so it does not matter, but keep the router deterministic.
+    router._createbot_flow._verify_token = mock.Mock(return_value=(True, "t"))
+
+    assert ui.createbot_enabled() is True
+    assert ui._can_createbot() is True
+    assert ("🤖 Run your own bot", "cb") in all_buttons(ui.main_menu(USER))
+
+    # Owner turns cloning OFF.
+    r = ui.button(OWNER, "a:cb")
+    assert "**OFF**" in r.text
+    assert ui.createbot_enabled() is False
+    assert ui._can_createbot() is False
+    assert ("🤖 Run your own bot", "cb") not in all_buttons(ui.main_menu(USER))
+    # A typed /createbot no longer bypasses the switch.
+    assert "turned OFF" in router.handle(USER, "/createbot").text
+
+    # Back on.
+    r2 = ui.button(OWNER, "a:cb")
+    assert "**ON**" in r2.text
+    assert ui._can_createbot() is True
+    assert ("🤖 Run your own bot", "cb") in all_buttons(ui.main_menu(USER))
+
+
+def test_admin_panel_shows_total_users(rig):
+    """The admin panel must surface the total-user count on its own line and
+    expose an 'All users' button."""
+    ui, router, _provider, _ledger = rig
+    panel = ui.admin_panel(OWNER)
+    assert "Total users:" in panel.text
+    # The dedicated 'All users' button (label) is present and opens the user list.
+    labels = [lbl for lbl, _d in all_buttons(panel)]
+    assert any(lbl.startswith("👥 All users") for lbl in labels)
+    assert "ax:users" in datas(panel)

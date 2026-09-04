@@ -145,6 +145,12 @@ class MenuUI:
         self.router = router
         self.catalog: Catalog = router.catalog
         self.pricer: Pricer = router.pricer
+        #: Wire the live owner toggles into the router so typed commands (/buy,
+        #: /createbot, ...) honour the same switches the buttons use. The router
+        #: treats a None hook as "enabled", so commands keep working in tests and
+        #: in deployments (main bot) before any UI is constructed.
+        self.router.bot_enabled_fn = self.bot_enabled
+        self.router.createbot_enabled_fn = self.createbot_enabled
         #: Default support contact (from SUPPORT_CONTACT env). The owner can
         #: change it live from the admin panel, which persists an override in
         #: the wallet store's kv table; ``support_contact`` reads that first.
@@ -172,6 +178,10 @@ class MenuUI:
         #: Add Money and the old order is irrelevant (nobody pays twice).
         self._fg_orders: dict[str, tuple[str, Decimal, Decimal, float]] = {}
         self._maintenance_memory = False  # in-memory fallback if no kv store
+        #: In-memory fallbacks for the two owner feature toggles when there is
+        #: no kv store (tests / dev). Real deployments persist in the kv table.
+        self._bot_enabled_memory = True   # allow users to use this bot
+        self._createbot_memory = True     # allow users to clone this bot
         #: user_id -> [(timestamp, slug, ok, one-line summary)].
         #: Session-scoped by design; say that on the screen.
         self._history: dict[str, list[tuple[float, str, bool, str]]] = {}
@@ -403,6 +413,85 @@ class MenuUI:
         self._maintenance_memory = new
         return new
 
+    # -- owner feature toggles --------------------------------------------
+    # Two live switches the owner flips from the admin panel: whether customers
+    # may USE the bot at all, and whether customers may CLONE it ("Run your own
+    # bot"). Both persist in the wallet kv table so they survive redeploys, and
+    # both gate the exact entry points (button tap + typed command) so the UI
+    # and the command router can never disagree.
+
+    def bot_enabled(self) -> bool:
+        """True while customers may use the bot (owner kill-switch OFF).
+
+        Independent of maintenance, which only pauses buying; this gates ALL
+        customer activity (manual top-ups too) because the owner asked for a
+        plain "allow users to use this bot" on/off.
+        """
+        store = self._store_for_kv()
+        if store is not None:
+            try:
+                v = store.kv_get("feature_bot_enabled")
+                if v in ("1", "0"):
+                    return v == "1"
+            except Exception:  # noqa: BLE001 - fall back to memory
+                pass
+        return self._bot_enabled_memory
+
+    def _toggle_bot_enabled(self) -> bool:
+        """Flip the access switch; returns the new state."""
+        new = not self.bot_enabled()
+        store = self._store_for_kv()
+        if store is not None:
+            try:
+                store.kv_set("feature_bot_enabled", "1" if new else "0")
+            except Exception:  # noqa: BLE001 - memory still reflects the flip
+                pass
+        self._bot_enabled_memory = new
+        return new
+
+    def createbot_enabled(self) -> bool:
+        """True while customers may create a clone ('Run your own bot').
+
+        The feature only exists if this router has a sub-bot registry; if not,
+        the whole button/command is unavailable regardless of the toggle.
+        """
+        if getattr(self.router, "subbots", None) is None:
+            return False
+        store = self._store_for_kv()
+        if store is not None:
+            try:
+                v = store.kv_get("feature_createbot")
+                if v in ("1", "0"):
+                    return v == "1"
+            except Exception:  # noqa: BLE001 - fall back to memory
+                pass
+        return self._createbot_memory
+
+    def _toggle_createbot(self) -> bool:
+        """Flip the master clone switch; returns the new state."""
+        new = not self.createbot_enabled()
+        store = self._store_for_kv()
+        if store is not None:
+            try:
+                store.kv_set("feature_createbot", "1" if new else "0")
+            except Exception:  # noqa: BLE001 - memory still reflects the flip
+                pass
+        self._createbot_memory = new
+        return new
+
+    def _bot_closed_reply(self, user_id: str) -> Optional[Reply]:
+        """A reply when a non-owner is shut out by the access switch, else None."""
+        if self.router._is_owner(user_id):
+            return None
+        if not self.bot_enabled():
+            return Reply(
+                "🔒 This bot is temporarily switched off by the owner. "
+                "\n\nYour balance and any active numbers are safe. Please try "
+                "again later.",
+                ok=False, rows=((("🏠 Menu", "m"),),),
+            )
+        return None
+
     def _store_for_kv(self):
         store = self._store
         if store is not None and callable(getattr(store, "kv_get", None)) \
@@ -429,6 +518,11 @@ class MenuUI:
         """
         body = (body or "").strip()
         low = body.lower()
+        # Owner kill-switch: non-owners are shut out of everything (the router's
+        # _authorised also gates typed commands, but give a friendly message).
+        closed = self._bot_closed_reply(user_id)
+        if closed is not None:
+            return closed
         # Persistent bottom-menu taps arrive as plain text ("🛒 Buy Number").
         # Route them straight to the same screen their inline-tap twin opens.
         # The reply keyboard reaches us lowercased, so match case-insensitively.
@@ -1388,27 +1482,37 @@ class MenuUI:
             "OFF — using UPI+screenshot"
         )
         fs = self._float_stats()
+        users = int(fs["users"]) if fs and fs.get("users") is not None else 0
         float_line = ""
         if fs:
-            float_line = f"\n👥 Customers: {fs['users']} · float held: {fs['float']}"
+            float_line = f" · float held: {fs['float']}"
+        cbt = self.createbot_enabled()
+        cbt_line = (
+            f"🤖 Clone-bot ({'on' if cbt else 'off'})"
+            if self.router.subbots is not None else
+            "🤖 Clone-bot (not enabled here)"
+        )
         return Reply(
             "📊 Owner panel\n\n"
             f"🏦 Provider wallet: {status['provider_wallet']}\n"
             f"📒 Ledger wallet:    {status['ledger_wallet']}\n"
             f"💹 Revenue: {pnl['revenue']} · Costs: {pnl['cogs']}\n"
-            f"📈 Net profit: {pnl['net_profit']}"
-            f"{float_line}\n"
+            f"📈 Net profit: {pnl['net_profit']}\n"
+            f"👥 Total users: {users}{float_line}\n"
             f"💳 Payments waiting: {len(pending)}\n"
             f"🖼 Payment QR: {qr_state}\n"
             f"📒 Top-up mode: {fg_state}\n"
-            f"🛠 Maintenance: {'🟢 ON — buying paused for customers' if self.maintenance_on() else '⚪ off'}\n\n"
+            f"🛠 Maintenance: {'🟢 ON — buying paused for customers' if self.maintenance_on() else '⚪ off'}\n"
+            f"🔓 Users may use bot: {'on' if self.bot_enabled() else 'off'}\n"
+            f"{cbt_line}\n\n"
             "Full P&L: /report · Health: /status",
             rows=(
-                ((f"🧾 Top-ups ({len(pending)} pending)", "a:t"),),
+                ((f"👥 All users ({users})", "ax:users"), ("🚫 Ban/Unban", "ax:ban")),
+                (("🔓 Users may use bot", "a:on"), ("🤖 Clone-bot on/off", "a:cb")),
+                ((f"🧾 Top-ups ({len(pending)} pending)", "a:t"), ("📊 Metrics", "ax:metrics")),
                 (("📦 Orders & per-order profit", "a:o"),),
                 (("💳 Add balance", "ax:credit"), ("↩️ Deduct", "ax:debit")),
-                (("👥 Customers", "ax:users"), ("🚫 Ban/Unban", "ax:ban")),
-                (("📢 Broadcast", "ax:broadcast"), ("📊 Metrics", "ax:metrics")),
+                (("📢 Broadcast", "ax:broadcast"), ("👥 Customers", "ax:users")),
                 (("🛠 Toggle maintenance", "a:mm"), ("🖼 Payment QR", "a:qr")),
                 (("🕳 Sunk cost", "ax:sunkcost"), ("🏦 Provider", "ax:provider")),
                 (("🆘 Support username", "ax:support"), ("💳 FamGateway", "ax:fg")),
@@ -1537,6 +1641,9 @@ class MenuUI:
         a wrong guess here can never spend money, because spending requires
         the confirm step, which re-quotes the price live.
         """
+        closed = self._bot_closed_reply(user_id)
+        if closed is not None:
+            return closed
         if not self.router._authorised(user_id):
             return Reply("You are not authorised to use this bot.", ok=False)
         if not data:
@@ -1581,6 +1688,37 @@ class MenuUI:
                     "can't buy. You (owner) still can, to test."
                     if on else
                     "✅ Maintenance OFF — buying is live again."
+                )
+                return Reply(text, rows=((("◀️ Owner panel", "a"),),))
+            if parts[1] == "on":
+                # 🔓 Allow users to use this bot (master kill-switch). Owner-gated.
+                if not self.router._is_owner(user_id):
+                    return Reply("Owner only.", ok=False, rows=((("🏠 Menu", "m"),),))
+                on = self._toggle_bot_enabled()
+                text = (
+                    "✅ Bot is **ON** — customers can use the bot again."
+                    if on else
+                    "🔒 Bot is **OFF** — customers are switched out of the bot "
+                    "until you re-enable it. Owner access is unaffected."
+                )
+                return Reply(text, rows=((("◀️ Owner panel", "a"),),))
+            if parts[1] == "cb":
+                # 🤖 Allow users to clone the bot ('Run your own bot'). Owner-gated.
+                if not self.router._is_owner(user_id):
+                    return Reply("Owner only.", ok=False, rows=((("🏠 Menu", "m"),),))
+                if getattr(self.router, "subbots", None) is None:
+                    return Reply(
+                        "Clone-bots aren't enabled on this deployment.",
+                        ok=False, rows=((("◀️ Owner panel", "a"),),),
+                    )
+                on = self._toggle_createbot()
+                text = (
+                    "✅ 'Run your own bot' is **ON** — owners can create clones "
+                    "from the main menu / /createbot."
+                    if on else
+                    "🤖 'Run your own bot' is **OFF** — nobody can create a new "
+                    "clone right now. Existing clones keep working. Turn it back "
+                    "on here to allow more."
                 )
                 return Reply(text, rows=((("◀️ Owner panel", "a"),),))
             return self._badtap()
@@ -1776,7 +1914,8 @@ class MenuUI:
         return replace(reply, rows=rows)
 
     def _can_createbot(self) -> bool:
-        return self.router.subbots is not None
+        return getattr(self.router, "subbots", None) is not None \
+            and self.createbot_enabled()
 
     @staticmethod
     def _with_back(reply: Reply, *, back_data: str = "a",
