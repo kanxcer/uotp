@@ -181,7 +181,10 @@ class MenuUI:
         #: In-memory fallbacks for the two owner feature toggles when there is
         #: no kv store (tests / dev). Real deployments persist in the kv table.
         self._bot_enabled_memory = True   # allow users to use this bot
-        self._createbot_memory = True     # allow users to clone this bot
+        #: Cloning is disabled BY DEFAULT ("for now disable the bot cloning
+        #: feature for users"); the owner re-enables it live from the admin
+        #: panel, which persists the choice so a redeploy keeps it.
+        self._createbot_memory = False    # allow users to clone this bot
         #: user_id -> [(timestamp, slug, ok, one-line summary)].
         #: Session-scoped by design; say that on the screen.
         self._history: dict[str, list[tuple[float, str, bool, str]]] = {}

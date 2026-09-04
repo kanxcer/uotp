@@ -256,6 +256,9 @@ def test_createbot_conversation_is_not_hijacked_by_the_menu(rig):
                            owner_id=OWNER, allowed_users=(OWNER, USER),
                            subbots=registry, platform_fee=PlatformFee())
     ui = MenuUI(router)
+    # Cloning is off by default; the owner enables it from the admin panel.
+    ui.button(OWNER, "a:cb")
+    assert ui.createbot_enabled() is True
     start = ui.text(USER, "/createbot")
     assert start.ok and "token" in start.text.lower()
     step = ui.text(USER, "123456:ABCDEF")  # an (invalid) token reaches the flow
@@ -783,24 +786,25 @@ def test_admin_toggle_clonebot_hides_and_blocks(rig):
     # confirm, so it does not matter, but keep the router deterministic.
     router._createbot_flow._verify_token = mock.Mock(return_value=(True, "t"))
 
+    # Cloning is OFF by default ("disable the bot cloning feature for users").
+    assert ui.createbot_enabled() is False
+    assert ui._can_createbot() is False
+    assert ("🤖 Run your own bot", "cb") not in all_buttons(ui.main_menu(USER))
+    # A typed /createbot does not bypass the switch.
+    assert "turned OFF" in router.handle(USER, "/createbot").text
+
+    # Owner turns cloning ON.
+    r = ui.button(OWNER, "a:cb")
+    assert "**ON**" in r.text
     assert ui.createbot_enabled() is True
     assert ui._can_createbot() is True
     assert ("🤖 Run your own bot", "cb") in all_buttons(ui.main_menu(USER))
 
-    # Owner turns cloning OFF.
-    r = ui.button(OWNER, "a:cb")
-    assert "**OFF**" in r.text
-    assert ui.createbot_enabled() is False
+    # Owner turns it back OFF.
+    r2 = ui.button(OWNER, "a:cb")
+    assert "**OFF**" in r2.text
     assert ui._can_createbot() is False
     assert ("🤖 Run your own bot", "cb") not in all_buttons(ui.main_menu(USER))
-    # A typed /createbot no longer bypasses the switch.
-    assert "turned OFF" in router.handle(USER, "/createbot").text
-
-    # Back on.
-    r2 = ui.button(OWNER, "a:cb")
-    assert "**ON**" in r2.text
-    assert ui._can_createbot() is True
-    assert ("🤖 Run your own bot", "cb") in all_buttons(ui.main_menu(USER))
 
 
 def test_admin_panel_shows_total_users(rig):
