@@ -65,7 +65,36 @@ def test_webhook_ignores_non_success_and_unmapped():
     assert wallets.balance("222") == Money(0)
 
 
-def test_webhook_none_when_key_unset():
+def test_webhook_reads_live_key_from_kv():
+    """The webhook must honour a key set live via the admin panel (kv), not
+    just one present in the env at boot. With no env key but a kv key, the
+    handler is still registered and credits using the kv key."""
+    settings = _settings()
+    settings.famgateway_api_key = ""           # no env key
+    wallets = SqliteWallets(":memory:")
+    wallets.kv_set("famgateway_api_key", "kv_key")   # owner set it live
+    wallets.kv_set("fg_order:fg_KV", "222")
+    wallets.kv_set("fg_amt:fg_KV", "75")
+    handler = _famgateway_webhook(settings, wallets)
+    assert handler is not None, "handler must exist even with no env key"
+    body = json.dumps({"event": "payment.success", "order_id": "fg_KV",
+                       "amount": 75}).encode()
+    code, payload = handler(body, _sig("kv_key", body))
+    assert code == 200 and payload["status"] == "credited"
+    assert wallets.balance("222") == Money(7500)
+    # And it rejects a signature for a DIFFERENT key than the live one.
+    body2 = json.dumps({"event": "payment.success", "order_id": "fg_KV",
+                        "amount": 75}).encode()
+    code2, _ = handler(body2, _sig("test_key_abc", body2))  # old stale key
+    assert code2 == 401
+
+
+def test_webhook_404_when_no_key_at_all():
     settings = _settings()
     settings.famgateway_api_key = ""
-    assert _famgateway_webhook(settings, SqliteWallets(":memory:")) is None
+    wallets = SqliteWallets(":memory:")
+    handler = _famgateway_webhook(settings, wallets)
+    body = json.dumps({"event": "payment.success", "order_id": "fg_X"}).encode()
+    code, payload = handler(body, _sig("whatever", body))
+    assert code == 400 and payload["status"] == "not_configured"
+    assert wallets.balance("222") == Money(0)

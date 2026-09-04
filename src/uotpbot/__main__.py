@@ -98,30 +98,45 @@ def _make_poller(settings: Settings, router_factory, *, owner_alert=None):
 
 
 def _famgateway_webhook(settings: Settings, wallets):
-    """Build the FamGateway webhook handler (or None when not configured).
+    """Build the FamGateway webhook handler.
+
+    Always registered, so ``POST /webhooks/famgateway`` exists even when the
+    owner configures the key live (admin panel -> 💳 FamGateway) rather than
+    in the env. The live key is read from the wallet kv table on every request
+    (falling back to the env default), so a runtime-configured key is honoured
+    without a redeploy.
 
     Credits a paid order idempotently, keyed on the order id. Uses the same
     kv table the bot writes order->user+amount mappings into, so a webhook
-    that arrives after a redeploy still credits the right wallet. Uses the
-    wallet's atomic ``adjust``; the ``fg_credited:<order>`` marker is the
-    single-flight lock against duplicate webhooks / retries.
+    that arrives after a redeploy still credits the right wallet. ``adjust``
+    is atomic; the ``fg_credited:<order>`` marker is the single-flight lock
+    against duplicate webhooks / retries.
     """
-    if not getattr(settings, "famgateway_api_key", ""):
-        return None
-
-    from .gateway import FamGateway, verify_webhook_signature
-    from .money import Money
-
-    gateway = FamGateway(
-        settings.famgateway_api_key,
-        base_url=getattr(settings, "famgateway_base_url",
-                         "https://famgateway.in"),
-    )
+    env_key = getattr(settings, "famgateway_api_key", "")
+    base_url = getattr(settings, "famgateway_base_url",
+                       "https://famgateway.in")
     store = wallets  # the wallet store has kv_get/kv_set + adjust
 
+    get_ = getattr(store, "kv_get", None)
+    kv_ok = callable(get_)
+
     def handle(raw_body: bytes, signature: str, _content_type: str = ""):
-        if not verify_webhook_signature(raw_body, signature,
-                                        gateway.api_key):
+        # Resolve the live API key: kv override wins over the env default,
+        # matching exactly what the Add Money flow screens show the customer.
+        key = ""
+        if kv_ok:
+            try:
+                key = (get_("famgateway_api_key") or "").strip()
+            except Exception:  # noqa: BLE001 - fall back to env
+                key = ""
+        if not key:
+            key = env_key
+        if not key:
+            log.warning("FamGateway webhook but no API key configured")
+            return 400, {"status": "not_configured"}
+
+        from .gateway import verify_webhook_signature
+        if not verify_webhook_signature(raw_body, signature, key):
             log.warning("FamGateway webhook rejected: bad signature")
             return 401, {"status": "invalid_signature"}
         try:
@@ -135,9 +150,8 @@ def _famgateway_webhook(settings: Settings, wallets):
             # Acknowledge-but-ignore (refund/expire etc.) so the gateway stops
             # retrying; never credit on a non-success event.
             return 200, {"status": "acknowledged"}
-        get_ = getattr(store, "kv_get", None)
         set_ = getattr(store, "kv_set", None)
-        if not callable(get_) or not callable(set_):
+        if not kv_ok or not callable(set_):
             log.error("wallet store has no kv interface; cannot credit webhook")
             return 200, {"status": "no_store"}
         if get_(f"fg_credited:{order_id}"):
@@ -155,6 +169,7 @@ def _famgateway_webhook(settings: Settings, wallets):
         except Exception:  # noqa: BLE001
             return 200, {"status": "bad_amount"}
         try:
+            from .money import Money
             money = Money(int(amt_dec * Decimal(100)))
             store.adjust(f"{uid}", money)
             set_(f"fg_credited:{order_id}", "1")
