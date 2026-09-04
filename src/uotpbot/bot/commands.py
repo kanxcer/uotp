@@ -82,6 +82,11 @@ class Reply:
     rows: tuple[tuple[tuple[str, str], ...], ...] = ()
     deferred: Optional[Callable[[str], "Reply"]] = None
     photo: Optional[str] = None
+    #: A URL to a photo the transport fetches and sends WITH this reply (used
+    #: for FamGateway's hosted payment-QR image, which is a URL, not a
+    #: Telegram file_id). The transport sends a fresh photo message, same as
+    #: ``photo``.
+    photo_url: Optional[str] = None
     notify: tuple[tuple[str, str], ...] = ()
     forward_photo: bool = False
     #: Ask the transport to also show a persistent bottom menu

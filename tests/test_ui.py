@@ -520,35 +520,58 @@ def test_remaining_time_capped_at_20_minutes_not_provider_30(rig):
     assert "30 min" not in reply.text, f"history must not claim 30 min: {reply.text!r}"
 
 
-# -- 💳 UPI VPA editor (owner) --------------------------------------------
+# -- ⚡ FamGateway API-key editor (owner) ---------------------------------
+# Live-editable so the owner can flip the deployment to automatic UPI
+# top-ups without a redeploy; a kv override wins over the env default.
 
-def test_admin_can_set_upi_id_and_it_shows_on_add_money(rig):
+def test_admin_can_set_famgateway_key_and_it_enables_automatic_topup(rig):
     from uotpbot.wallets import SqliteWallets
     ui, router, _provider, _ledger = rig
     router.wallets = SqliteWallets(":memory:")
-    # No UPI yet.
-    assert ui.pay_upi_id == ""
-    assert "not configured" in ui.topup_card(USER).text
-    # Admin panel has the UPI edit button.
+    # No key yet -> the old UPI + screenshot flow (owner-verified).
+    assert ui.famgateway_api_key == ""
+    assert not ui.fg_enabled
+    assert "I've paid" in ui.topup_card(USER).text
+    # Admin panel has the FamGateway edit button.
     panel = ui.admin_panel(OWNER)
-    assert "ax:upi" in datas(panel), "admin needs a UPI edit button"
-    # Owner edits it; it persists and appears on the Add Money screen.
-    r = ui.button(OWNER, "ax:upi")
-    assert "EDIT UPI ID" in r.text
-    r2 = ui.text(OWNER, "owner@okaxis")
+    assert "ax:fg" in datas(panel), "admin needs a FamGateway edit button"
+    # Owner sets a key; it persists and Add Money switches to auto flow.
+    r = ui.button(OWNER, "ax:fg")
+    assert "FAMGATEWAY API KEY" in r.text
+    r2 = ui.text(OWNER, "live_key_123456")
     assert "✅" in r2.text
-    assert ui.pay_upi_id == "owner@okaxis"
-    assert "owner@okaxis" in ui.topup_card(USER).text
+    assert ui.famgateway_api_key == "live_key_123456"
+    assert ui.fg_enabled
+    tc = ui.topup_card(USER)
+    assert "t:amount" in datas(tc), "auto top-up offers a live QR amount button"
+    assert "t:paid" not in datas(tc), "no screenshot step in auto mode"
     # A customer cannot edit it.
-    assert ui.button(USER, "ax:upi").text.startswith("Owner only")
+    assert "Owner only" in ui.button(USER, "ax:fg").text
 
 
-def test_upi_id_requires_valid_vpa(rig):
-    ui, _router, _provider, _ledger = rig
-    ui.button(OWNER, "ax:upi")
-    r = ui.text(OWNER, "notanemail")
-    assert "valid UPI" in r.text
-    assert ui.pay_upi_id == ""
+def test_admin_can_disable_famgateway(rig):
+    from uotpbot.wallets import SqliteWallets
+    ui, router, _provider, _ledger = rig
+    router.wallets = SqliteWallets(":memory:")
+    assert ui.fg_enabled is False  # starts off
+    ui.button(OWNER, "ax:fg")      # open the FamGateway editor
+    ui.text(OWNER, "live_key_123456")
+    assert ui.fg_enabled
+    ui.button(OWNER, "ax:fg")      # re-open the editor
+    r = ui.text(OWNER, "off")      # type off to disable
+    assert "disabled" in r.text
+    assert not ui.fg_enabled
+    assert "I've paid" in ui.topup_card(USER).text  # back to screenshot flow
+
+
+def test_famgateway_key_requires_length(rig):
+    from uotpbot.wallets import SqliteWallets
+    ui, router, _provider, _ledger = rig
+    router.wallets = SqliteWallets(":memory:")
+    ui.button(OWNER, "ax:fg")
+    r = ui.text(OWNER, "short")
+    assert "doesn't look like" in r.text
+    assert ui.famgateway_api_key == ""
 
 
 # -- freshly-purchased number always shows live ---------------------------
@@ -572,3 +595,76 @@ def test_record_active_never_stores_zero_validity(rig):
     active = store.active_numbers(user_id=USER)
     assert active, "a freshly-bought number must appear under My numbers"
     assert active[0].seconds_left > 0, f"must have positive validity, got {active[0].seconds_left}"
+
+
+# -- ⚡ FamGateway live order flow (stubbed client) ------------------------
+class _FakeOrder:
+    order_id = "fg_LIVE"
+    amount = None
+    payable_amount = Decimal("100.05")
+    upi_id = "merchant@fam"
+    qr_url = "https://famgateway.in/x.png"
+    checkout_url = ""
+    upi_intent = "upi://pay?pa=merchant@fam"
+    expires_at_ist = "02-09-2026 14:35:00"
+
+
+class _FakeClient:
+    def __init__(self):
+        self.paid = False
+        self.verify_calls = 0
+    def create_order(self, amount):
+        o = _FakeOrder()
+        o.amount = amount
+        return o
+    def verify(self, order_id):
+        self.verify_calls += 1
+        if self.paid:
+            return type("S", (), {"is_paid": True, "state": "success",
+                                  "utr": "420", "sender_name": "R"})()
+        return type("S", (), {"is_paid": False, "state": "pending" })()
+
+
+def test_famgateway_full_automatic_topup(rig):
+    from uotpbot.wallets import SqliteWallets
+    ui, router, _provider, _ledger = rig
+    router.wallets = SqliteWallets(":memory:")
+    fake = _FakeClient()
+    # Enable fg with a stubbed client. _set_famgateway_api_key resets the cached
+    # client, so monkeypatch after enabling.
+    ui._set_famgateway_api_key("key")
+    ui._fg_client = fake
+    assert ui.fg_enabled
+    # 1. Add money -> prompt amount.
+    r = ui.button(USER, "t")
+    assert "Add money" in r.text
+    # Choose amount opens the input wizard.
+    pa = ui.button(USER, "t:amount")
+    assert "add" in pa.text.lower()
+    # 2. Enter amount -> deferred job creates the order and shows the QR screen.
+    r2 = ui.text(USER, "100")
+    # In the wizard path r2 carries a deferred job (placeholder "Creating your payment…").
+    assert r2.deferred is not None
+    final = r2.deferred(USER)   # run the job like the transport does
+    assert f"fg_LIVE" in final.text
+    assert final.photo_url == "https://famgateway.in/x.png"
+    assert "fg:check:fg_LIVE" in datas(final)
+    # The order mapping persisted for the webhook.
+    assert router.wallets.kv_get("fg_order:fg_LIVE") == USER
+    assert router.wallets.kv_get("fg_amt:fg_LIVE") == "100"
+    # 3. Payment not yet received -> tap check; still pending.
+    r3 = ui.button(USER, "fg:check:fg_LIVE")
+    assert r3.deferred is not None
+    pending = r3.deferred(USER)
+    assert "not received yet" in pending.text.lower() or "Payment not" in pending.text
+    # 4. Money lands.
+    fake.paid = True
+    r4 = ui.button(USER, "fg:check:fg_LIVE")
+    done = r4.deferred(USER)
+    assert "✅" in done.text
+    assert router.balance_of(USER) == INR(100)
+    # Idempotent: re-check does not double-credit.
+    r5 = ui.button(USER, "fg:check:fg_LIVE")
+    again = r5.deferred(USER) if r5.deferred else r5
+    assert "already credited" in again.text.lower()
+    assert router.balance_of(USER) == INR(100)

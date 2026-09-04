@@ -351,3 +351,65 @@ def test_no_poller_is_allowed(rig):
     code, body = server.liveness()
     assert code == 200
     assert body["poller_alive"] is None
+
+
+# -- FamGateway webhook over a real socket --------------------------------
+def _post(url, data, signature=None):
+    req = urllib.request.Request(url, data=data, method="POST")
+    if signature is not None:
+        req.add_header("X-FamGateway-Signature", signature)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode())
+
+
+def test_http_famgateway_webhook_credit_and_404(rig):
+    """POST /webhooks/famgateway credits once and only with a valid signature.
+
+    No webhook configured -> 404. Configured -> verifies signature, credits,
+    and is idempotent across a duplicated body.
+    """
+    import hashlib, hmac
+    import threading
+    from http.server import ThreadingHTTPServer
+
+    from uotpbot.wallets import SqliteWallets
+    from uotpbot import __main__ as mm
+
+    server, ledger, provider = rig
+    wallets = SqliteWallets(":memory:")
+    wallets.kv_set("fg_order:fg_SOCK", "222")
+    wallets.kv_set("fg_amt:fg_SOCK", "50")
+
+    class _Settings:
+        famgateway_api_key = "sock_key"
+        famgateway_base_url = "https://famgateway.in"
+
+    handler = mm._famgateway_webhook(_Settings(), wallets)
+    srv = HealthServer(server.engine, ledger, port=0, cache_seconds=0.0,
+                       famgateway_webhook=handler)
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), srv._handler_class())
+    httpd.daemon_threads = True
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}"
+    try:
+        body = json.dumps({"event": "payment.success",
+                           "order_id": "fg_SOCK", "amount": 50}).encode()
+        sig = hmac.new(b"sock_key", body, hashlib.sha256).hexdigest()
+        # Correct signature credits.
+        code, payload = _post(f"{base}/webhooks/famgateway", body, sig)
+        assert code == 200 and payload["status"] == "credited"
+        assert wallets.balance("222") == INR(50)
+        # Duplicate -> idempotent.
+        code2, payload2 = _post(f"{base}/webhooks/famgateway", body, sig)
+        assert code2 == 200 and payload2["status"] == "already_credited"
+        assert wallets.balance("222") == INR(50)
+        # Wrong signature rejected.
+        code3, payload3 = _post(f"{base}/webhooks/famgateway", body, "00")
+        assert code3 == 401
+    finally:
+        httpd.shutdown()
+        httpd.server_close()

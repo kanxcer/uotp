@@ -231,10 +231,14 @@ class TelegramFrontend:
         ui: Optional[MenuUI] = None,
         support_contact: str = "",
         pay_upi_id: str = "",
+        famgateway_api_key: str = "",
+        famgateway_base_url: str = "https://famgateway.in",
     ) -> None:
         self.router = router
         self.ui = ui or MenuUI(
-            router, support_contact=support_contact, pay_upi_id=pay_upi_id
+            router, support_contact=support_contact, pay_upi_id=pay_upi_id,
+            famgateway_api_key=famgateway_api_key,
+            famgateway_base_url=famgateway_base_url,
         )
         # /buy (typed) and button buys must agree on maintenance mode:
         # the flag lives in the UI's store; the router just consults it.
@@ -259,8 +263,28 @@ class TelegramFrontend:
         if not user_id:
             return
         reply = await _run_offloop(self.ui.text, user_id, message.text)
+        deferred = getattr(reply, "deferred", None)
+        if deferred is None:
+            await self._deliver_reply(message, reply)
+            await self._send_notifications(context, reply)
+            return
+        # A slow step (e.g. creating a FamGateway payment order): send the
+        # placeholder now, do the work off the event loop, then deliver the
+        # outcome. If the outcome carries a photo (a QR image) we send a fresh
+        # photo message, otherwise we edit the placeholder in place.
         await self._deliver_reply(message, reply)
-        await self._send_notifications(context, reply)
+        try:
+            final = await _run_slow(deferred, user_id)
+        except Exception:  # never leave the customer staring at a spinner
+            log.exception("deferred step failed")
+            await self._safe_edit_text(
+                message,
+                "⚠️ That step could not be completed. Nothing was charged. "
+                "Please try again or contact support.",
+            )
+            return
+        await self._deliver_reply(message, final)
+        await self._send_notifications(context, final)
 
     async def on_callback(self, update: Any, context: Any = None) -> None:
         """Handle an inline-keyboard press.
@@ -458,10 +482,18 @@ class TelegramFrontend:
         message); every other reply keeps its inline keyboard.
         """
         photo = getattr(reply, "photo", None)
-        if photo:
-            await message.reply_photo(
-                photo=photo, caption=reply.text[:1024], reply_markup=_reply_markup(reply),
-            )
+        photo_url = getattr(reply, "photo_url", None)
+        if photo or photo_url:
+            if photo:
+                await message.reply_photo(
+                    photo=photo, caption=reply.text[:1024],
+                    reply_markup=_reply_markup(reply),
+                )
+            else:
+                await message.reply_photo(
+                    photo=photo_url, caption=reply.text[:1024],
+                    reply_markup=_reply_markup(reply),
+                )
             return
         markup = _reply_menu_markup() if getattr(reply, "persistent_menu", False) \
             else _reply_markup(reply)
@@ -520,6 +552,9 @@ def build_from_settings(settings: Settings, router_factory: Any) -> Any:
         router_factory(),
         support_contact=getattr(settings, "support_contact", ""),
         pay_upi_id=getattr(settings, "pay_upi_id", ""),
+        famgateway_api_key=getattr(settings, "famgateway_api_key", ""),
+        famgateway_base_url=getattr(settings, "famgateway_base_url",
+                                    "https://famgateway.in"),
     )
     # Durable refunds: boot the retry worker so any refund left pending by an
     # earlier crash/redeploy is credited now (idempotent; safe on rebuilds).

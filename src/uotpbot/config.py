@@ -156,6 +156,11 @@ class Settings:
     #: Add Money screen. The visual QR is set by the owner from inside the bot
     #: (📊 Owner panel → 🖼 Payment QR) so it survives redeploys.
     pay_upi_id: str = ""
+    #: FamGateway API key for automated UPI top-ups. Blank = the old
+    #: owner-approves-a-screenshot flow.
+    famgateway_api_key: str = ""
+    #: FamGateway base URL (overridable for testing/self-hosting).
+    famgateway_base_url: str = "https://famgateway.in"
     #: Phase-1 per-user buy rate limiter: max buys within ``rate_limit_window``
     #: seconds before a user is throttled. Anti-spam, protects provider calls.
     rate_limit_max_buys: int = 3
@@ -275,6 +280,12 @@ def from_environment(env_file: Optional[Path | str] = None) -> Settings:
         pricing_strategy=_get("PRICING_STRATEGY", "exact_markup"),
         pricing_markup_rate=_decimal("PRICING_MARKUP_RATE", "0.45"),
         support_contact=_get("SUPPORT_CONTACT", ""),
+        #: FamGateway API key for automated UPI top-ups. When set, the Add
+        #: Money screen creates a live FamGateway order (QR + exact amount)
+        #: and the owner no longer approves screenshots by hand. Blank (the
+        #: default) falls back to the old owner-verifies-a-screenshot flow.
+        famgateway_api_key=_get("FAMGATEWAY_API_KEY", ""),
+        famgateway_base_url=_get("FAMGATEWAY_BASE_URL", "https://famgateway.in"),
         pay_upi_id=_get("PAY_UPI_ID", ""),
         rate_limit_max_buys=_int("RATE_LIMIT_MAX_BUYS", 3),
         rate_limit_window=_int("RATE_LIMIT_WINDOW", 30),

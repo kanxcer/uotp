@@ -90,6 +90,8 @@ def test_support_and_my_numbers_callback_edit_the_message():
 
     from uotpbot.bot.commands import CommandRouter
     from uotpbot.bot.telegram import TelegramFrontend
+    from uotpbot.bot.commands import CommandRouter
+    from uotpbot.bot.telegram import TelegramFrontend
     from uotpbot.bot.ui import MenuUI
     from uotpbot.catalog import Catalog, ServiceCost, WalletPack
     from uotpbot.engine import BotEngine, EngineConfig
@@ -144,3 +146,73 @@ def test_support_and_my_numbers_callback_edit_the_message():
             f"{data!r} must edit the message, not only answer the popup"
         q_args = msg.edit_text.await_args_list[0][0][0]
         assert q_args, f"{data!r} must edit to non-empty text"
+
+
+def test_famgateway_amount_message_delivers_qr_photo():
+    """The Add Money amount text must run the deferred order-creation and then
+    deliver the hosted QR as a fresh photo message (photo_url), not drop it."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+    from decimal import Decimal
+
+    from uotpbot.bot.commands import CommandRouter
+    from uotpbot.bot.telegram import TelegramFrontend
+    from uotpbot.bot.ui import MenuUI
+    from uotpbot.catalog import Catalog, ServiceCost, WalletPack
+    from uotpbot.engine import BotEngine, EngineConfig
+    from uotpbot.ledger import Ledger
+    from uotpbot.money import INR
+    from uotpbot.pricing import Pricer
+    from uotpbot.provider.mock import MockProvider
+    from uotpbot.wallets import SqliteWallets
+
+    cat = Catalog(
+        {"telegram": ServiceCost("telegram", "Telegram", "messaging",
+                                 INR(10), Decimal("0.94"), Decimal("0.04"),
+                                 Decimal("0.95"))},
+        (WalletPack("Pro", INR(1000), INR(1150)),))
+    ledger = Ledger()
+    pricer = Pricer(cat)
+    prov = MockProvider({s.slug: cat.sticker_price(s.slug) for s in cat.services()},
+                        balance=INR(5000), seed=7)
+    eng = BotEngine(cat, prov, ledger, pricer,
+                    config=EngineConfig(retry_cap=3, otp_timeout_seconds=300,
+                                        poll_interval=0.05))
+    w = SqliteWallets(":memory:")
+    router = CommandRouter(eng, cat, pricer, ledger, owner_id="111",
+                           allowed_users=("111", "222"), wallets=w)
+    ui = MenuUI(router, famgateway_api_key="k", famgateway_base_url="https://famgateway.in")
+
+    class _Client:
+        api_key = "k"
+        def create_order(self, amount):
+            class O: pass
+            o = O()
+            o.order_id = "fg_T"
+            o.amount = amount
+            o.payable_amount = Decimal("100.05")
+            o.qr_url = "https://famgateway.in/s.png"
+            return o
+
+    ui._fg_client = _Client()
+    fe = TelegramFrontend(router, ui=ui)
+
+    async def run():
+        ui.button("222", "t:amount")            # open the amount wizard
+        msg = MagicMock()
+        msg.text = "100"
+        msg.from_user.id = 222
+        msg.chat_id = "222"
+        msg.message_id = 5
+        msg.reply_text = AsyncMock()
+        msg.reply_photo = AsyncMock()
+        upd = MagicMock()
+        upd.message = msg
+        await fe.on_message(upd)
+        assert msg.reply_photo.await_count == 1, "must deliver the QR as a photo"
+        a = msg.reply_photo.await_args_list[-1]
+        assert a[1].get("photo") == "https://famgateway.in/s.png"
+        assert "fg_T" in a[1].get("caption", "")
+        assert msg.reply_text.await_count == 1, "placeholder sent once"
+
+    asyncio.run(run())

@@ -17,8 +17,10 @@ postings exist in precisely one place.
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import replace
+from decimal import Decimal
 from typing import Callable, Optional
 
 from ..catalog import Catalog
@@ -26,6 +28,8 @@ from ..money import Money
 from ..pricing import Pricer
 from ..tz import format_ts
 from .commands import CommandRouter, Reply
+
+log = logging.getLogger("uotpbot.ui")
 
 __all__ = ["MenuUI", "WELCOME"]
 
@@ -127,6 +131,8 @@ class MenuUI:
         *,
         support_contact: str = "",
         pay_upi_id: str = "",
+        famgateway_api_key: str = "",
+        famgateway_base_url: str = "https://famgateway.in",
         history_size: int = 20,
         now: Optional[Callable[[], float]] = None,
     ) -> None:
@@ -142,6 +148,17 @@ class MenuUI:
         #: the wallet store's kv table so it survives redeploys; ``pay_upi_id``
         #: reads that override first. The QR image is a separate admin setting.
         self._upi_default = pay_upi_id.strip()
+        #: FamGateway config. The owner can set the API key live from the admin
+        #: panel ("💳 FamGateway"): a kv override wins over this env default.
+        #: When a key is present, Add Money creates a live, auto-verifying UPI
+        #: order instead of asking customers to screenshot a manual QR.
+        self._fg_api_default = famgateway_api_key.strip()
+        self._fg_base_url = famgateway_base_url
+        self._fg_client = None  # lazy, built from the (possibly kv-overridden) key
+        #: order_id -> (user_id, amount Decimal, payable Decimal, created_ts).
+        #: Session-scoped: a redeploy loses it, but the customer just re-taps
+        #: Add Money and the old order is irrelevant (nobody pays twice).
+        self._fg_orders: dict[str, tuple[str, Decimal, Decimal, float]] = {}
         self._maintenance_memory = False  # in-memory fallback if no kv store
         #: user_id -> [(timestamp, slug, ok, one-line summary)].
         #: Session-scoped by design; say that on the screen.
@@ -263,6 +280,61 @@ class MenuUI:
                 pass
         # In-memory fallback (tests / no kv store).
         self._upi_default = value.strip()
+
+    # -- FamGateway ------------------------------------------------------
+    @property
+    def famgateway_api_key(self) -> str:
+        """The live FamGateway API key, owner-live-editable.
+
+        An owner-set override wins (persisted in the wallet kv table so it
+        survives redeploys); otherwise the FAMGATEWAY_API_KEY env default.
+        """
+        store = self._store_for_kv()
+        if store is not None:
+            try:
+                v = store.kv_get("famgateway_api_key")
+                if v:
+                    return v
+            except Exception:  # noqa: BLE001 - fall back to default
+                pass
+        return self._fg_api_default
+
+    def _set_famgateway_api_key(self, value: str) -> None:
+        """Persist the owner-edited FamGateway API key."""
+        store = self._store_for_kv()
+        if store is not None:
+            try:
+                store.kv_set("famgateway_api_key", value.strip())
+                if value.strip():
+                    self._fg_client = None  # force rebuild from the new key
+                return
+            except Exception:  # noqa: BLE001
+                pass
+        self._fg_api_default = value.strip()
+        self._fg_client = None
+
+    def _new_fg_client(self):
+        """Build a live FamGateway client from the current (kv-overridden) key."""
+        from ..gateway import FamGateway  # local: optional dependency
+
+        key = self.famgateway_api_key
+        if not key:
+            return None
+        return FamGateway(key, base_url=self._fg_base_url)
+
+    @property
+    def fg_client(self):
+        """A FamGateway client or None when no API key is configured."""
+        if not self.famgateway_api_key:
+            return None
+        if self._fg_client is None:
+            self._fg_client = self._new_fg_client()
+        return self._fg_client
+
+    @property
+    def fg_enabled(self) -> bool:
+        """True when automated UPI top-ups are configured (an API key is set)."""
+        return self.fg_client is not None
 
     # -- favourites ------------------------------------------------------
     def _fav_key(self, user_id: str) -> str:
@@ -702,6 +774,20 @@ class MenuUI:
                 f"Message {self.support_contact or 'the bot owner'} to add money.",
                 ok=False, rows=((("🏠 Menu", "m"),),),
             )
+        if self.fg_enabled:
+            # Automated UPI top-up: no screenshot, no manual approval. The money
+            # is verified live by FamGateway and credited in seconds.
+            return Reply(
+                "➕ Add money\n\n"
+                "Tap 💳 and enter the amount to add (min ₹10). I'll generate a "
+                "UPI payment QR and credit your wallet automatically the moment "
+                "the money lands — no screenshots, no waiting for a human.\n\n"
+                "⚡ Credited automatically within seconds of payment.",
+                rows=(
+                    (("💳 Choose amount", "t:amount"),),
+                    (("◀️ Back", "w"), ("🏠 Menu", "m")),
+                ),
+            )
         payee = (
             f"UPI: `{self.pay_upi_id}`" if self.pay_upi_id
             else "UPI ID: not configured yet — ask the owner"
@@ -723,12 +809,18 @@ class MenuUI:
 
     def topup_amount_prompt(self, user_id: str) -> Reply:
         self._wizard[user_id] = {"flow": "topup", "step": "amount"}
-        return Reply(
-            "💳 How much did you pay?\n\n"
+        intro = (
+            "💳 Enter the amount to add\n\n"
             "Reply with just the amount in ₹ — e.g. 200\n"
-            "(minimum ₹10)",
-            rows=((("✖️ Cancel", "w"),),),
+            "(minimum ₹10)"
         )
+        if self.fg_enabled:
+            intro = (
+                "💳 How much would you like to add?\n\n"
+                "Reply with just the amount in ₹ — e.g. 200\n"
+                "(minimum ₹10). I'll generate a payment QR for that exact amount."
+            )
+        return Reply(intro, rows=((("✖️ Cancel", "w"),),))
 
     def _admin_input_prompt(self, user_id: str, action: str) -> Reply:
         """Start the collect-input wizard for an owner action."""
@@ -755,6 +847,14 @@ class MenuUI:
                     "Send the UPI VPA customers pay into on the ➕ Add Money "
                     "screen, e.g.\n`yourname@okaxis`\n"
                     f"(current: `{self.pay_upi_id or 'not set'}`)"),
+            "fg": ("💳 FAMGATEWAY API KEY",
+                   "Send your FamGateway API key to turn on automatic UPI "
+                   "top-ups. With a key set, ➕ Add Money creates a live QR "
+                   "and credits the wallet automatically — no screenshots, "
+                   "no manual approval.\n\n"
+                   "Send `off` to disable and revert to the UPI + screenshot "
+                   "flow.\n"
+                   f"(current: {'set ✅' if self.famgateway_api_key else 'not set ❌'})"),
         }[action]
         self._wizard[user_id] = {"flow": "admin", "action": action, "step": "input"}
         return Reply(f"{prompt[0]}\n\n{prompt[1]}\n\nTap ✖️ Cancel to abort.",
@@ -813,6 +913,31 @@ class MenuUI:
                     ok=True, rows=((("💰 Preview Add Money", "t"),),
                                    (("📊 Admin Panel", "a"),)),
                 )
+            if action == "fg":
+                val = (body.strip() or "")
+                if val.lower() in ("off", "disable", "none", "clear", "-"):
+                    self._set_famgateway_api_key("")
+                    return Reply(
+                        "✅ FamGateway disabled — ➕ Add Money now uses the "
+                        "UPI + screenshot flow.",
+                        ok=True, rows=((("📊 Admin Panel", "a"),),),
+                    )
+                if len(val) < 6:
+                    return Reply(
+                        "That doesn't look like a FamGateway API key "
+                        "(keys are much longer). Send it again, or `off` to "
+                        "disable — ✖️ Cancel to abort.",
+                        ok=False, rows=((("✖️ Cancel", "a"),),),
+                    )
+                self._set_famgateway_api_key(val)
+                return Reply(
+                    "✅ FamGateway API key saved.\n\n"
+                    "➕ Add Money now generates a live UPI QR and credits "
+                    "automatically. Test it: Preview Add Money → 💳 Choose "
+                    "amount.",
+                    ok=True, rows=((("💰 Preview Add Money", "t"),),
+                                   (("📊 Admin Panel", "a"),)),
+                )
             self._wizard.pop(user_id, None)
             return self.main_menu(user_id)
 
@@ -826,6 +951,10 @@ class MenuUI:
                 "(₹10 minimum, ₹1,00,000 maximum).\n\nTry again or tap ✖️ Cancel.",
                 ok=False, rows=((("✖️ Cancel", "w"),),),
             )
+        if self.fg_enabled:
+            # Automated flow: create a live FamGateway order, then show the QR
+            # and poll. No screenshot, no owner approval.
+            return self._begin_fg_topup(user_id, amount)
         self._wizard[user_id] = {"flow": "topup", "step": "screenshot", "amount": amount.paise}
         return Reply(
             f"Amount noted: {amount}\n\n"
@@ -833,6 +962,182 @@ class MenuUI:
             "it goes straight to the owner with approve/decline buttons.",
             rows=((("✖️ Cancel", "w"),),),
         )
+
+    def _begin_fg_topup(self, user_id: str, amount: Money) -> Reply:
+        """Create a FamGateway order for ``amount`` and return the QR screen.
+
+        The order is created lazily when the customer confirms, so a bad API
+        key surfaces immediately ("check your FamGateway setting") rather than
+        after they've paid into nothing. The actual order id is captured in the
+        deferred job so polling can credit the wallet on success.
+        """
+        amount_dec = Decimal(amount.paise) / Decimal(100)
+
+        def job(uid: str) -> Reply:
+            client = self.fg_client
+            if client is None:
+                return Reply(
+                    "FamGateway isn't configured right now. Try again shortly.",
+                    ok=False, rows=((("🏠 Menu", "m"),),),
+                )
+            try:
+                order = client.create_order(amount_dec)
+            except Exception as exc:  # noqa: BLE001 - surface to the customer
+                log.error("FamGateway create_order failed: %s", exc)
+                return Reply(
+                    "⚠️ Could not create your payment. Please try again in a "
+                    "moment, or contact the owner.",
+                    ok=False, rows=((("🏠 Menu", "m"),),),
+                )
+            if not order.order_id:
+                return Reply(
+                    "⚠️ The payment service returned no order. Please try again.",
+                    ok=False, rows=((("🏠 Menu", "m"),),),
+                )
+            # Remember the order for this session so polling/taps can credit it.
+            self._fg_orders[order.order_id] = (
+                uid, amount_dec, order.payable_amount, self._now())
+            # Also persist order->user+amount in the kv store so the async
+            # FamGateway webhook can credit the right wallet even if the
+            # process restarts between order creation and payment.
+            store = self._store
+            set_ = getattr(store, "kv_set", None) if store is not None else None
+            if callable(set_):
+                try:
+                    set_(f"fg_order:{order.order_id}", uid)
+                    set_(f"fg_amt:{order.order_id}", str(amount_dec))
+                except Exception:  # noqa: BLE001 - webhook then does not credit
+                    log.warning("could not persist FamGateway order %s", order.order_id)
+            qr_hint = (
+                f"💳 Add **{amount}** to your balance\n\n"
+                f"Pay exactly **₹{order.payable_amount}** via any UPI app.\n\n"
+                "📱 Scan the QR below with GPay / PhonePe / Paytm — or tap "
+                "‘✅ I've paid’ after paying.\n\n"
+                "⏳ Your balance updates automatically within seconds (usually "
+                "under a minute) once the money lands.\n\n"
+                f"🧾 Order: {order.order_id}"
+            )
+            return Reply(
+                qr_hint,
+                rows=((("✅ I've paid", f"fg:pay:{order.order_id}"),),
+                      (("🔄 Check status", f"fg:check:{order.order_id}"),),
+                      (("🏠 Menu", "m"),)),
+                photo_url=order.qr_url,
+            )
+
+        self._wizard.pop(user_id, None)
+        return Reply(
+            "⏳ Creating your payment…\n\n"
+            "One moment while I set up a payment QR for that amount.",
+            deferred=job,
+        )
+
+    def _check_fg_topup(self, user_id: str, order_id: str) -> Reply:
+        """Poll FamGateway for ``order_id`` and credit the wallet when paid.
+
+        Runs off the event loop (deferred) so a few seconds of polling never
+        blocks other customers. Idempotent: crediting uses the wallet's atomic
+        ``adjust`` and records the order as credited so a double-check or a
+        duplicate webhook can never add money twice.
+        """
+        stored = self._fg_orders.get(order_id)
+        if stored is None:
+            # Unknown order. If it was already credited (e.g. the order rolled
+            # out of session or the webhook beat us to it) say so rather than
+            # telling them to pay again.
+            store = self._store
+            get_ = getattr(store, "kv_get", None) if store is not None else None
+            if callable(get_) and get_(f"fg_credited:{order_id}"):
+                return Reply(
+                    "✅ That payment was already credited — no double charge.",
+                    ok=True,
+                    rows=((("💰 Balance", "w"),), (("🏠 Menu", "m"),)),
+                )
+            return Reply(
+                "That payment isn't in this session (maybe the bot restarted). "
+                "Please add money again to generate a fresh QR.",
+                ok=False, rows=((("➕ Add money", "t"),),),
+            )
+        uid, amount_dec, payable, created = stored
+
+        def job(caller: str) -> Reply:
+            client = self.fg_client
+            if client is None:
+                return Reply(
+                    "⚠️ FamGateway isn't configured right now.",
+                    ok=False, rows=((("🏠 Menu", "m"),),),
+                )
+            if not self.router._is_owner(caller) and caller != uid:
+                return Reply("That's not your payment.", ok=False)
+            try:
+                status = client.verify(order_id)
+            except Exception as exc:  # noqa: BLE001
+                log.error("FamGateway verify failed for %s: %s", order_id, exc)
+                return Reply(
+                    "⏳ Still checking… the most recent check didn't reach the "
+                    "payment service. Tap 🔄 Check status again shortly.",
+                    ok=False, rows=((("🔄 Check status", f"fg:check:{order_id}"),),
+                                    (("🏠 Menu", "m"),)),
+                )
+            if not status.is_paid:
+                prompt = (
+                    "⏳ Payment not received yet.\n\n"
+                    f"We also check automatically as soon as it lands — you can "
+                    "just wait, or confirm again below. Order: "
+                    f"`{order_id}`"
+                )
+                if status.state == "expired":
+                    prompt = (
+                        "⌛️ That payment QR expired.\n\n"
+                        "Tap below to generate a fresh one for the same amount."
+                    )
+                rows = ((("🔄 Check status", f"fg:check:{order_id}"),), (("🏠 Menu", "m"),))
+                return Reply(prompt, ok=False, rows=rows)
+            return self._credit_fg_order(uid, order_id, amount_dec, payable)
+
+        return Reply(
+            "⏳ Checking your payment…", deferred=lambda uid_: job(uid),
+        )
+
+    def _credit_fg_order(self, uid: str, order_id: str, amount: Decimal,
+                         payable: Decimal) -> Reply:
+        """Idempotently credit an order. Returns a success/failure Reply.
+
+        Uses the wallet's atomic ``adjust`` and the ``kv`` record so a repeated
+        check (or a duplicate webhook) can never double-credit.
+        """
+        store = self._store
+        if store is None:
+            return Reply("Wallet is offline right now.", ok=False)
+        try:
+            key = f"fg_credited:{order_id}"
+            get = getattr(store, "kv_get", None)
+            set_ = getattr(store, "kv_set", None)
+            if callable(get) and callable(set_) and get(key):
+                return Reply(
+                    "✅ Already credited — no double charge. Your balance is "
+                    f"{self.router.balance_of(uid)}.",
+                    ok=True, rows=((("💰 Balance", "w"), (("🏠 Menu", "m"),)),),
+                )
+            money = Money(int(amount * Decimal(100)))
+            self.router.credit(uid, money)
+            if callable(set_):
+                set_(key, "1")
+            self._fg_orders.pop(order_id, None)
+            return Reply(
+                f"✅ Payment received! {money} added to your balance\n"
+                f"({self.router.balance_of(uid)} now).\n\n"
+                "Tap 🛒 and buy away.",
+                ok=True,
+                rows=((("🛒 Buy a number", "l"),), (("🏠 Menu", "m"),)),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error("FamGateway credit failed for %s: %s", order_id, exc)
+            return Reply(
+                "⚠️ We confirmed your payment but couldn't credit it yet. "
+                "Please contact the owner — nothing was double-charged.",
+                ok=False, rows=((("🏠 Menu", "m"),),),
+            )
 
     @staticmethod
     def _split_uid_amount(text: str) -> Optional[str]:
@@ -1032,6 +1337,11 @@ class MenuUI:
         pnl = status["pnl"]
         pending = self._pending_topups()
         qr_state = "set ✅" if self._qr_file_id() else "not set ❌"
+        fg_state = (
+            "ON ✅ (auto-credited)"
+            if self.fg_enabled else
+            "OFF — using UPI+screenshot"
+        )
         fs = self._float_stats()
         float_line = ""
         if fs:
@@ -1045,6 +1355,7 @@ class MenuUI:
             f"{float_line}\n"
             f"💳 Payments waiting: {len(pending)}\n"
             f"🖼 Payment QR: {qr_state}\n"
+            f"📒 Top-up mode: {fg_state}\n"
             f"🛠 Maintenance: {'🟢 ON — buying paused for customers' if self.maintenance_on() else '⚪ off'}\n\n"
             "Full P&L: /report · Health: /status",
             rows=(
@@ -1055,7 +1366,7 @@ class MenuUI:
                 (("📢 Broadcast", "ax:broadcast"), ("📊 Metrics", "ax:metrics")),
                 (("🛠 Toggle maintenance", "a:mm"), ("🖼 Payment QR", "a:qr")),
                 (("🕳 Sunk cost", "ax:sunkcost"), ("🏦 Provider", "ax:provider")),
-                (("🆘 Support username", "ax:support"), ("💳 UPI ID", "ax:upi")),
+                (("🆘 Support username", "ax:support"), ("💳 FamGateway", "ax:fg")),
                 (("🏠 Menu", "m"),),
             ),
         )
@@ -1190,18 +1501,25 @@ class MenuUI:
         kind = parts[0]
         # Navigating away silently cancels any half-done top-up wizard; the
         # payment itself only exists once the screenshot lands, so nothing is lost.
-        if kind not in {"t", "ap", "ad"} and user_id in self._wizard:
+        if kind not in {"t", "ap", "ad", "fg"} and user_id in self._wizard:
             self._wizard.pop(user_id, None)
         if kind == "m":
             return self.main_menu(user_id)
         if kind == "t":
             if len(parts) == 2 and parts[1] == "paid":
                 return self.topup_amount_prompt(user_id)
+            if len(parts) == 2 and parts[1] == "amount":
+                return self.topup_amount_prompt(user_id)
             return self.topup_card(user_id) if len(parts) == 1 else self._badtap()
         if kind == "ap" and len(parts) == 2:
             return self.decide_topup(user_id, parts[1], approve=True)
         if kind == "ad" and len(parts) == 2:
             return self.decide_topup(user_id, parts[1], approve=False)
+        if kind == "fg" and len(parts) == 3:
+            # FamGateway payment buttons: fg:pay:<order> / fg:check:<order>.
+            if parts[1] == "pay" or parts[1] == "check":
+                return self._check_fg_topup(user_id, parts[2])
+            return self._badtap()
         if kind == "a" and len(parts) == 2:
             if parts[1] == "t":
                 return self.topups_screen(user_id)
@@ -1241,6 +1559,9 @@ class MenuUI:
             if action == "upi":
                 # 💳 Edit the UPI VPA customers pay into (Add Money screen).
                 return self._admin_input_prompt(user_id, "upi")
+            if action == "fg":
+                # 💳 Edit the FamGateway API key (auto-credit top-ups).
+                return self._admin_input_prompt(user_id, "fg")
             return self._badtap()
         if kind == "fav":
             return self.favourites_card(user_id)

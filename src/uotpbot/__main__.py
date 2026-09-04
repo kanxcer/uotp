@@ -97,6 +97,77 @@ def _make_poller(settings: Settings, router_factory, *, owner_alert=None):
     return lambda: run_bot(settings, router_factory, owner_alert=owner_alert)
 
 
+def _famgateway_webhook(settings: Settings, wallets):
+    """Build the FamGateway webhook handler (or None when not configured).
+
+    Credits a paid order idempotently, keyed on the order id. Uses the same
+    kv table the bot writes order->user+amount mappings into, so a webhook
+    that arrives after a redeploy still credits the right wallet. Uses the
+    wallet's atomic ``adjust``; the ``fg_credited:<order>`` marker is the
+    single-flight lock against duplicate webhooks / retries.
+    """
+    if not getattr(settings, "famgateway_api_key", ""):
+        return None
+
+    from .gateway import FamGateway, verify_webhook_signature
+    from .money import Money
+
+    gateway = FamGateway(
+        settings.famgateway_api_key,
+        base_url=getattr(settings, "famgateway_base_url",
+                         "https://famgateway.in"),
+    )
+    store = wallets  # the wallet store has kv_get/kv_set + adjust
+
+    def handle(raw_body: bytes, signature: str, _content_type: str = ""):
+        if not verify_webhook_signature(raw_body, signature,
+                                        gateway.api_key):
+            log.warning("FamGateway webhook rejected: bad signature")
+            return 401, {"status": "invalid_signature"}
+        try:
+            import json as _json
+            payload = _json.loads(raw_body.decode("utf-8"))
+        except Exception:  # noqa: BLE001
+            return 400, {"status": "bad_json"}
+        order_id = str(payload.get("order_id", "") or "")
+        event = payload.get("event", "")
+        if event != "payment.success" or not order_id:
+            # Acknowledge-but-ignore (refund/expire etc.) so the gateway stops
+            # retrying; never credit on a non-success event.
+            return 200, {"status": "acknowledged"}
+        get_ = getattr(store, "kv_get", None)
+        set_ = getattr(store, "kv_set", None)
+        if not callable(get_) or not callable(set_):
+            log.error("wallet store has no kv interface; cannot credit webhook")
+            return 200, {"status": "no_store"}
+        if get_(f"fg_credited:{order_id}"):
+            return 200, {"status": "already_credited"}
+        uid = get_(f"fg_order:{order_id}")
+        amt_s = get_(f"fg_amt:{order_id}")
+        if not uid or not amt_s:
+            log.error(
+                "FamGateway webhook for %s but no order mapping; amount %s "
+                "needs manual credit", order_id, payload.get("amount"))
+            return 200, {"status": "no_mapping"}
+        try:
+            from decimal import Decimal
+            amt_dec = Decimal(amt_s)
+        except Exception:  # noqa: BLE001
+            return 200, {"status": "bad_amount"}
+        try:
+            money = Money(int(amt_dec * Decimal(100)))
+            store.adjust(f"{uid}", money)
+            set_(f"fg_credited:{order_id}", "1")
+        except Exception as exc:  # noqa: BLE001
+            log.error("FamGateway credit failed for %s: %s", order_id, exc)
+            return 200, {"status": "credit_error"}
+        log.info("FamGateway webhook credited %s to user %s (order %s)",
+                 money, uid, order_id)
+        return 200, {"status": "credited"}
+
+    return handle
+
+
 def _serve(settings: Settings) -> int:
     from .web import HealthServer
 
@@ -180,6 +251,7 @@ def _serve(settings: Settings) -> int:
         wallet_monitor=wallet_monitor,
         subsystem_stats=main_router.phase1_snapshot,
         metrics_token=settings.metrics_token,
+        famgateway_webhook=_famgateway_webhook(settings, wallets),
     )
     try:
         server.serve_forever()

@@ -87,10 +87,15 @@ class HealthServer:
         wallet_monitor: Optional[Any] = None,
         subsystem_stats: Optional[Callable[[], dict]] = None,
         metrics_token: str = "",
+        famgateway_webhook: Optional[Callable[[bytes, str, str],
+                                               tuple[int, dict]]] = None,
     ) -> None:
         self.engine = engine
         self.ledger = ledger
         self.port = port if port is not None else int(os.environ.get(PORT_ENV, DEFAULT_PORT))
+        #: Handler for ``POST /webhooks/famgateway``. Signature is
+        #: ``(raw_body, signature, content_type) -> (http_status, json)``.
+        self._famgateway_webhook = famgateway_webhook
         # Business metrics are only served when a token is configured, and
         # then only to a bearer that matches it. Empty (the default) means
         # /metrics does not exist at all -- an unauthenticated endpoint that
@@ -262,6 +267,31 @@ class HealthServer:
                     log.exception("handler failed for %s", path)
                     code, payload = 500, {"error": f"{type(exc).__name__}: {exc}"}
                 self._send(code, payload)
+
+            def do_POST(self) -> None:  # noqa: N802 - stdlib naming
+                path = self.path.split("?", 1)[0].rstrip("/") or "/"
+                try:
+                    if path == "/webhooks/famgateway":
+                        if server._famgateway_webhook is None:
+                            code, payload = 404, {"error": "no route"}
+                        else:
+                            length = int(self.headers.get("Content-Length", 0) or 0)
+                            body = self.rfile.read(length) if length > 0 else b""
+                            signature = self.headers.get("X-FamGateway-Signature", "")
+                            code, payload = server._famgateway_webhook(
+                                body, signature,
+                                self.headers.get("Content-Type", ""))
+                    else:
+                        code, payload = 404, {"error": f"no route for {path}"}
+                except Exception as exc:  # never let a handler kill the server
+                    log.exception("POST handler failed for %s", path)
+                    code, payload = 500, {"error": f"{type(exc).__name__}: {exc}"}
+                body = json.dumps(payload, indent=2).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
 
             def log_message(self, fmt: str, *args: Any) -> None:
                 log.debug("%s - %s", self.address_string(), fmt % args)
