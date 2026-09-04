@@ -14,7 +14,6 @@ import logging
 import threading
 import time
 import uuid
-from typing import Optional
 
 from ..catalog import Catalog
 from ..cancel_tracker import CancelTracker
@@ -119,6 +118,11 @@ class CommandRouter:
         self.ledger = ledger
         self.owner_id = owner_id
         self.allowed_users = allowed_users
+        #: Explicitly banned user ids. Kept SEPARATE from ``allowed_users``:
+        #: an allowlist means "these may buy" (empty = anyone), so toggling
+        #: bans on it made banning one user lock out everyone else. Banned
+        #: users are refused in every mode; the owner can never be banned.
+        self._banned: set[str] = set()
         #: Customer wallets. A real deployment passes ``wallets`` (a
         #: WalletStore on Postgres/sqlite) so balances survive redeploys;
         #: ``balances`` stays as the plain-dict fallback for tests.
@@ -212,6 +216,10 @@ class CommandRouter:
         return self.balances[user_id]
 
     def _authorised(self, user_id: str) -> bool:
+        # Ban is a hard NO in every mode (allowlist or anyone), independent of
+        # the allowlist so banning one user can never affect the rest.
+        if user_id in self._banned:
+            return False
         return not self.allowed_users or user_id in self.allowed_users
 
     def _is_owner(self, user_id: str) -> bool:
@@ -266,7 +274,7 @@ class CommandRouter:
         if alloc is None:
             return None
         try:
-            from datetime import datetime, timezone
+            from datetime import datetime
             allocated = getattr(alloc, "allocated_at", None)
             if isinstance(allocated, str) and allocated:
                 ts = datetime.fromisoformat(allocated).timestamp()
@@ -380,7 +388,8 @@ class CommandRouter:
             "debit": self.cmd_debit,
             "orders": self.cmd_orders,
             "users": self.cmd_users,
-            "ban": self.cmd_ban,
+            "ban": lambda uid, a: self.cmd_ban(uid, a, ban=True),
+            "unban": lambda uid, a: self.cmd_ban(uid, a, ban=False),
             "maintenance": self.cmd_maintenance,
             "broadcast": self.cmd_broadcast,
             "setmargin": self.cmd_setmargin,
@@ -507,7 +516,10 @@ class CommandRouter:
             )
 
         # Debit first: if the purchase then fails, the refund path restores it.
-        self._rate_limiter.record(user_id)
+        # (Exactly ONE rate-limit slot per buy — the check+record above already
+        # spent it. Recording again here halved the effective limit for typed
+        # /buy while button buys used one slot, so identical behaviour hit two
+        # different throttles.)
         self._debit(user_id, price)
         result = self.engine.fulfil(user_id, slug, gross_price=price,
                                     server=server or None)
@@ -620,8 +632,8 @@ class CommandRouter:
             "Enter this number on the service to request the code, then tap "
             "💰 Check OTP below. Auto-refund if it never lands.",
             rows=(
-                ((f"💰 Check OTP", f"co:{token}"),),
-                ((f"🔁 Resend SMS", f"rs:{token}"), (f"♻️ Cancel", f"cx:{token}")),
+                (("💰 Check OTP", f"co:{token}"),),
+                (("🔁 Resend SMS", f"rs:{token}"), ("♻️ Cancel", f"cx:{token}")),
                 (("🧾 My numbers", "o"), ("🏠 Menu", "m")),
             ),
         )
@@ -671,6 +683,10 @@ class CommandRouter:
         user_id = slug = None
         result = None
         provider_id = ""
+        #: Gross from the persisted active row, used when the in-memory order
+        #: is gone (after a redeploy) -- a cancel must refund the same money
+        #: the purchase took, and the row is the only place that survives.
+        db_gross: Optional[Money] = None
         if entry is not None:
             user_id, slug, result = entry
             alloc = getattr(result, "_alloc", None)
@@ -681,6 +697,7 @@ class CommandRouter:
                 return Reply("That order has finished. See 🧾 My numbers.",
                              ok=False, rows=((("🧾 My numbers", "o"),),))
             user_id, slug, provider_id = active.user_id, active.slug, active.provider_order_id
+            db_gross = active.gross
         released = True
         refused = ""
         if provider_id:
@@ -705,6 +722,8 @@ class CommandRouter:
             cost = 0
             if result is not None and result.order is not None:
                 cost = result.order.gross_price.paise
+            elif db_gross is not None:
+                cost = db_gross.paise
             self._cancel_tracker.record_denied(
                 service=slug or "", server=provider_id.split("|")[-1] if provider_id else "",
                 order_id=provider_id, cost_paise=cost,
@@ -757,7 +776,9 @@ class CommandRouter:
                 finish(provider_id)
             except Exception:  # noqa: BLE001
                 pass
-        gross = result.order.gross_price if result is not None and result.order else Money(0)
+        gross = (result.order.gross_price
+                 if result is not None and result.order is not None
+                 else (db_gross or Money(0)))
         # Idempotent: if a concurrent poll already refunded this order, don't
         # credit again -- tell the truth instead.
         already = self.refunds.is_processed(token)
@@ -776,7 +797,21 @@ class CommandRouter:
         # GUARANTEED refund: post the ledger line + wallet credit through the
         # durable outbox, so a confirmed release can never leave the customer
         # silently out of pocket (and the books stay accurate).
-        ok, _ = self.refunds.request(user_id, gross, token, reason="user_cancelled")
+        #
+        # If the ENGINE already posted this order's customer-refund ledger line
+        # (a timeout race posted it under the order id) tell the outbox so the
+        # router does not post a SECOND line under the wait-token: one order,
+        # one refund line, always.
+        ledger_posted = False
+        if order is not None and getattr(order, "order_id", ""):
+            try:
+                ledger_posted = bool(
+                    self.ledger.has_customer_refund(order.order_id))
+            except Exception:  # noqa: BLE001 - worst case: the ledger-level
+                ledger_posted = False  # guard still catches the duplicate
+        ok, _ = self.refunds.request(user_id, gross, token,
+                                     reason="user_cancelled",
+                                     ledger_posted=ledger_posted)
         if not already:
             self._record_cancel(user_id, slug, gross)
         name = self.catalog.get(slug).name if self.catalog.has(slug) else slug
@@ -889,7 +924,7 @@ class CommandRouter:
         try:
             msgs = list(get_sms(active.provider_order_id))
             codes = [m.extract_otp() for m in msgs if m.extract_otp()]
-        except Exception as exc:  # noqa: BLE001 - provider hiccup, retryable
+        except Exception:  # noqa: BLE001 - provider hiccup, retryable
             return Reply(
                 "Couldn't reach the provider right now. Tap 💰 Check new OTP "
                 "again in a moment — your number is still valid.",
@@ -1316,22 +1351,29 @@ class CommandRouter:
             return Reply(f"Could not debit: {exc}", ok=False)
         return Reply(f"↩️ Debited {amount} from `{target}` (balance now {new}).")
 
-    def cmd_ban(self, user_id: str, args: list[str]) -> Reply:
-        """🚫 /ban <user_id> | /unban <user_id> — toggle access."""
+    def cmd_ban(self, user_id: str, args: list[str], *, ban: bool = True) -> Reply:
+        """🚫 /ban <user_id> | /unban <user_id> — owner-only access control.
+
+        Maintains the dedicated ban set (not the allowlist): banned users are
+        refused in every mode, and banning one user can never change who else
+        is allowed. The owner can never be banned.
+        """
         if not self._is_owner(user_id):
             return Reply("Owner only.", ok=False)
         if not args:
             return Reply("Usage: /ban <user_id>  or  /unban <user_id>", ok=False)
         target = args[0]
-        mode = "ban"
-        current = set(self.allowed_users or [])
-        if target in current:
-            current.discard(target)
-            (setattr(self, "allowed_users", tuple(current)))
-            return Reply(f"🚫 Banned `{target}` from buying.")
-        current.add(target)
-        setattr(self, "allowed_users", tuple(current))
-        return Reply(f"✅ Unbanned `{target}`.")
+        if self.owner_id and target == self.owner_id:
+            return Reply("The owner cannot be banned.", ok=False)
+        if ban:
+            if target in self._banned:
+                return Reply(f"`{target}` is already banned. Use /unban to restore access.")
+            self._banned.add(target)
+            return Reply(f"🚫 Banned `{target}` — they can no longer buy until unbanned.")
+        if target not in self._banned:
+            return Reply(f"`{target}` is not banned.")
+        self._banned.discard(target)
+        return Reply(f"✅ Unbanned `{target}` — they can buy again.")
 
     def cmd_maintenance(self, user_id: str, args: list[str]) -> Reply:
         """🛠 /maintenance [on|off] — pivot buying (owner)."""

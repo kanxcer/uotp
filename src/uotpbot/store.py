@@ -63,5 +63,6 @@ def make_registry(settings: Settings) -> SubBotRegistry:
     if settings.database_url:
         from .pgstore import PostgresRegistry
 
-        return PostgresRegistry(settings.database_url, schema=settings.database_schema)
-    return SubBotRegistry(settings.subbots_path)
+        return PostgresRegistry(settings.database_url, schema=settings.database_schema,
+                                secret_key=settings.secret_key)
+    return SubBotRegistry(settings.subbots_path, secret_key=settings.secret_key)

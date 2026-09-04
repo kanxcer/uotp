@@ -355,6 +355,77 @@ def test_rate_limit_gates_buys(rig):
     assert not r2.ok and "wait" in r2.text.lower()
 
 
+def test_typed_buy_and_button_buy_burn_one_rate_slot_each(rig):
+    """The typed /buy path used to record the rate-limit slot TWICE per buy
+    (check+record, then again before the debit), so a 2-buy window blocked
+    after one typed buy while button buys got two. Both entry points must
+    consume exactly one slot."""
+    from uotpbot.ratelimit import RateLimitConfig
+    orig, provider, ledger = rig
+    router = CommandRouter(orig.engine, orig.catalog, orig.pricer,
+                           orig.ledger, owner_id=OWNER,
+                           allowed_users=(OWNER, USER),
+                           rate_limit=RateLimitConfig(max_buys=2, window_seconds=60,
+                                                      cooldown_seconds=0))
+    router.credit(USER, INR(50000))
+    # Two typed buys must both get through a 2-slot window.
+    r1 = router.handle(USER, "/buy telegram")
+    assert r1.ok, r1.text
+    r2 = router.handle(USER, "/buy telegram")
+    assert r2.ok, r2.text
+    # The window is now exhausted: a third buy (any entry point) is throttled.
+    r3 = router.handle(USER, "/buy telegram")
+    assert not r3.ok and "wait" in r3.text.lower()
+
+
+def test_ban_blocks_only_the_target_in_anyone_mode(rig):
+    """Banning a user must not rewrite the allowlist: in 'anyone may buy' mode
+    the old /ban removed the target from an empty allowlist, which LOCKED OUT
+    EVERYONE else."""
+    orig, provider, ledger = rig
+    router = CommandRouter(orig.engine, orig.catalog, orig.pricer,
+                           orig.ledger, owner_id=OWNER, allowed_users=())
+    # Sanity: in anyone-mode an outsider can list.
+    assert router.handle(OUTSIDER, "/list").ok
+    reply = router.handle(OWNER, f"/ban {USER}")
+    assert reply.ok and "Banned" in reply.text
+    # The banned user is out...
+    assert not router.handle(USER, "/list").ok
+    # ...and EVERYONE ELSE IS STILL IN.
+    assert router.handle(OUTSIDER, "/list").ok
+    # Unban restores exactly the target.
+    unban = router.handle(OWNER, f"/unban {USER}")
+    assert unban.ok and "Unbanned" in unban.text
+    assert router.handle(USER, "/list").ok
+
+
+def test_ban_in_allowlist_mode_keeps_the_allowlist_intact(rig):
+    router, _, _ = rig  # allowed_users=(OWNER, USER)
+    reply = router.handle(OWNER, f"/ban {USER}")
+    assert reply.ok
+    assert not router._authorised(USER)
+    assert router._authorised(OWNER)
+    # The allowlist itself is untouched: an unbanned outsider is still out,
+    # and re-adding works only through the allowlist, not through /ban.
+    assert not router._authorised(OUTSIDER)
+    router.handle(OWNER, f"/unban {USER}")
+    assert router._authorised(USER)
+
+
+def test_owner_cannot_ban_themselves(rig):
+    router, _, _ = rig
+    reply = router.handle(OWNER, f"/ban {OWNER}")
+    assert not reply.ok and "owner" in reply.text.lower()
+    assert router._authorised(OWNER)  # still in control
+
+
+def test_ban_is_owner_only(rig):
+    router, _, _ = rig
+    reply = router.handle(USER, f"/ban {OUTSIDER}")
+    assert not reply.ok and "Owner only" in reply.text
+    assert OUTSIDER not in router._banned
+
+
 def test_sunkcost_command_owner_only(rig):
     router, _, _ = rig
     assert "Owner only" in router.handle(USER, "/sunkcost").text

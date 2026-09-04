@@ -246,7 +246,6 @@ def test_exact_markup_uses_list_price_not_amortized_cost():
 def test_exact_markup_per_server():
     """A server's own price (list_price override) is the base, so each server
     is marked up individually."""
-    from uotpbot.catalog import ServerOption
     c = cat()
     over = c.get("telegram").with_overrides(list_price=INR(20), server="8")
     pricer = Pricer(cat(), strategy=Strategy.EXACT_MARKUP, markup=rate("0.45"))

@@ -126,6 +126,12 @@ class Settings:
     #: Opt-in. Off by default so an existing deployment does not start
     #: spawning pollers for bots nobody asked it to run.
     whitelabel_enabled: bool = False
+    #: Secret that encrypts sub-bot credentials (Telegram bot tokens, OWN_API
+    #: provider keys) at rest in the registry. Required whenever
+    #: ``whitelabel_enabled`` is True: a registry holding live bot tokens in
+    #: plaintext is a standing compromise. Any long random string works; a
+    #: Fernet key is derived from it deterministically.
+    secret_key: str = ""
     #: The platform's cut of an OWN_API sub-bot sale, as a fraction of gross.
     #: Whatever is set here is what owners are shown at creation time and what
     #: is recorded against their bot -- it is not a rate the platform can
@@ -157,6 +163,12 @@ class Settings:
     rate_limit_window: int = 30
     #: How often the provider-wallet monitor (P2) polls the balance, in seconds.
     wallet_monitor_seconds: int = 120
+    #: Shared secret gating the /metrics endpoint (P&L, wallet balances).
+    #: Empty (default) means /metrics is not exposed at all -- revenue figures
+    #: are not something an unauthenticated endpoint should serve. Set this to
+    #: a long random string to enable it; then requests need
+    #: ``Authorization: Bearer <token>`` or ``?token=<token>``.
+    metrics_token: str = ""
 
     @property
     def has_telegram(self) -> bool:
@@ -231,6 +243,18 @@ def from_environment(env_file: Optional[Path | str] = None) -> Settings:
     allowed = tuple(
         u.strip() for u in _get("TELEGRAM_ALLOWED_USERS", "").split(",") if u.strip()
     )
+    whitelabel_enabled = _bool("WHITELABEL_ENABLED", False)
+    secret_key = _get("SECRET_KEY", "")
+    # A white-label registry stores live credentials. If it is enabled we must
+    # refuse to boot without the key that encrypts them: silently falling back
+    # to plaintext would leave every sub-bot token exposed on a surviving disk.
+    if whitelabel_enabled and not secret_key:
+        raise ConfigError(
+            "WHITELABEL_ENABLED is on but SECRET_KEY is not set. Set SECRET_KEY "
+            "to a long random string (e.g. `openssl rand -hex 32`) so sub-bot "
+            "tokens and provider keys are stored encrypted; or set "
+            "WHITELABEL_ENABLED=false to disable white-label."
+        )
     return Settings(
         uotp=uotp,
         fees=fees,
@@ -244,7 +268,8 @@ def from_environment(env_file: Optional[Path | str] = None) -> Settings:
         database_schema=_get("DATABASE_SCHEMA", "uotp"),
         prices_path=_get("PRICES_PATH") or None,
         subbots_path=_get("SUBBOTS_PATH", "subbots.db"),
-        whitelabel_enabled=_bool("WHITELABEL_ENABLED", False),
+        whitelabel_enabled=whitelabel_enabled,
+        secret_key=secret_key,
         platform_fee_rate=_fee_rate(_get("PLATFORM_FEE_RATE", "0.05")),
         pricing_target_margin=_fraction("PRICING_TARGET_MARGIN", "0.35"),
         pricing_strategy=_get("PRICING_STRATEGY", "exact_markup"),
@@ -254,6 +279,7 @@ def from_environment(env_file: Optional[Path | str] = None) -> Settings:
         rate_limit_max_buys=_int("RATE_LIMIT_MAX_BUYS", 3),
         rate_limit_window=_int("RATE_LIMIT_WINDOW", 30),
         wallet_monitor_seconds=_int("WALLET_MONITOR_SECONDS", 120),
+        metrics_token=_get("METRICS_TOKEN", ""),
     )
 
 

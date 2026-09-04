@@ -81,12 +81,53 @@ Profit is never stored. The ledger records double-entry postings and profit is
 always *derived*, so it cannot drift away from reality. `Ledger.verify()`
 asserts debits == credits and runs on every read.
 
+## Security
+
+The parts of this system that hold money or secrets are hardened so a bug or a
+leak costs one customer's one order at most, not the whole book:
+
+- **Credentials are never plaintext at rest.** White-label sub-bots store a
+  Telegram bot token and (own-API) a provider key. Both are Fernet-encrypted
+  with a key derived from `SECRET_KEY`, and the bot **refuses to boot** if
+  white-label is enabled without it. The registry falls back to reading legacy
+  plaintext rows, so an existing deployment can turn encryption on without
+  recreating every bot.
+- **The metrics endpoint is not public.** `/metrics` (P&L, wallet balances,
+  order counters) only exists when `METRICS_TOKEN` is set, and then answers
+  only to `Authorization: Bearer <token>` / `?token=<token>`, compared in
+  constant time. `/healthz` and `/readyz` are public by necessity (the
+  platform probes them) and are deliberately reduced to liveness/readiness —
+  they expose **no** revenue, profit, or wallet balances, and provider errors
+  leak only the exception class name, not the message.
+- **Refunds are exactly-once.** A customer refund writes a durable outbox row
+  *before* any money moves, and that row's unique `(scope, order_token)`
+  constraint is the claim: of every path that can resolve an order (Cancel,
+  the auto-poller, a late Check, a retry worker, a redeploy), only the one
+  that inserts the row may credit the wallet. The customer-refund *ledger
+  line* is posted at most once per order (guarded by a `ledger_done` flag and
+  a ledger-level `has_customer_refund` check), so a retry after a wallet-credit
+  blip completes the credit without double-posting the books.
+- **Access control is a real boundary.** Banning a customer removes *them*, in
+  every allowlist mode — it no longer rewrites the allowlist (which used to
+  lock out everyone else), and the owner can never ban themselves. Sub-bot
+  wallet, top-up, order and active-number views are scope-guarded: one bot's
+  customers can never read, spend, or mutate another bot's rows.
+- **Rate limiting is consistent.** Typed `/buy` and the button path each
+  consume exactly one slot per purchase (a duplicate `record` used to halve
+  the typed path's effective limit).
+
+The regression tests for every one of these live in `tests/` — `test_refund.py`
+(exactly-once refunds), `test_whitelabel.py` (credential encryption),
+`test_web.py` (endpoint auth + no P&L leak), `test_commands.py` (ban + rate
+limit), and `test_wallets.py` (scope isolation + migration).
+
 ## Install
 
 ```bash
 pip install -e ".[dev]"          # core + tests
 pip install -e ".[telegram]"     # add the Telegram transport
 pip install -e ".[postgres]"     # add Postgres storage (Supabase)
+pip install -e ".[whitelabel]"   # add at-rest encryption for sub-bot credentials
 ```
 
 Requires Python 3.10+. The core has **no runtime dependencies** — the HTTP
@@ -189,7 +230,7 @@ If the closed-form expectation were wrong, those would diverge. The suite runs
 this check across the whole catalogue.
 
 ```bash
-pytest            # 370 tests, lint clean (ruff)
+pytest            # 556 tests, lint clean (ruff: E4,E7,E9,F)
 ```
 
 ## Storage: sqlite or Postgres (Supabase)
@@ -234,7 +275,9 @@ Health: /healthz
 `render up` and you're done.
 
 Required env vars: `DATABASE_URL`, `UOTP_API_KEY`, `TELEGRAM_BOT_TOKEN`,
-`TELEGRAM_OWNER_ID`, `TELEGRAM_ALLOWED_USERS`. See `.env.example` for the rest.
+`TELEGRAM_OWNER_ID`, `TELEGRAM_ALLOWED_USERS`. Add `SECRET_KEY` when you turn
+on white-label (required), and `METRICS_TOKEN` when you want `/metrics`. See
+`.env.example` for the rest.
 
 **The extras matter.** A bare `pip install .` starts an HTTP server that
 accepts no orders and cannot reach Postgres.

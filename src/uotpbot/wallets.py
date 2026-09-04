@@ -130,22 +130,30 @@ class ScopedWallets(WalletStore):
 
     def get_active(self, token: str):
         found = self._inner.get_active(token)
-        # Scope-guard: only return rows belonging to this sub-bot.
-        if found is not None and getattr(found, "user_id", None) is not None:
-            return found
+        # Scope-guard: a wait-token only admits this bot's own live numbers.
+        # (Tokens are random, but "can't guess it" is not a boundary.)
+        if found is not None and found.scope != self._scope:
+            return None
         return found
 
     def update_active(self, provider_order_id: str, *, otp: str = ""):
-        return self._inner.update_active(provider_order_id, otp=otp)
+        return self._inner.update_active(provider_order_id, otp=otp,
+                                         scope=self._scope)
 
     def finish_active(self, provider_order_id: str):
-        return self._inner.finish_active(provider_order_id)
+        return self._inner.finish_active(provider_order_id, scope=self._scope)
 
-    def write_refund(self, *, user_id, amount, order_token="", reason="", scope=""):
+    def write_refund(self, *, user_id, amount, order_token="", reason="", scope="",
+                     ledger_done=False):
         # Refunds are recorded at the platform scope; the credit itself stays
         # scoped to this bot via ``adjust``, so a sub-bot never loses a refund.
         return self._inner.write_refund(user_id=user_id, amount=amount,
-                                        order_token=order_token, reason=reason, scope="")
+                                        order_token=order_token, reason=reason,
+                                        scope="", ledger_done=ledger_done)
+
+    def mark_ledger_done(self, order_token, *, scope=""):
+        # Same platform scope as write_refund: the ledger line is per order.
+        return self._inner.mark_ledger_done(order_token, scope="")
 
     def get_refund(self, order_token, *, scope=""):
         return self._inner.get_refund(order_token, scope="")
@@ -227,6 +235,12 @@ CREATE TABLE IF NOT EXISTS {t} (
 )
 """
 
+# ``scope`` is also SELECTed on active rows (added by _migrate_orders on old
+# tables) so a sub-bot's view can be scope-guarded.
+_ACTIVE_SELECT = ("id, user_id, slug, phone, provider_order_id, token, "
+                  "gross_paise, otp, ts, valid_until, "
+                  "COALESCE(scope, '')")
+
 _KV_SCHEMA = """
 CREATE TABLE IF NOT EXISTS {t} (
     key TEXT PRIMARY KEY,
@@ -238,7 +252,11 @@ CREATE TABLE IF NOT EXISTS {t} (
 #: ledger post is attempted, so if that credit ever fails the refund is never
 #: silently lost -- a background worker retries the pending rows (and a redeploy
 #: re-reads them), guaranteeing a customer who was actually refunded gets their
-#: money. One row per order_token (a cancel can only ever refund once).
+#: money. One row per order_token (a cancel can only ever refund once): the
+#: UNIQUE constraint makes the INSERT the claim, so racing paths cannot both
+#: credit. ``ledger_done`` records that the customer-refund LEDGER line for
+#: this order is already posted, so a retry after a wallet-credit blip never
+#: posts a second line (which would make reported refunds outrun real money).
 _REFUND_SCHEMA = """
 CREATE TABLE IF NOT EXISTS {t} (
     {pk}
@@ -254,9 +272,14 @@ CREATE TABLE IF NOT EXISTS {t} (
     last_error TEXT NOT NULL DEFAULT '',
     created_ts REAL NOT NULL,
     done_ts REAL,
+    ledger_done INTEGER NOT NULL DEFAULT 0 CHECK (ledger_done IN (0, 1)),
     UNIQUE(scope, order_token)
 )
 """
+
+_REFUND_SELECT = ("id, refund_id, user_id, amount_paise, order_token, reason,"
+                  " status, attempts, COALESCE(last_error, ''), created_ts,"
+                  " COALESCE(ledger_done, 0)")
 
 
 @dataclass(frozen=True, slots=True)
@@ -337,6 +360,9 @@ class ActiveNumber:
     otp: str
     ts: float
     valid_until: float
+    #: Which sub-bot (or the platform, "") this number belongs to. Surfaced so
+    #: a scoped view can refuse rows from another bot instead of leaking them.
+    scope: str = ""
 
     @property
     def seconds_left(self) -> float:
@@ -354,7 +380,8 @@ class RefundRow:
     A refund is written here before any money moves; if the credit or ledger
     post fails the row stays 'pending' and a retry worker (or a redeploy)
     re-attempts until it succeeds, so a confirmed customer refund is never
-    silently lost.
+    silently lost. ``ledger_done`` says the customer-refund ledger line is
+    already posted, so retries never post it a second time.
     """
 
     id: int
@@ -367,6 +394,7 @@ class RefundRow:
     attempts: int
     last_error: str
     created_ts: float
+    ledger_done: bool = False
 
 
 class SqliteWallets(WalletStore):
@@ -391,26 +419,43 @@ class SqliteWallets(WalletStore):
             )
             self._conn.execute(_ACTIVE_SCHEMA.format(
                 t="activenumbers", pk="id INTEGER PRIMARY KEY AUTOINCREMENT,"))
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_active ON activenumbers(scope, user_id)")
             self._conn.execute(_REFUND_SCHEMA.format(
                 t="refund_outbox", pk="id INTEGER PRIMARY KEY AUTOINCREMENT,"))
+            # BEFORE the index: a legacy database gains the scope column here.
             self._migrate_orders()
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_active ON activenumbers(scope, user_id)")
             self._conn.commit()
 
     def _migrate_orders(self) -> None:
-        """Add the richer history columns to existing orders tables (old DBs)."""
-        cols = {
-            "status": "TEXT NOT NULL DEFAULT ''",
-            "reason": "TEXT NOT NULL DEFAULT ''",
-            "refunded_paise": "INTEGER NOT NULL DEFAULT 0",
-            "spent_paise": "INTEGER NOT NULL DEFAULT 0",
-            "balance_after_paise": "INTEGER NOT NULL DEFAULT 0",
+        """Add newer columns to existing tables (old DBs).
+
+        Columns are only added when absent, so a fresh database (created with
+        the current DDL) skips this entirely.
+        """
+        migrations = {
+            "orders": {
+                "status": "TEXT NOT NULL DEFAULT ''",
+                "reason": "TEXT NOT NULL DEFAULT ''",
+                "refunded_paise": "INTEGER NOT NULL DEFAULT 0",
+                "spent_paise": "INTEGER NOT NULL DEFAULT 0",
+                "balance_after_paise": "INTEGER NOT NULL DEFAULT 0",
+            },
+            "refund_outbox": {
+                # Refund idempotency: whether the ledger line is already posted.
+                "ledger_done": "INTEGER NOT NULL DEFAULT 0",
+            },
+            "activenumbers": {
+                # Sub-bot scope isolation for live numbers.
+                "scope": "TEXT NOT NULL DEFAULT ''",
+            },
         }
-        existing = {r[1] for r in self._conn.execute("PRAGMA table_info(orders)").fetchall()}
-        for name, ddl in cols.items():
-            if name not in existing:
-                self._conn.execute(f"ALTER TABLE orders ADD COLUMN {name} {ddl}")
+        for table, cols in migrations.items():
+            existing = {r[1] for r in self._conn.execute(
+                f"PRAGMA table_info({table})").fetchall()}
+            for name, ddl in cols.items():
+                if name not in existing:
+                    self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
     # -- active numbers ----------------------------------------------------
     def record_active(self, *, user_id, slug, phone, provider_order_id="",
@@ -430,8 +475,7 @@ class SqliteWallets(WalletStore):
                        now: Optional[float] = None) -> list[ActiveNumber]:
         """Every LIVE number for a user (ts <= now < valid_until), newest first."""
         now = time.time() if now is None else now
-        sql = ("SELECT id, user_id, slug, phone, provider_order_id, token, "
-               " gross_paise, otp, ts, valid_until FROM activenumbers "
+        sql = (f"SELECT {_ACTIVE_SELECT} FROM activenumbers "
                " WHERE scope = ? AND valid_until > ?")
         params: list = [scope, now]
         if user_id:
@@ -450,48 +494,66 @@ class SqliteWallets(WalletStore):
         """
         with self._lock:
             row = self._conn.execute(
-                "SELECT id, user_id, slug, phone, provider_order_id, token, "
-                " gross_paise, otp, ts, valid_until FROM activenumbers "
+                f"SELECT {_ACTIVE_SELECT} FROM activenumbers "
                 " WHERE token = ? AND valid_until > ?",
                 (token, time.time()),
             ).fetchone()
         return self._active_from(row) if row else None
 
-    def update_active(self, provider_order_id: str, *, otp: str = "") -> None:
-        """Record the OTP on a live number once it arrives."""
+    def update_active(self, provider_order_id: str, *, otp: str = "",
+                      scope: str = "") -> None:
+        """Record the OTP on a live number once it arrives (this scope only)."""
         with self._lock, self._conn:
             self._conn.execute(
-                "UPDATE activenumbers SET otp = ? WHERE provider_order_id = ?",
-                (otp, provider_order_id),
+                "UPDATE activenumbers SET otp = ? "
+                "WHERE provider_order_id = ? AND scope = ?",
+                (otp, provider_order_id, scope),
             )
 
-    def finish_active(self, provider_order_id: str) -> None:
+    def finish_active(self, provider_order_id: str, *, scope: str = "") -> None:
         """Remove a number from the live set (delivered, refunded, or expired)."""
         with self._lock, self._conn:
             self._conn.execute(
-                "DELETE FROM activenumbers WHERE provider_order_id = ?",
-                (provider_order_id,),
+                "DELETE FROM activenumbers WHERE provider_order_id = ? AND scope = ?",
+                (provider_order_id, scope),
             )
 
     # -- refund outbox -----------------------------------------------------
     def write_refund(self, *, user_id: str, amount: Money, order_token: str = "",
-                     reason: str = "", scope: str = "") -> str:
-        """Durably record a refund before any money moves. Idempotent per order."""
+                     reason: str = "", scope: str = "",
+                     ledger_done: bool = False) -> tuple[str, bool]:
+        """Durably claim + record a refund before any money moves.
+
+        Returns ``(refund_id, inserted)``: ``inserted`` is True only when THIS
+        call created the row (the unique ``(scope, order_token)`` constraint
+        made the insert the claim). Callers that do not insert did not win the
+        claim and must not credit.
+        """
         refund_id = uuid.uuid4().hex
         with self._lock, self._conn:
-            self._conn.execute(
+            cur = self._conn.execute(
                 "INSERT OR IGNORE INTO refund_outbox(scope, refund_id, user_id, "
-                " amount_paise, order_token, reason, created_ts) "
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (scope, refund_id, user_id, amount.paise, order_token, reason, time.time()),
+                " amount_paise, order_token, reason, created_ts, ledger_done) "
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (scope, refund_id, user_id, amount.paise, order_token, reason,
+                 time.time(), 1 if ledger_done else 0),
             )
-        return refund_id
+            inserted = (cur.rowcount or 0) == 1
+        return refund_id, inserted
+
+    def mark_ledger_done(self, order_token: str, *, scope: str = "") -> None:
+        """Persist that this order's customer-refund ledger line is posted."""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE refund_outbox SET ledger_done = 1 "
+                "WHERE scope = ? AND order_token = ?",
+                (scope, order_token),
+            )
 
     def get_refund(self, order_token: str, *, scope: str = "") -> Optional[RefundRow]:
         with self._lock:
             row = self._conn.execute(
-                "SELECT id, refund_id, user_id, amount_paise, order_token, reason, status,"
-                " attempts, COALESCE(last_error, ''), created_ts FROM refund_outbox"
+                f"SELECT {_REFUND_SELECT} FROM refund_outbox"
                 " WHERE scope = ? AND order_token = ?",
                 (scope, order_token)).fetchone()
         return self._refund_from(row) if row else None
@@ -499,8 +561,7 @@ class SqliteWallets(WalletStore):
     def pending_refunds(self, *, scope: str = "", max_attempts: int = 5) -> list[RefundRow]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, refund_id, user_id, amount_paise, order_token, reason, status,"
-                " attempts, COALESCE(last_error, ''), created_ts FROM refund_outbox"
+                f"SELECT {_REFUND_SELECT} FROM refund_outbox"
                 " WHERE scope = ? AND status = 'pending' AND attempts < ? ORDER BY id",
                 (scope, max_attempts)).fetchall()
         return [self._refund_from(r) for r in rows]
@@ -520,7 +581,7 @@ class SqliteWallets(WalletStore):
         return RefundRow(
             id=row[0], refund_id=row[1], user_id=row[2], amount=Money(row[3]),
             order_token=row[4], reason=row[5], status=row[6], attempts=row[7],
-            last_error=row[8], created_ts=row[9],
+            last_error=row[8], created_ts=row[9], ledger_done=bool(row[10]),
         )
 
     @staticmethod
@@ -528,7 +589,7 @@ class SqliteWallets(WalletStore):
         return ActiveNumber(
             id=row[0], user_id=row[1], slug=row[2], phone=row[3],
             provider_order_id=row[4], token=row[5], gross=Money(row[6]),
-            otp=row[7], ts=row[8], valid_until=row[9],
+            otp=row[7], ts=row[8], valid_until=row[9], scope=row[10],
         )
 
     # -- payment top-ups ---------------------------------------------------
@@ -759,10 +820,11 @@ class PostgresWallets(WalletStore):
             self._tr = f"{schema}.refund_outbox"
             self._conn.execute(_REFUND_SCHEMA.format(
                 t=self._tr, pk="id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"))
+            # BEFORE the index: a legacy database gains the scope column here.
+            self._migrate_orders()
             safe = schema.replace("-", "_").replace('"', "")
             self._conn.execute(
                 f'CREATE INDEX IF NOT EXISTS "idx_active_{safe}" ON {self._ta}(scope, user_id)')
-            self._migrate_orders()
 
     # -- active numbers ----------------------------------------------------
     def record_active(self, *, user_id, slug, phone, provider_order_id="",
@@ -780,8 +842,7 @@ class PostgresWallets(WalletStore):
     def active_numbers(self, *, scope: str = "", user_id: str = "",
                        now: Optional[float] = None) -> list[ActiveNumber]:
         now = time.time() if now is None else now
-        sql = (f"SELECT id, user_id, slug, phone, provider_order_id, token, "
-               f" gross_paise, otp, ts, valid_until FROM {self._ta} "
+        sql = (f"SELECT {_ACTIVE_SELECT} FROM {self._ta} "
                " WHERE scope = %s AND valid_until > %s")
         params: list = [scope, now]
         if user_id:
@@ -795,45 +856,60 @@ class PostgresWallets(WalletStore):
     def get_active(self, token: str) -> Optional[ActiveNumber]:
         with self._lock:
             row = self._conn.execute(
-                f"SELECT id, user_id, slug, phone, provider_order_id, token, "
-                f" gross_paise, otp, ts, valid_until FROM {self._ta} "
+                f"SELECT {_ACTIVE_SELECT} FROM {self._ta} "
                 " WHERE token = %s AND valid_until > %s",
                 (token, time.time()),
             ).fetchone()
         return self._active_from(row) if row else None
 
-    def update_active(self, provider_order_id: str, *, otp: str = "") -> None:
+    def update_active(self, provider_order_id: str, *, otp: str = "",
+                      scope: str = "") -> None:
         with self._lock:
             self._conn.execute(
-                f"UPDATE {self._ta} SET otp = %s WHERE provider_order_id = %s",
-                (otp, provider_order_id),
+                f"UPDATE {self._ta} SET otp = %s WHERE provider_order_id = %s AND scope = %s",
+                (otp, provider_order_id, scope),
             )
 
-    def finish_active(self, provider_order_id: str) -> None:
+    def finish_active(self, provider_order_id: str, *, scope: str = "") -> None:
         with self._lock:
             self._conn.execute(
-                f"DELETE FROM {self._ta} WHERE provider_order_id = %s",
-                (provider_order_id,),
+                f"DELETE FROM {self._ta} WHERE provider_order_id = %s AND scope = %s",
+                (provider_order_id, scope),
             )
 
     # -- refund outbox -----------------------------------------------------
     def write_refund(self, *, user_id: str, amount: Money, order_token: str = "",
-                     reason: str = "", scope: str = "") -> str:
+                     reason: str = "", scope: str = "",
+                     ledger_done: bool = False) -> tuple[str, bool]:
+        """Claim + record a refund. See :meth:`SqliteWallets.write_refund`.
+
+        ``ON CONFLICT DO NOTHING`` makes the insert the claim; the command
+        result says whether this call won it.
+        """
         refund_id = uuid.uuid4().hex
         with self._lock:
-            self._conn.execute(
+            inserted = bool(self._conn.execute(
                 f"INSERT INTO {self._tr}(scope, refund_id, user_id, amount_paise,"
-                f" order_token, reason, created_ts) VALUES (%s, %s, %s, %s, %s, %s, %s)"
-                " ON CONFLICT(scope, order_token) DO NOTHING",
-                (scope, refund_id, user_id, amount.paise, order_token, reason, time.time()),
+                f" order_token, reason, created_ts, ledger_done) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT(scope, order_token) DO NOTHING",
+                (scope, refund_id, user_id, amount.paise, order_token, reason,
+                 time.time(), 1 if ledger_done else 0),
+            ).rowcount == 1)
+        return refund_id, inserted
+
+    def mark_ledger_done(self, order_token: str, *, scope: str = "") -> None:
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE {self._tr} SET ledger_done = 1 "
+                "WHERE scope = %s AND order_token = %s",
+                (scope, order_token),
             )
-        return refund_id
 
     def get_refund(self, order_token: str, *, scope: str = "") -> Optional[RefundRow]:
         with self._lock:
             row = self._conn.execute(
-                f"SELECT id, refund_id, user_id, amount_paise, order_token, reason, status,"
-                f" attempts, COALESCE(last_error, ''), created_ts FROM {self._tr}"
+                f"SELECT {_REFUND_SELECT} FROM {self._tr}"
                 " WHERE scope = %s AND order_token = %s",
                 (scope, order_token)).fetchone()
         return self._refund_from(row) if row else None
@@ -841,8 +917,7 @@ class PostgresWallets(WalletStore):
     def pending_refunds(self, *, scope: str = "", max_attempts: int = 5) -> list[RefundRow]:
         with self._lock:
             rows = self._conn.execute(
-                f"SELECT id, refund_id, user_id, amount_paise, order_token, reason, status,"
-                f" attempts, COALESCE(last_error, ''), created_ts FROM {self._tr}"
+                f"SELECT {_REFUND_SELECT} FROM {self._tr}"
                 " WHERE scope = %s AND status = 'pending' AND attempts < %s ORDER BY id",
                 (scope, max_attempts)).fetchall()
         return [self._refund_from(r) for r in rows]
@@ -862,7 +937,7 @@ class PostgresWallets(WalletStore):
         return RefundRow(
             id=row[0], refund_id=row[1], user_id=row[2], amount=Money(row[3]),
             order_token=row[4], reason=row[5], status=row[6], attempts=row[7],
-            last_error=row[8], created_ts=row[9],
+            last_error=row[8], created_ts=row[9], ledger_done=bool(row[10]),
         )
 
     @staticmethod
@@ -870,7 +945,7 @@ class PostgresWallets(WalletStore):
         return ActiveNumber(
             id=row[0], user_id=row[1], slug=row[2], phone=row[3],
             provider_order_id=row[4], token=row[5], gross=Money(row[6]),
-            otp=row[7], ts=row[8], valid_until=row[9],
+            otp=row[7], ts=row[8], valid_until=row[9], scope=row[10],
         )
 
     # -- payment top-ups ---------------------------------------------------
@@ -1005,24 +1080,34 @@ class PostgresWallets(WalletStore):
         return _order_from_row(row) if row else None
 
     def _migrate_orders(self) -> None:
-        """Add the richer history columns to existing orders tables (old DBs)."""
-        cols = {
-            "status": "TEXT NOT NULL DEFAULT ''",
-            "reason": "TEXT NOT NULL DEFAULT ''",
-            "refunded_paise": "INTEGER NOT NULL DEFAULT 0",
-            "spent_paise": "INTEGER NOT NULL DEFAULT 0",
-            "balance_after_paise": "INTEGER NOT NULL DEFAULT 0",
+        """Add newer columns to existing tables (old DBs).
+
+        ``ADD COLUMN IF NOT EXISTS`` keeps this idempotent on fresh schemas.
+        """
+        migrations = {
+            self._to: {
+                "status": "TEXT NOT NULL DEFAULT ''",
+                "reason": "TEXT NOT NULL DEFAULT ''",
+                "refunded_paise": "INTEGER NOT NULL DEFAULT 0",
+                "spent_paise": "INTEGER NOT NULL DEFAULT 0",
+                "balance_after_paise": "INTEGER NOT NULL DEFAULT 0",
+            },
+            self._tr: {
+                # Refund idempotency: whether the ledger line is already posted.
+                "ledger_done": "INTEGER NOT NULL DEFAULT 0",
+            },
+            self._ta: {
+                # Sub-bot scope isolation for live numbers.
+                "scope": "TEXT NOT NULL DEFAULT ''",
+            },
         }
-        try:
-            existing = {r[0] for r in self._conn.execute(
-                "SELECT column_name FROM information_schema.columns "
-                "WHERE table_name = 'orders'").fetchall()}
-        except Exception:  # noqa: BLE001
-            existing = set()
-        for name, ddl in cols.items():
-            if name not in existing:
-                self._conn.execute(
-                    f'ALTER TABLE {self._to} ADD COLUMN IF NOT EXISTS {name} {ddl}')
+        for table, cols in migrations.items():
+            for name, ddl in cols.items():
+                try:
+                    self._conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {name} {ddl}")
+                except Exception:  # noqa: BLE001 - never block startup on drift checks
+                    pass
 
     def float_stats(self, *, scope: str = "") -> dict[str, object]:
         like = (scope + ":%") if scope else None

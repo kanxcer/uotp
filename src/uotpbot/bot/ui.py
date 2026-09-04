@@ -174,7 +174,7 @@ class MenuUI:
                 continue
             lines.append(f"{_emoji(slug)} {name} · {price}")
             rows.append(((f"✅ Buy · {price}", f"y:{slug}"),
-                         (f"★ Remove", f"fvt:{slug}")))
+                         ("★ Remove", f"fvt:{slug}")))
         rows.append((("🛒 Browse services", "l"), ("🏠 Menu", "m")))
         return Reply("\n".join(lines), rows=tuple(rows))
 
@@ -1037,7 +1037,9 @@ class MenuUI:
                 ratio = o.profit_ratio
                 pct = f" ({ratio:.0%})" if ratio is not None else ""
                 lines.append(f"\n✅ {when} · {o.slug} · {o.gross} → profit {o.profit}{pct}")
-                tot_g += o.gross.paise; tot_p += o.profit.paise; n += 1
+                tot_g += o.gross.paise
+                tot_p += o.profit.paise
+                n += 1
             else:
                 lines.append(f"\n♻️ {when} · {o.slug} · refunded")
         if n:
@@ -1296,7 +1298,6 @@ class MenuUI:
         price = self.pricer.price(
             cost.with_overrides(list_price=opt.price) if opt else cost
         ).gross_price
-        where = f" · server {server}" if server else ""
 
         def job(uid: str) -> Reply:
             reply = self.router.alloc_and_wait(uid, slug, server=server, retry=retry)

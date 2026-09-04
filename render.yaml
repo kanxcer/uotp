@@ -20,10 +20,11 @@ services:
     plan: free
     region: singapore          # same region as the Supabase project
     pythonVersion: "3.11.9"    # known-good on Render; project needs >=3.10
-    # `[telegram,postgres]` matters: python-telegram-bot and psycopg are
-    # optional extras, and a bare `pip install .` starts an HTTP server that
-    # accepts no orders and cannot reach Postgres.
-    buildCommand: pip install --upgrade pip && pip install ".[telegram,postgres]"
+    # `[telegram,postgres,whitelabel]` matters: python-telegram-bot, psycopg
+    # and cryptography are optional extras, and a bare `pip install .` starts
+    # an HTTP server that accepts no orders, cannot reach Postgres, and cannot
+    # encrypt sub-bot credentials.
+    buildCommand: pip install --upgrade pip && pip install ".[telegram,postgres,whitelabel]"
     startCommand: python -m uotpbot serve
     # Liveness, not readiness: a provider outage must not get the process
     # killed and restarted, because a restart mid-order is how you charge a
@@ -63,6 +64,20 @@ services:
       # Postgres alongside the ledger, so no SUBBOTS_PATH is needed.
       - key: WHITELABEL_ENABLED
         value: "false"
+      # Encrypts sub-bot credentials (Telegram tokens, own-API provider keys)
+      # at rest in the registry. REQUIRED whenever WHITELABEL_ENABLED=true --
+      # the bot refuses to boot without it, because a registry holding live
+      # tokens in plaintext is a standing compromise. Any long random string
+      # works (a Fernet key is derived from it); e.g. `openssl rand -hex 32`.
+      - key: SECRET_KEY
+        sync: false
+      # --- HTTP surface ---------------------------------------------------
+      # Shared secret for /metrics (P&L, wallet balances, order counters).
+      # Empty (default) means /metrics is not exposed at all -- revenue
+      # figures are not for an unauthenticated endpoint. Set it to enable;
+      # then curl with `Authorization: Bearer <token>` or `?token=<token>`.
+      - key: METRICS_TOKEN
+        sync: false
       # The platform's cut of an own-API sub-bot sale, as a fraction of
       # gross -- disclosed to the owner at creation and stored per sub-bot.
       # Out-of-range values fail at startup rather than mid-sale.

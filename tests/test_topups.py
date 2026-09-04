@@ -120,7 +120,8 @@ def test_non_owner_cannot_open_admin_screens(rig):
 @pytest.mark.parametrize("bad", ["abc", "", "0", "-20", "9", "100001", "12.345", "₹₹"])
 def test_amount_validation_rejects_garbage(rig, bad):
     ui, router, store = rig
-    ui.button(USER, "t"); ui.button(USER, "t:paid")
+    ui.button(USER, "t")
+    ui.button(USER, "t:paid")
     assert not ui.text(USER, bad).ok
     ui.photo(USER, "NOPE")  # photo anyway -> must not create a topup
     assert store.pending_topups() == []
@@ -130,7 +131,8 @@ def test_amount_validation_rejects_garbage(rig, bad):
                                           ("Rs 750", 750), ("10", 10), ("INR 99.50", 99)])
 def test_amount_parsing_accepts_human_input(rig, text, rupees):
     ui, router, store = rig
-    ui.button(USER, "t"); ui.button(USER, "t:paid")
+    ui.button(USER, "t")
+    ui.button(USER, "t:paid")
     r = ui.text(USER, text)
     assert r.ok
     r2 = ui.photo(USER, "FID")
@@ -140,7 +142,9 @@ def test_amount_parsing_accepts_human_input(rig, text, rupees):
 
 def test_opening_another_menu_cancels_the_wizard(rig):
     ui, router, store = rig
-    ui.button(USER, "t"); ui.button(USER, "t:paid"); ui.text(USER, "200")
+    ui.button(USER, "t")
+    ui.button(USER, "t:paid")
+    ui.text(USER, "200")
     ui.button(USER, "m")  # wander off
     uninvited = ui.photo(USER, "FID")
     assert not uninvited.ok
@@ -164,8 +168,10 @@ def test_owner_sets_qr_and_customers_see_it(rig):
 
 def test_topups_and_qr_survive_reopen(tmp_path):
     db = str(tmp_path / "w.db")
-    s1 = SqliteWallets(db); s1.kv_set("pay_qr_file_id", "QR1")
-    tid = s1.create_topup(USER, INR(150), photo_file_id="F1"); s1.close()
+    s1 = SqliteWallets(db)
+    s1.kv_set("pay_qr_file_id", "QR1")
+    tid = s1.create_topup(USER, INR(150), photo_file_id="F1")
+    s1.close()
     s2 = SqliteWallets(db)
     t = s2.get_topup(tid)
     assert t and t.amount.paise == INR(150).paise and t.status == "pending"
@@ -174,7 +180,8 @@ def test_topups_and_qr_survive_reopen(tmp_path):
     s3 = SqliteWallets(db)
     assert s3.get_topup(tid).status == "approved"
     assert s3.decide_topup(tid, "declined", decided_by=OWNER) is False
-    s2.close(); s3.close()
+    s2.close()
+    s3.close()
 
 
 def test_subbot_owner_sees_only_own_scope(tmp_path):

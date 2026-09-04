@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Callable, Optional
 
-from .catalog import Catalog
+from .catalog import Catalog, ServiceCost
 from .economics import EconomicsError, FeeModel, OrderEconomics
 from .ledger import COGS, OWNER, WALLET, Ledger, LedgerError
 from .money import Money

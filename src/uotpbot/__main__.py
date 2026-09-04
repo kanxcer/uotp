@@ -179,6 +179,7 @@ def _serve(settings: Settings) -> int:
         subbots=subbots.manager if subbots else None,
         wallet_monitor=wallet_monitor,
         subsystem_stats=main_router.phase1_snapshot,
+        metrics_token=settings.metrics_token,
     )
     try:
         server.serve_forever()

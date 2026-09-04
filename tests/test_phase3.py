@@ -12,7 +12,6 @@ Each test pins one fix so a regression is caught immediately:
 from datetime import datetime, timezone
 from decimal import Decimal
 
-import pytest
 
 from uotpbot.bot.commands import CommandRouter
 from uotpbot.bot.ui import MenuUI, REPLY_MENU_LABELS_LOW, WELCOME
@@ -20,7 +19,7 @@ from uotpbot.tz import format_ts
 from uotpbot.catalog import Catalog, ServiceCost, WalletPack
 from uotpbot.engine import BotEngine, EngineConfig
 from uotpbot.ledger import Ledger
-from uotpbot.money import INR, Money
+from uotpbot.money import INR
 from uotpbot.pricing import Pricer
 from uotpbot.provider.base import NumberAllocation, ProviderError
 from uotpbot.provider.mock import MockOutcome, MockProvider
@@ -307,8 +306,6 @@ def test_order_refunded_exactly_once_under_concurrent_polls():
     # Simulate THREE independent resolutions of the same order: the background
     # auto-poller, a manual Check OTP, and a late poll after a Cancel. Each gets
     # its own engine poll; the engine times out (no OTP) and tries to refund.
-    from uotpbot.provider.base import OtpResult
-    asyncio_loop = None
     # Poll #1: auto-poller (blocks in wait_for_otp then times out).
     _t, reply1 = router.poll_once(token, wait_seconds=1)
     # Poll #2: a second concurrent poller on the same token.
@@ -362,7 +359,6 @@ def test_duplicate_check_otp_returns_instantly_not_a_second_wait():
     (or the manual Check racing the background auto-poller) must return
     immediately, never stacking another ~5-minute OTP-window wait on its own
     thread (which is what made 'My numbers' freeze until the number expired)."""
-    import threading
     router, _, _, _ = _rig()
     provider = router.engine.provider
     provider.force_next(MockOutcome("success", otp="555555"))

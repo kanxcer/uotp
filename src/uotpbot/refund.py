@@ -2,18 +2,27 @@
 
 A refund is real money leaving the customer balance and entering the ledger's
 sales-refund line, and it must never be lost to a transient DB blip. The wallet
-store keeps a durable ``refund_outbox`` row, and this service writes it BEFORE
-any money moves, then attempts the credit. If the credit fails the row stays
-pending and a background worker (plus a redeploy's startup pass) retries until
-it succeeds -- so a customer who was legitimately refunded (confirmed release
-at the provider) is never left out of pocket silently.
+store keeps a durable ``refund_outbox`` row, and this service WRITES IT FIRST
+(the row's unique ``(scope, order_token)`` constraint is the claim), then
+attempts the ledger post and the wallet credit. Each step is individually
+idempotent:
+
+* the ledger line is posted at most once per order (tracked by the row's
+  ``ledger_done`` flag -- a retry after a wallet-credit blip never re-posts
+  the refund line, which used to make reported refunds outrun real money);
+* the wallet credit happens only for the path that CLAIMED the row (the
+  insert won), so two racing paths (a Cancel and a timeout poll) cannot both
+  credit;
+* if the credit fails the row stays pending and a background worker (plus a
+  redeploy's startup pass) retries until it succeeds -- so a customer who was
+  legitimately refunded (confirmed release at the provider) is never left out
+  of pocket silently.
 """
 
 from __future__ import annotations
 
 import logging
 import threading
-import time
 
 from .money import Money
 
@@ -29,27 +38,69 @@ RETRY_INTERVAL_SECONDS = 30
 
 def refund_once(router, user_id: str, amount: Money, order_token: str,
                 reason: str) -> bool:
-    """Post the ledger refund line and credit the customer's wallet.
+    """Idempotently apply one claimed refund: ledger line + wallet credit.
 
-    Both must succeed for a refund to count; either failing leaves the money
-    outstanding and is retried by :class:`DurableRefund`. Returns True on
-    success.
+    Both steps are guarded so a partial failure plus retry cannot double-post
+    the ledger line or double-credit the wallet:
+
+    1. If the outbox row says the ledger line was already posted, skip it.
+    2. Otherwise post it, then persist ``ledger_done`` BEFORE the credit --
+       so any later retry (worker or redeploy) will never post it again.
+    3. If the row is already ``done`` the credit already happened; skip it.
+    4. Otherwise credit the wallet.
+
+    Returns True when the refund is fully applied (it may have been applied
+    by an earlier call -- idempotency, not "I did the work").
     """
-    # 1. Ledger: the customer refund line, so P&L never understates refunds.
-    try:
-        router.ledger.record_customer_refund(amount, ref=order_token, memo=reason)
-    except Exception as exc:  # noqa: BLE001 - retryable
-        log.warning("refund ledger post failed user=%s amount=%s: %s",
-                    user_id, amount, exc)
-        return False
-    # 2. Wallet: give the customer their money back.
+    store = router.wallets
+    row = None
+    if store is not None and callable(getattr(store, "get_refund", None)):
+        try:
+            row = store.get_refund(order_token)
+        except Exception:  # noqa: BLE001 - fail open: attempt the steps
+            row = None
+
+    # 1 + 2. Ledger line, at most once per order.
+    if not (row is not None and row.ledger_done):
+        try:
+            router.ledger.record_customer_refund(amount, ref=order_token, memo=reason)
+        except Exception as exc:  # noqa: BLE001 - retryable
+            log.warning("refund ledger post failed user=%s amount=%s: %s",
+                        user_id, amount, exc)
+            return False
+        _mark_ledger_done(store, order_token)
+    # 3. Already credited (an earlier attempt or a racing path).
+    if row is not None and row.status == "done":
+        return True
+    # 4. Wallet: give the customer their money back.
     try:
         router.credit(user_id, amount)
     except Exception as exc:  # noqa: BLE001 - retryable
         log.warning("refund wallet credit failed user=%s amount=%s: %s",
                     user_id, amount, exc)
         return False
+    # Persist "done" immediately, so no later call -- worker sweep, redeploy,
+    # or a racing path that still holds the row -- can credit again. (Dying
+    # between the credit and this mark is the documented reconciliation case:
+    # the credit is monotonic and visible in the wallet.)
+    if row is not None and store is not None \
+            and callable(getattr(store, "mark_refund_result", None)):
+        try:
+            store.mark_refund_result(row.refund_id, done=True)
+        except Exception:  # noqa: BLE001 - the caller's mark is the fallback
+            log.warning("could not mark refund %s done", row.refund_id)
     return True
+
+
+def _mark_ledger_done(store, order_token: str) -> None:
+    """Persist that the ledger line for ``order_token`` is posted."""
+    if store is None or not order_token \
+            or not callable(getattr(store, "mark_ledger_done", None)):
+        return
+    try:
+        store.mark_ledger_done(order_token)
+    except Exception:  # noqa: BLE001 - the ledger line will re-check on retry
+        log.warning("could not persist ledger_done for %s", order_token)
 
 
 class DurableRefund:
@@ -64,16 +115,31 @@ class DurableRefund:
     def _store(self):
         return self.router.wallets
 
-    def _write(self, user_id, amount, order_token, reason) -> str:
+    def _claim(self, user_id, amount, order_token, reason, *,
+               ledger_done: bool) -> tuple[str, bool]:
+        """Durably claim this order's refund. Returns (refund_id, inserted).
+
+        ``inserted`` is True only for the path that won the claim (the unique
+        constraint made the row exist because of this call). The row is
+        written BEFORE any money moves, so a crash can never lose the refund;
+        ``ledger_done`` records whether the caller already posted the ledger
+        line (the engine posts it itself on the timeout path).
+        """
         store = self._store
         if store is None or not callable(getattr(store, "write_refund", None)):
-            return ""
+            return "", True
         try:
-            return store.write_refund(user_id=user_id, amount=amount,
-                                      order_token=order_token, reason=reason)
-        except Exception as exc:  # noqa: BLE001 - never block the cancel
+            result = store.write_refund(user_id=user_id, amount=amount,
+                                        order_token=order_token, reason=reason,
+                                        ledger_done=ledger_done)
+        except Exception as exc:  # noqa: BLE001 - never block the refund
             log.critical("refund outbox write FAILED order=%s: %s", order_token, exc)
-            return ""
+            return "", True
+        if isinstance(result, tuple):
+            refund_id, inserted = result
+        else:  # a store that predates the claim API: assume claimed
+            refund_id, inserted = result, True
+        return str(refund_id), bool(inserted)
 
     def _mark(self, refund_id: str, *, done: bool, error: str = "") -> None:
         store = self._store
@@ -86,20 +152,37 @@ class DurableRefund:
             log.exception("could not mark refund %s", refund_id)
 
     def request(self, user_id: str, amount: Money, order_token: str,
-                reason: str) -> tuple[bool, str]:
+                reason: str, *, ledger_posted: bool = False) -> tuple[bool, str]:
         """Refund ``amount`` to ``user_id`` for ``order_token`` (cancel path).
 
-        Writes the outbox first (durable + idempotent: one refund per order),
-        then attempts the credit. Returns ``(ok_tried_now, refund_id)``. If the
-        order was ALREADY refunded (a concurrent poll raced the Cancel), this
-        does NOT credit again and returns ``(False, ...)`` so the caller can
-        tell the customer honestly. Even when ``ok`` is False for a transient
-        DB blip, the refund WILL still be retried.
+        Claims the outbox row first (durable + idempotent: one refund per
+        order), then applies it idempotently. Returns ``(ok, refund_id)``.
+
+        ``ledger_posted`` is True when the caller KNOWS the ledger line
+        already exists (e.g. the engine posted it for this order just before
+        a cancel raced in) -- the row is then written with ``ledger_done``
+        set so the apply step does not post a second line.
+
+        If the order was ALREADY refunded by a racing path, this does NOT
+        credit again and returns ``(False, ...)`` so the caller can tell the
+        customer honestly. Even when ``ok`` is False for a transient DB blip,
+        the refund WILL still be retried.
         """
         if self.is_processed(order_token):
             log.info("refund request for %s skipped: already processed", order_token)
             return False, ""
-        refund_id = self._write(user_id, amount, order_token, reason)
+        refund_id, inserted = self._claim(user_id, amount, order_token, reason,
+                                          ledger_done=ledger_posted)
+        if not inserted:
+            # A racing path already claimed this order's refund; it owns the
+            # credit. Report its state honestly, credit nothing here.
+            row = None
+            if self._store is not None and callable(getattr(self._store, "get_refund", None)):
+                try:
+                    row = self._store.get_refund(order_token)
+                except Exception:  # noqa: BLE001
+                    row = None
+            return (row is not None and row.status == "done"), ""
         ok = refund_once(self.router, user_id, amount, order_token, reason)
         self._mark(refund_id, done=ok, error="" if ok else "first attempt failed")
         return ok, refund_id
@@ -127,11 +210,18 @@ class DurableRefund:
         """Credit a timeout/auto-refund, guarded so it only happens once.
 
         The ENGINE already posted the customer-refund ledger line when the OTP
-        timed out (that is its job); this only credits the wallet, and only if
-        the order's refund was not already applied. Returns True when this call
-        applied the credit, False when it was already done (no double credit).
+        timed out (that is its job); this claims the outbox row (marked
+        ``ledger_done`` so no retry re-posts the line), writes it BEFORE the
+        credit, and credits the wallet only if this call won the claim.
+        Returns True when this call applied the credit, False when the order
+        was already resolved by another path (no double credit).
         """
         if self.is_processed(order_token):
+            return False
+        refund_id, inserted = self._claim(user_id, amount, order_token, reason,
+                                          ledger_done=True)
+        if not inserted:
+            # The cancel path claimed first (it will credit); do not credit again.
             return False
         try:
             self.router.credit(user_id, amount)
@@ -141,7 +231,6 @@ class DurableRefund:
             return False
         # Record it as done (the ledger line is the engine's; here we only
         # persist that the WALLET credit happened, so nothing re-credits).
-        refund_id = self._write(user_id, amount, order_token, reason)
         self._mark(refund_id, done=True, error="")
         return True
 

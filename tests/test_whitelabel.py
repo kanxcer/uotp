@@ -579,6 +579,18 @@ def test_whitelabel_is_disabled_by_default():
     assert from_environment().whitelabel_enabled is False
 
 
+def test_whitelabel_without_a_secret_key_refuses_to_boot(monkeypatch):
+    """A registry stores live credentials; enabling white-label without the
+    key that encrypts them must fail startup, not silently go plaintext."""
+    from uotpbot.config import ConfigError, from_environment
+
+    monkeypatch.setenv("UOTP_API_KEY", "dummy")
+    monkeypatch.setenv("WHITELABEL_ENABLED", "true")
+    monkeypatch.delenv("SECRET_KEY", raising=False)
+    with pytest.raises(ConfigError, match="SECRET_KEY"):
+        from_environment()
+
+
 def test_make_whitelabel_returns_none_when_disabled():
     from uotpbot.__main__ import _make_whitelabel
     from uotpbot.catalog import load_catalog
@@ -603,6 +615,7 @@ def test_make_whitelabel_builds_a_manager_when_enabled(monkeypatch, tmp_path):
 
     monkeypatch.setenv("UOTP_API_KEY", "dummy")
     monkeypatch.setenv("WHITELABEL_ENABLED", "true")
+    monkeypatch.setenv("SECRET_KEY", "test-secret-key")
     monkeypatch.setenv("SUBBOTS_PATH", str(tmp_path / "sub.db"))
     settings = from_environment()
     ledger = Ledger()
@@ -980,3 +993,90 @@ def test_on_callback_edits_message_and_answers_query():
     router.handle_callback.assert_called_once_with("42", "cb:createbot:confirm")
     query.message.edit_text.assert_awaited_once_with("done", reply_markup=None)
     query.answer.assert_awaited_once_with("OK")
+
+
+# ---------------------------------------------------------------- encryption
+def test_registry_stores_credentials_as_ciphertext(tmp_path):
+    """With a SECRET_KEY, raw rows must not contain the live credentials."""
+    import sqlite3
+
+    path = str(tmp_path / "enc.db")
+    reg = SubBotRegistry(path, secret_key="test-secret-key-0123456789")
+    bot = SubBot(owner_id="u1", bot_token=GOOD_TOKEN, mode=SubBotMode.OWN_API,
+                 fee=PlatformFee(rate=Decimal("0.05")), provider_key="secret-provider-key")
+    reg.add(bot)
+    reg.close()
+
+    conn = sqlite3.connect(path)
+    raw_token, raw_key = conn.execute(
+        "SELECT bot_token, provider_key FROM subbots").fetchone()
+    conn.close()
+    assert GOOD_TOKEN not in raw_token
+    assert "secret-provider-key" not in raw_key
+    # Fernet tokens are base64 starting with gAAAAA -- ciphertext, not plaintext.
+    assert raw_token.startswith("gAAAAA")
+    assert raw_key.startswith("gAAAAA")
+
+
+def test_registry_decrypts_credentials_on_read(tmp_path):
+    path = str(tmp_path / "enc2.db")
+    key = "another-secret-key"
+    reg = SubBotRegistry(path, secret_key=key)
+    bot = SubBot(owner_id="u1", bot_token=GOOD_TOKEN, mode=SubBotMode.OWN_API,
+                 fee=DEFAULT_PLATFORM_FEE, provider_key="pkey" * 4)
+    reg.add(bot)
+    reg.close()
+
+    reopened = SubBotRegistry(path, secret_key=key)
+    found = reopened.find(bot.id)
+    assert found is not None
+    assert found.bot_token == GOOD_TOKEN
+    assert found.provider_key == "pkey" * 4
+    by_token = reopened.find_by_token(GOOD_TOKEN)
+    assert by_token is not None and by_token.id == bot.id
+    reopened.close()
+
+
+def test_registry_duplicate_detection_works_with_encryption(tmp_path):
+    """find_by_token must match through ciphertext, or a stolen token could be
+    registered twice (two pollers, one Telegram account)."""
+    reg = SubBotRegistry(str(tmp_path / "enc3.db"), secret_key="k" * 32)
+    reg.add(SubBot(owner_id="u1", bot_token=GOOD_TOKEN,
+                   mode=SubBotMode.PLATFORM_API, fee=DEFAULT_PLATFORM_FEE))
+    with pytest.raises(WhiteLabelError, match="already registered"):
+        reg.add(SubBot(owner_id="u2", bot_token=GOOD_TOKEN,
+                       mode=SubBotMode.PLATFORM_API, fee=DEFAULT_PLATFORM_FEE))
+
+
+def test_registry_legacy_plaintext_rows_survive_enabling_encryption(tmp_path):
+    """A registry written before SECRET_KEY existed must still be readable
+    once encryption is switched on (no forced re-creation of every bot)."""
+    path = str(tmp_path / "legacy.db")
+    old = SubBotRegistry(path)
+    bot = SubBot(owner_id="u1", bot_token=GOOD_TOKEN, mode=SubBotMode.PLATFORM_API,
+                 fee=DEFAULT_PLATFORM_FEE)
+    old.add(bot)
+    old.close()
+
+    new = SubBotRegistry(path, secret_key="key-after-migration")
+    found = new.find_by_token(GOOD_TOKEN)
+    assert found is not None and found.id == bot.id
+    assert new.find(bot.id).bot_token == GOOD_TOKEN
+    new.close()
+
+
+def test_registry_wrong_key_never_crashes_reads(tmp_path):
+    """A changed SECRET_KEY must not take the whole registry down: reads fall
+    back to the stored bytes, the bot just stops authenticating (visible via
+    /mybots), instead of every read raising."""
+    path = str(tmp_path / "wrongkey.db")
+    reg = SubBotRegistry(path, secret_key="original-key")
+    bot = SubBot(owner_id="u1", bot_token=GOOD_TOKEN,
+                 mode=SubBotMode.PLATFORM_API, fee=DEFAULT_PLATFORM_FEE)
+    reg.add(bot)
+    reg.close()
+
+    other = SubBotRegistry(path, secret_key="rotated-key")
+    assert other.find(bot.id) is not None  # does not raise
+    assert other.find_by_token(GOOD_TOKEN) is None  # no false match
+    other.close()

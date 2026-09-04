@@ -47,7 +47,7 @@ def test_many_concurrent_offloop_tasks_run_in_parallel():
         total_sleep = 0.3
         n = 12
         start = time.monotonic()
-        results = await asyncio.gather(
+        await asyncio.gather(
             *[_run_offloop(time.sleep, total_sleep) for _ in range(n)]
         )
         el = time.monotonic() - start

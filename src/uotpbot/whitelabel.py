@@ -29,6 +29,8 @@ instead of revenue.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import secrets
 import sqlite3
 import threading
@@ -39,6 +41,15 @@ from enum import Enum
 from typing import Any, Callable, Optional
 
 from .money import Money, quantize_money
+
+# Optional dependency (the [whitelabel] extra): encrypts sub-bot credentials
+# at rest. The import is lazy so the base install (no white-label) never
+# needs cryptography at all.
+try:
+    from cryptography.fernet import Fernet, InvalidToken
+except ImportError:  # pragma: no cover - depends on the install extras
+    Fernet = None  # type: ignore[assignment]
+    InvalidToken = Exception  # type: ignore[assignment,misc]
 
 __all__ = [
     "SubBotMode",
@@ -209,6 +220,25 @@ class SubBot:
         )
 
 
+def _fernet_for(secret_key: str) -> "Fernet":
+    """Build a Fernet instance from an arbitrary secret string.
+
+    ``SECRET_KEY`` may be any long random string (a pass-phrase, a token, an
+    exported secret); a Fernet key is a specific 32-byte url-safe-base64 shape,
+    so we derive one deterministically with SHA-256. The same string always
+    yields the same key, which is what makes stored values decryptable after a
+    redeploy. Requiring the exact Fernet key shape would just fail at startup
+    on every reasonable secret a human would paste.
+    """
+    if Fernet is None:
+        raise WhiteLabelError(
+            "cryptography is required for encrypted sub-bot storage: "
+            "pip install 'uotpbot[whitelabel]'"
+        )
+    digest = hashlib.sha256(secret_key.encode("utf-8")).digest()
+    return Fernet(base64.urlsafe_b64encode(digest))
+
+
 class SubBotRegistry:
     """SQLite-backed store of white-label bots. Thread-safe, like the ledger.
 
@@ -216,13 +246,21 @@ class SubBotRegistry:
     canonical (``{t}`` table, ``?`` placeholders) and all of it flows through
     :meth:`_execute` / :meth:`_write`. :class:`pgstore.PostgresRegistry`
     overrides only the connection and those two primitives.
+
+    ``secret_key`` (optional) enables at-rest encryption of the two secrets a
+    sub-bot row carries -- its Telegram ``bot_token`` and its OWN_API
+    ``provider_key``. A registry file that survives a redeploy would otherwise
+    hold live credentials in plaintext, so the moment any one of them leaks
+    (backup, dump, a shared host) every sub-bot is compromised. With a key,
+    both are stored as Fernet ciphertext and decrypted only in memory.
     """
 
-    def __init__(self, path: Optional[str] = None) -> None:
+    def __init__(self, path: Optional[str] = None, *, secret_key: str = "") -> None:
         self._table = "subbots"
         self._ph = "?"
         self._conn = sqlite3.connect(path or ":memory:", check_same_thread=False)
         self._lock = threading.RLock()
+        self._fernet = _fernet_for(secret_key) if secret_key else None
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.executescript(SCHEMA)
@@ -231,6 +269,30 @@ class SubBotRegistry:
     def close(self) -> None:
         with self._lock:
             self._conn.close()
+
+    # -- at-rest secret encryption --------------------------------------
+    def _enc(self, value: str) -> str:
+        """Encrypt one secret for storage. No key -> stored as-is."""
+        if not value or self._fernet is None:
+            return value
+        return self._fernet.encrypt(value.encode("utf-8")).decode("ascii")
+
+    def _dec(self, value: str) -> str:
+        """Decrypt one stored secret, tolerating legacy plaintext rows.
+
+        A value that is not a Fernet token (rows written before encryption
+        existed) is returned untouched, so an existing registry keeps working
+        on its first encrypted read. A token that fails to decrypt (wrong
+        key) is likewise returned rather than raising -- the poller for that
+        bot will fail on Telegram and be reported in /mybots, instead of
+        taking down startup of every other bot.
+        """
+        if not value or self._fernet is None:
+            return value
+        try:
+            return self._fernet.decrypt(value.encode("ascii")).decode("utf-8")
+        except (InvalidToken, ValueError, UnicodeDecodeError):  # noqa: BLE001
+            return value
 
     # -- backend seam ------------------------------------------------------
     def _q(self, sql: str) -> str:
@@ -260,8 +322,8 @@ class SubBotRegistry:
             "provider_url, fee_rate, fee_fixed_p, disclosed_at, disclosure, "
             "created_at, active) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (
-                bot.id, bot.owner_id, bot.bot_token, bot.mode.value,
-                bot.provider_key, bot.provider_url, str(bot.fee.rate),
+                bot.id, bot.owner_id, self._enc(bot.bot_token), bot.mode.value,
+                self._enc(bot.provider_key), bot.provider_url, str(bot.fee.rate),
                 bot.fee.fixed.paise, bot.disclosed_at, bot.disclosure,
                 bot.created_at, int(bot.active),
             ),
@@ -277,11 +339,11 @@ class SubBotRegistry:
         return self._write("DELETE FROM {t} WHERE id = ?", (bot_id,)) > 0
 
     # -- reading ---------------------------------------------------------
-    @staticmethod
-    def _row_to_bot(row: tuple) -> SubBot:
+    def _row_to_bot(self, row: tuple) -> SubBot:
         return SubBot(
-            id=row[0], owner_id=row[1], bot_token=row[2], mode=SubBotMode(row[3]),
-            provider_key=row[4] or "", provider_url=row[5] or "",
+            id=row[0], owner_id=row[1], bot_token=self._dec(row[2]),
+            mode=SubBotMode(row[3]),
+            provider_key=self._dec(row[4]) or "", provider_url=row[5] or "",
             fee=PlatformFee(rate=Decimal(row[6]), fixed=Money(int(row[7]))),
             disclosed_at=row[8], disclosure=row[9], created_at=row[10],
             active=bool(row[11]),
@@ -291,10 +353,24 @@ class SubBotRegistry:
              "fee_rate, fee_fixed_p, disclosed_at, disclosure, created_at, active")
 
     def find_by_token(self, token: str) -> Optional[SubBot]:
-        rows = self._execute(
-            f"SELECT {self._COLS} FROM {{t}} WHERE bot_token = ?", (token,)
-        )
-        return self._row_to_bot(rows[0]) if rows else None
+        """Find a registered bot by its (plaintext) Telegram token.
+
+        When encryption is on the stored column is ciphertext, and Fernet
+        output is randomized -- so a ``WHERE bot_token = ?`` match is not
+        possible. The registry holds one row per sub-bot (a handful, at most),
+        so scanning and comparing the decrypted value is both correct and
+        fast enough. With no key the column is plaintext and the SQL index
+        path is used.
+        """
+        if self._fernet is None:
+            rows = self._execute(
+                f"SELECT {self._COLS} FROM {{t}} WHERE bot_token = ?", (token,)
+            )
+            return self._row_to_bot(rows[0]) if rows else None
+        for row in self._execute(f"SELECT {self._COLS} FROM {{t}}"):
+            if self._dec(row[2]) == token:
+                return self._row_to_bot(row)
+        return None
 
     def find(self, bot_id: str) -> Optional[SubBot]:
         rows = self._execute(

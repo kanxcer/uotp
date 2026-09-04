@@ -254,7 +254,7 @@ class TelegramFrontend:
         # the transport always edits to a real fallback instead.
         try:
             reply = await _run_offloop(self.ui.button, user_id, data)
-        except Exception as exc:  # noqa: BLE001 - never freeze a tap
+        except Exception:  # noqa: BLE001 - never freeze a tap
             log.exception("button handler failed")
             await query.answer("Hmm")
             if message is not None:

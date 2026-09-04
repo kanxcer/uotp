@@ -167,12 +167,14 @@ class PostgresRegistry(SubBotRegistry):
     the ledger keeps charging owners fees nobody can account for.
     """
 
-    def __init__(self, dsn: str, *, schema: str = "uotp") -> None:
+    def __init__(self, dsn: str, *, schema: str = "uotp", secret_key: str = "") -> None:
         if not _IDENT.match(schema):
             raise WhiteLabelError(f"unsafe schema name {schema!r}")
         self._table = f'"{schema}"."subbots"'
         self._ph = "%s"
         self._lock = threading.RLock()
+        from .whitelabel import _fernet_for
+        self._fernet = _fernet_for(secret_key) if secret_key else None
         self._conn = _connect_pg(dsn)
         with self._lock:
             _bootstrap(self._conn, REGISTRY_DDL.format(s=f'"{schema}"', t=self._table))

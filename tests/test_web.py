@@ -99,6 +99,10 @@ def test_ledger_survives_concurrent_reads_and_writes():
     ledger.verify()
 
 
+#: Token the rig's metrics endpoint requires (see the auth tests below).
+METRICS_TOKEN = "test-metrics-token"
+
+
 # ----------------------------------------------------------- fixtures
 @pytest.fixture()
 def rig():
@@ -115,7 +119,8 @@ def rig():
     engine = BotEngine(catalog, provider, ledger, pricer,
                        config=EngineConfig(retry_cap=3, otp_timeout_seconds=1.0,
                                            poll_interval=0.01))
-    yield HealthServer(engine, ledger, cache_seconds=0.0), ledger, provider
+    yield (HealthServer(engine, ledger, cache_seconds=0.0,
+                        metrics_token=METRICS_TOKEN), ledger, provider)
     ledger.close()
 
 
@@ -147,7 +152,11 @@ def test_readiness_is_200_when_everything_works(rig):
     assert code == 200, body
     assert body["status"] == "ready"
     assert body["ledger"] == "balanced"
-    assert body["provider_wallet"] == "500.00"
+    assert body["provider"] == "reachable"
+    # An unauthenticated endpoint must not publish business figures.
+    assert "provider_wallet" not in body
+    assert "net_profit" not in body
+    assert "revenue" not in body
 
 
 def test_readiness_is_503_when_the_provider_is_down(rig):
@@ -157,6 +166,9 @@ def test_readiness_is_503_when_the_provider_is_down(rig):
     assert code == 503
     assert body["status"] == "not_ready"
     assert "provider_error" in body
+    # Only the exception CLASS leaks -- the message can carry URLs/credentials.
+    assert body["provider_error"] == "RuntimeError"
+    assert "provider down" not in body["provider_error"]
     # The ledger is still fine, and that must be reported separately.
     assert body["ledger"] == "balanced"
 
@@ -170,7 +182,7 @@ def test_readiness_is_503_when_the_ledger_is_corrupt(rig):
     ledger._conn.commit()
     code, body = server.readiness()
     assert code == 503
-    assert "UNBALANCED" in body["ledger"]
+    assert body["ledger"] == "unbalanced"
 
 
 def test_readiness_caches(rig):
@@ -202,7 +214,8 @@ def test_metrics_reports_the_pnl(rig):
 def live_server(rig):
     """Serve on an ephemeral port for a genuine end-to-end HTTP test."""
     server, ledger, provider = rig
-    srv = HealthServer(server.engine, ledger, port=0, cache_seconds=0.0)
+    srv = HealthServer(server.engine, ledger, port=0, cache_seconds=0.0,
+                       metrics_token=METRICS_TOKEN)
     from http.server import ThreadingHTTPServer
 
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), srv._handler_class())
@@ -231,9 +244,54 @@ def test_http_healthz(live_server):
 def test_http_metrics_over_a_real_socket(live_server):
     """This is the request that returned 500 before the thread fix."""
     base, srv = live_server
-    code, body = _get(f"{base}/metrics")
+    code, body = _get(f"{base}/metrics?token={METRICS_TOKEN}")
     assert code == 200, body
     assert "net_profit" in body
+
+
+def test_http_metrics_accepts_a_bearer_header(live_server):
+    base, _ = live_server
+    req = urllib.request.Request(
+        f"{base}/metrics",
+        headers={"Authorization": f"Bearer {METRICS_TOKEN}"},
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        assert resp.status == 200
+        assert "net_profit" in json.loads(resp.read().decode())
+
+
+def test_http_metrics_is_403_with_the_wrong_token(live_server):
+    base, _ = live_server
+    code, body = _get(f"{base}/metrics?token=wrong-token")
+    assert code == 403
+    assert body["error"] == "unauthorised"
+
+
+def test_http_metrics_is_403_without_a_token(live_server):
+    base, _ = live_server
+    code, body = _get(f"{base}/metrics")
+    assert code == 403
+    assert body["error"] == "unauthorised"
+
+
+def test_http_metrics_is_404_when_no_token_is_configured(rig):
+    """No token configured -> the route does not exist at all."""
+    server, ledger, provider = rig
+    from http.server import ThreadingHTTPServer
+
+    anon = HealthServer(server.engine, ledger, port=0, cache_seconds=0.0)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), anon._handler_class())
+    httpd.daemon_threads = True
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        code, body = _get(f"{base}/metrics?token=anything")
+        assert code == 404
+        assert "no route" in body["error"]
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
 
 
 def test_http_readyz_over_a_real_socket(live_server):
@@ -258,8 +316,9 @@ def test_http_root_lists_endpoints(live_server):
 
 def test_http_concurrent_requests_do_not_error(live_server):
     base, _ = live_server
+    url = f"{base}/metrics?token={METRICS_TOKEN}"
     with ThreadPoolExecutor(max_workers=12) as pool:
-        results = list(pool.map(lambda _: _get(f"{base}/metrics")[0], range(36)))
+        results = list(pool.map(lambda _: _get(url)[0], range(36)))
     assert results == [200] * 36
 
 

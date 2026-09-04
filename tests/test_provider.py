@@ -665,7 +665,6 @@ def test_live_tokens_map_to_exceptions(token, exc):
     """Tokens the real uotp.store handler returns (observed live 2026-09-03)
     must map to the right exception so the bot never parses a failure as a
     success status."""
-    from uotpbot.provider.base import ServiceUnavailable
     p, _ = make(token)
     with pytest.raises(exc):
         p.get_balance()

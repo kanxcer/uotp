@@ -132,9 +132,81 @@ def test_scoped_active_numbers_are_isolated(tmp_path):
     store.close()
 
 
+def test_scoped_get_active_refuses_a_foreign_token(tmp_path):
+    """A wait-token handed to the wrong bot must yield nothing, not someone
+    else's live number (user id, phone, OTP) -- a cross-tenant data leak."""
+    store = SqliteWallets(str(tmp_path / "w.db"))
+    store.record_active(user_id="999", slug="telegram", phone="+91111",
+                        provider_order_id="pA", token="tok-X", gross=INR(100),
+                        valid_until=time.time() + 600, scope="botA")
+    botB = ScopedWallets(store, scope="botB")
+    assert botB.get_active("tok-X") is None
+    # And botA still sees its own number.
+    assert ScopedWallets(store, scope="botA").get_active("tok-X") is not None
+    store.close()
+
+
+def test_scoped_update_and_finish_cannot_touch_foreign_rows(tmp_path):
+    store = SqliteWallets(str(tmp_path / "w.db"))
+    store.record_active(user_id="999", slug="telegram", phone="+91111",
+                        provider_order_id="pA", token="tok-X", gross=INR(100),
+                        valid_until=time.time() + 600, scope="botA")
+    botB = ScopedWallets(store, scope="botB")
+    # Writing botA's OTP or deleting botA's number from botB must be no-ops.
+    botB.update_active("pA", otp="123456")
+    assert store.get_active("tok-X").otp == ""
+    botB.finish_active("pA")
+    assert store.get_active("tok-X") is not None
+    # The owning scope still controls its own row.
+    botA = ScopedWallets(store, scope="botA")
+    botA.update_active("pA", otp="654321")
+    assert store.get_active("tok-X").otp == "654321"
+    botA.finish_active("pA")
+    assert store.get_active("tok-X") is None
+    store.close()
+
+
+def test_legacy_db_gains_new_columns_on_open(tmp_path):
+    """A database created by an older release (no ledger_done / scope columns)
+    must be migrated on open, not crash or silently lose the new features."""
+    import sqlite3
+
+    path = str(tmp_path / "legacy.db")
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE refund_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " scope TEXT NOT NULL DEFAULT '', refund_id TEXT NOT NULL,"
+        " user_id TEXT NOT NULL, amount_paise INTEGER NOT NULL,"
+        " order_token TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '',"
+        " status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,"
+        " last_error TEXT NOT NULL DEFAULT '', created_ts REAL NOT NULL, done_ts REAL,"
+        " UNIQUE(scope, order_token))")
+    conn.execute(
+        "CREATE TABLE activenumbers (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " user_id TEXT NOT NULL, slug TEXT NOT NULL, phone TEXT NOT NULL DEFAULT '',"
+        " provider_order_id TEXT NOT NULL DEFAULT '', token TEXT NOT NULL DEFAULT '',"
+        " gross_paise INTEGER NOT NULL, otp TEXT NOT NULL DEFAULT '', ts REAL NOT NULL,"
+        " valid_until REAL NOT NULL)")
+    conn.execute(
+        "INSERT INTO activenumbers(user_id, slug, phone, provider_order_id, token,"
+        " gross_paise, ts, valid_until) VALUES ('5','s','9','p9','tokY',10000,0,9e18)")
+    conn.commit()
+    conn.close()
+
+    store = SqliteWallets(path)
+    # New features work on the migrated table.
+    rid, inserted = store.write_refund(user_id="u", amount=INR(1), order_token="tL")
+    assert inserted and store.get_refund("tL").ledger_done is False
+    store.mark_ledger_done("tL")
+    assert store.get_refund("tL").ledger_done is True
+    # Pre-existing rows survive with sane defaults.
+    active = store.get_active("tokY")
+    assert active is not None and active.scope == ""
+    store.close()
+
+
 def test_orders_rich_history_fields_and_get_order(tmp_path):
     store = SqliteWallets(str(tmp_path / "w.db"))
-    now = time.time()
     store.record_order(user_id=USER, slug="telegram", amount=INR(18), phone="+911111",
                        otp="123456", success=True, profit=INR(5), status="delivered",
                        reason="delivered after 2 attempts", refunded=INR(0),

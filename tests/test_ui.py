@@ -276,7 +276,7 @@ def test_low_balance_wallet_card_shows_add_money_nudge(rig):
 
 
 def test_cheapest_sticker_floors_at_min_charge():
-    from uotpbot.catalog import Catalog, ServiceCost, PROVIDER_MIN_CHARGE
+    from uotpbot.catalog import Catalog, ServiceCost
     from uotpbot.money import INR
     from decimal import Decimal
     cat = Catalog({"cheap": ServiceCost("cheap", "Cheap", "x", INR(1), Decimal("0.9"))},
@@ -317,9 +317,9 @@ def test_my_numbers_shows_active_number_and_check_otp(tmp_path):
         for b in row:
             if isinstance(b, tuple) and len(b) == 2:
                 labels.append(b[0])
-    assert any("Check OTP" in l for l in labels)
-    assert any("Resend" in l for l in labels)
-    assert any("Cancel" in l for l in labels)
+    assert any("Check OTP" in lbl for lbl in labels)
+    assert any("Resend" in lbl for lbl in labels)
+    assert any("Cancel" in lbl for lbl in labels)
     store.close()
 
 
@@ -404,7 +404,8 @@ def test_typed_my_numbers_matches_the_button_screen(tmp_path):
                                  Decimal("0.94"))},
         (WalletPack("Pro", INR(1000), INR(1150)),),
     )
-    ledger = Ledger(); pricer = Pricer(catalog)
+    ledger = Ledger()
+    pricer = Pricer(catalog)
     provider = MockProvider({s.slug: catalog.sticker_price(s.slug)
                              for s in catalog.services()}, balance=INR(5000), seed=5)
     engine = BotEngine(catalog, provider, ledger, pricer,
@@ -451,8 +452,8 @@ def test_favourites_flow_star_toggle_and_card(rig):
     reply = ui.favourites_card(USER)
     assert "Telegram" in reply.text
     # The menu shows the count on the Favourites button itself.
-    m_labels = [l for row in ui.main_menu(USER).rows for l, _d in row]
-    assert any("Favourites (1)" in l for l in m_labels), m_labels
+    m_labels = [lbl for row in ui.main_menu(USER).rows for lbl, _d in row]
+    assert any("Favourites (1)" in lbl for lbl in m_labels), m_labels
     # Unstar via the favourites card "Remove" button.
     assert "fvt:telegram" in datas(reply)
     ui.toggle_favourite(USER, "telegram")
@@ -493,7 +494,6 @@ def test_remaining_time_capped_at_20_minutes_not_provider_30(rig):
     """The provider's clock can report 30-minute validity, but the number is
     only ours for 20. _record_active must cap the persisted valid_until to 20
     minutes so the 'min left' screens never claim 30."""
-    import time as _time
     from uotpbot.wallets import SqliteWallets
     from uotpbot.catalog import PROVIDER_VALIDITY_MINUTES
     ui, router, _provider, _ledger = rig

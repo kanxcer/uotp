@@ -18,11 +18,15 @@ Endpoints:
 
 ``/readyz``
     Readiness. Verifies the provider is reachable and the ledger balances.
-    Results are cached for ``cache_seconds`` so a health-check interval cannot
-    turn into an API request storm that gets the key rate-limited.
+    Deliberately reports NO business figures (revenue, profit, wallet
+    balances): an unauthenticated endpoint must not publish P&L. Results are
+    cached for ``cache_seconds`` so a health-check interval cannot turn into
+    an API request storm that gets the key rate-limited.
 
 ``/metrics``
-    P&L, wallet balances and order counters as JSON.
+    P&L, wallet balances and order counters as JSON. Business-sensitive, so
+    it only EXISTS when ``metrics_token`` is set (404 otherwise), and then
+    requires ``Authorization: Bearer <token>`` or ``?token=<token>``.
 """
 
 from __future__ import annotations
@@ -30,6 +34,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import secrets
 import signal
 import threading
 import time
@@ -81,10 +86,16 @@ class HealthServer:
         subbots: Optional[Any] = None,
         wallet_monitor: Optional[Any] = None,
         subsystem_stats: Optional[Callable[[], dict]] = None,
+        metrics_token: str = "",
     ) -> None:
         self.engine = engine
         self.ledger = ledger
         self.port = port if port is not None else int(os.environ.get(PORT_ENV, DEFAULT_PORT))
+        # Business metrics are only served when a token is configured, and
+        # then only to a bearer that matches it. Empty (the default) means
+        # /metrics does not exist at all -- an unauthenticated endpoint that
+        # publishes revenue and wallet balances is a leak, not a feature.
+        self._metrics_token = metrics_token
         self._poller = poller
         #: Phase-1 provider wallet monitor (P2), for /readyz + /metrics.
         self._wallet_monitor = wallet_monitor
@@ -131,27 +142,25 @@ class HealthServer:
                 cached = self._cache
                 return (200 if cached.ok else 503), dict(cached.detail, cached=True)
 
+        # Readiness = "can we serve orders right now", reported as booleans
+        # and error CLASS NAMES only. No money figures, no exception messages
+        # (they can echo URLs, tokens or provider payloads): this endpoint is
+        # unauthenticated.
         detail: dict[str, Any] = {}
         ok = True
         try:
-            balance = self.engine.provider.get_balance()
-            detail["provider_wallet"] = balance.credit.to_plain()
+            self.engine.provider.get_balance()
+            detail["provider"] = "reachable"
         except (ProviderError, Exception) as exc:  # noqa: BLE001 - report, never raise
             ok = False
-            detail["provider_error"] = f"{type(exc).__name__}: {exc}"
+            # Class name only: the message can carry URLs/credentials.
+            detail["provider_error"] = type(exc).__name__
         try:
             self.ledger.verify()
             detail["ledger"] = "balanced"
-        except LedgerError as exc:
+        except LedgerError:
             ok = False
-            detail["ledger"] = f"UNBALANCED: {exc}"
-        try:
-            pnl = self.ledger.profit_and_loss()
-            detail["net_profit"] = pnl.net_profit.to_plain()
-            detail["revenue"] = pnl.revenue.to_plain()
-        except LedgerError as exc:
-            ok = False
-            detail["pnl_error"] = str(exc)
+            detail["ledger"] = "unbalanced"
 
         health = self.subbot_health()
         if health is not None:
@@ -184,6 +193,13 @@ class HealthServer:
         return 200, body
 
     # -- HTTP ------------------------------------------------------------
+    def _metrics_authed(self, token: str) -> bool:
+        """Constant-time check of a presented metrics token."""
+        if not self._metrics_token:
+            return False
+        return bool(token) and secrets.compare_digest(
+            token.encode("utf-8"), self._metrics_token.encode("utf-8"))
+
     def _handler_class(self) -> type:
         server = self
 
@@ -198,6 +214,19 @@ class HealthServer:
                 self.end_headers()
                 self.wfile.write(body)
 
+            def _metrics_token_presented(self) -> str:
+                """Bearer header first, then a ?token= query (for curl)."""
+                auth = self.headers.get("Authorization", "")
+                if auth.lower().startswith("bearer "):
+                    return auth[7:].strip()
+                try:
+                    from urllib.parse import parse_qs, urlparse
+                    query = parse_qs(urlparse(self.path).query)
+                    values = query.get("token", [])
+                    return values[0] if values else ""
+                except Exception:  # noqa: BLE001 - malformed query is a 403, not 500
+                    return ""
+
             def do_GET(self) -> None:  # noqa: N802 - stdlib naming
                 path = self.path.split("?", 1)[0].rstrip("/") or "/"
                 try:
@@ -206,7 +235,15 @@ class HealthServer:
                     elif path == "/readyz":
                         code, payload = server.readiness()
                     elif path == "/metrics":
-                        code, payload = server.metrics()
+                        # Business figures: no token configured -> the route
+                        # does not exist (404, so it can't be probed into);
+                        # token configured -> Bearer/query auth, else 403.
+                        if not server._metrics_token:
+                            code, payload = 404, {"error": f"no route for {path}"}
+                        elif not server._metrics_authed(self._metrics_token_presented()):
+                            code, payload = 403, {"error": "unauthorised"}
+                        else:
+                            code, payload = server.metrics()
                     elif path == "/versionz":
                         code, payload = 200, {
                             # Render injects these; unknown in local/dev runs.
@@ -215,10 +252,10 @@ class HealthServer:
                             "service": os.environ.get("RENDER_SERVICE_NAME", "uotpbot"),
                         }
                     elif path == "/":
-                        code, payload = 200, {
-                            "service": "uotpbot",
-                            "endpoints": ["/healthz", "/readyz", "/metrics"],
-                        }
+                        endpoints = ["/healthz", "/readyz"]
+                        if server._metrics_token:
+                            endpoints.append("/metrics (token required)")
+                        code, payload = 200, {"service": "uotpbot", "endpoints": endpoints}
                     else:
                         code, payload = 404, {"error": f"no route for {path}"}
                 except Exception as exc:  # never let a handler kill the server

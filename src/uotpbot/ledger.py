@@ -484,5 +484,28 @@ class Ledger:
         return max(self.balance(PLATFORM_FEE), Money.zero())
 
     def record_customer_refund(self, amount: Money, *, ref: str, memo: str = "") -> None:
-        """Refund a customer. Reduces revenue; the number cost stays in COGS."""
+        """Refund a customer. Reduces revenue; the number cost stays in COGS.
+
+        Idempotent per ``ref``: the customer refund for a given order ref is
+        posted at most ONCE, no matter how many code paths (engine timeout,
+        a cancel, a retry worker) race to post it. A duplicate posting would
+        make reported refunds exceed the money actually returned -- exactly
+        the drift this ledger exists to prevent. Callers that must *know*
+        whether a refund line already exists (to skip their own post) use
+        :meth:`has_customer_refund`.
+        """
+        if self.has_customer_refund(ref):
+            return
         self.post(SALES, CASH, amount, ref=ref, memo=memo or "customer refund")
+
+    def has_customer_refund(self, ref: str) -> bool:
+        """True when a customer-refund line (Dr sales / Cr cash) exists for ``ref``.
+
+        The sale postings credit ``revenue:sales``; only a customer refund
+        *debits* it, so a debit row on that account is unambiguous.
+        """
+        row = self._execute(
+            "SELECT COUNT(*) FROM {t} WHERE ref = ? AND account = ? AND debit_p > 0",
+            (ref, str(SALES)),
+        )[0]
+        return int(row[0]) > 0

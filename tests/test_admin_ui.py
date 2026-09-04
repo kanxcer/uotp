@@ -43,11 +43,11 @@ def test_admin_panel_has_money_and_broadcast_buttons(rig):
     panel = ui.admin_panel(OWNER)
     assert panel.ok
     labels = [lbl for row in panel.rows for lbl, _ in row]
-    assert any("Add balance" in l for l in labels)
-    assert any("Deduct" in l for l in labels)
-    assert any("Broadcast" in l for l in labels)
-    assert any("Customers" in l for l in labels)
-    assert any("Ban" in l for l in labels)
+    assert any("Add balance" in lbl for lbl in labels)
+    assert any("Deduct" in lbl for lbl in labels)
+    assert any("Broadcast" in lbl for lbl in labels)
+    assert any("Customers" in lbl for lbl in labels)
+    assert any("Ban" in lbl for lbl in labels)
 
 
 def test_admin_actions_owner_gated(rig):
