@@ -315,6 +315,7 @@ def _serve(settings: Settings) -> int:
         owner_id=settings.owner_id, allowed_users=settings.allowed_users,
         wallets=wallets,
         subbots=subbots.registry if subbots else None,
+        subbot_manager=subbots.manager if subbots else None,
         platform_fee=_platform_fee(settings),
         rate_limit=RateLimitConfig(
             max_buys=settings.rate_limit_max_buys,

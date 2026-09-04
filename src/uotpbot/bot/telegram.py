@@ -517,13 +517,45 @@ class TelegramFrontend:
             except Exception:
                 log.warning("notification to %s failed", chat_id, exc_info=True)
 
-    async def _safe_edit(self, message: Any, reply) -> None:
+    @staticmethod
+    def _is_photo_message(message: Any) -> bool:
+        """True when ``message`` is a Telegram PHOTO (the QR image screen).
+
+        Real PTB Message objects expose ``photo`` as a list of
+        :class:`PhotoSize` (empty/None for text messages), so only a non-empty
+        list counts -- a bare truthiness test would misfire on mocks.
+        """
+        if message is None:
+            return False
         try:
-            await message.edit_text(reply.text, reply_markup=_reply_markup(reply))
+            photos = getattr(message, "photo", None)
+            return isinstance(photos, (list, tuple)) and bool(photos)
+        except Exception:  # noqa: BLE001
+            return False
+
+    async def _safe_edit(self, message: Any, reply) -> None:
+        """Update a message with a reply's text + keyboard.
+
+        The payment QR screen (and any screen a fresh photo message carries) is
+        a PHOTO message: Telegram cannot ``edit_text`` a photo into a text
+        reply, so the button tap used to silently do nothing ("buttons not
+        responding"). Detect a photo message and reply with a fresh text
+        message instead -- the QR stays, and the result (or the Menu) appears
+        as a new message. Everything else edits in place.
+        """
+        markup = _reply_markup(reply)
+        if self._is_photo_message(message):
+            await message.reply_text(reply.text, reply_markup=markup)
+            return
+        try:
+            await message.edit_text(reply.text, reply_markup=markup)
         except Exception:  # pragma: no cover - "message is not modified"
             pass
 
     async def _safe_edit_text(self, message: Any, text: str) -> None:
+        if self._is_photo_message(message):
+            await message.reply_text(text)
+            return
         try:
             await message.edit_text(text)
         except Exception:  # pragma: no cover

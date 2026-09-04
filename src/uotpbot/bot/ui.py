@@ -87,6 +87,11 @@ _CATEGORY_EMOJI: dict[str, str] = {
 # A number is live this long; mirrored from catalog constants so the UI
 # copy cannot silently drift from engine reality.
 _VALIDITY = "20 minutes"
+#: The platform validity window in seconds. The UI clamps the "minutes left"
+#: figure to this at DISPLAY time so a stale or provider-skewed
+#: ``activenumbers`` row (e.g. one that recorded ``valid_until`` ~100 min out)
+#: can never claim the customer owns the number longer than they really do.
+_VALIDITY_SECONDS = 20 * 60
 
 #: The label -> callback pair(s) for the persistent bottom menu
 #: (ReplyKeyboardMarkup). Customers tap these without typing; Telegram delivers
@@ -715,7 +720,7 @@ class MenuUI:
         if live:
             lines.append("📱 Active purchase:")
             for a in live:
-                mins = max(1, int(round(a.seconds_left / 60)))
+                mins = self._display_minutes_left(a)
                 try:
                     name = self.catalog.get(a.slug).name if self.catalog.has(a.slug) else a.slug
                 except Exception:  # noqa: BLE001
@@ -1053,13 +1058,26 @@ class MenuUI:
         ``adjust`` and records the order as credited so a double-check or a
         duplicate webhook can never add money twice.
         """
+        # Resolve the order's user + amount. Prefer the persisted kv mapping
+        # (survives a redeploy); the in-memory map is a fast path when present.
+        store = self._store
+        get_ = getattr(store, "kv_get", None) if store is not None else None
         stored = self._fg_orders.get(order_id)
-        if stored is None:
-            # Unknown order. If it was already credited (e.g. the order rolled
-            # out of session or the webhook beat us to it) say so rather than
+        uid = amount_dec = None
+        if stored is not None:
+            uid, amount_dec, _payable, _created = stored
+        elif callable(get_):
+            kv_uid = get_(f"fg_order:{order_id}")
+            kv_amt = get_(f"fg_amt:{order_id}")
+            if kv_uid and kv_amt:
+                try:
+                    uid = kv_uid
+                    amount_dec = Decimal(kv_amt)
+                except Exception:  # noqa: BLE001
+                    uid = None
+        if uid is None or amount_dec is None:
+            # Unknown order. If it was already credited say so rather than
             # telling them to pay again.
-            store = self._store
-            get_ = getattr(store, "kv_get", None) if store is not None else None
             if callable(get_) and get_(f"fg_credited:{order_id}"):
                 return Reply(
                     "✅ That payment was already credited — no double charge.",
@@ -1071,7 +1089,6 @@ class MenuUI:
                 "Please add money again to generate a fresh QR.",
                 ok=False, rows=((("➕ Add money", "t"),),),
             )
-        uid, amount_dec, payable, created = stored
 
         def job(caller: str) -> Reply:
             client = self.fg_client
@@ -1106,14 +1123,13 @@ class MenuUI:
                     )
                 rows = ((("🔄 Check status", f"fg:check:{order_id}"),), (("🏠 Menu", "m"),))
                 return Reply(prompt, ok=False, rows=rows)
-            return self._credit_fg_order(uid, order_id, amount_dec, payable)
+            return self._credit_fg_order(uid, order_id, amount_dec)
 
         return Reply(
             "⏳ Checking your payment…", deferred=lambda uid_: job(uid),
         )
 
-    def _credit_fg_order(self, uid: str, order_id: str, amount: Decimal,
-                         payable: Decimal) -> Reply:
+    def _credit_fg_order(self, uid: str, order_id: str, amount: Decimal) -> Reply:
         """Idempotently credit an order. Returns a success/failure Reply.
 
         Uses the wallet's atomic ``adjust`` and the ``kv`` record so a repeated
@@ -1232,7 +1248,7 @@ class MenuUI:
         if live:
             lines.append("🔴 LIVE numbers (tap a number for its buttons):")
             for a in live:
-                mins = max(1, int(round(a.seconds_left / 60)))
+                mins = self._display_minutes_left(a)
                 try:
                     name = self.catalog.get(a.slug).name if self.catalog.has(a.slug) else a.slug
                 except Exception:  # noqa: BLE001 - never blank the whole screen
@@ -1342,6 +1358,22 @@ class MenuUI:
             return list(fn(user_id=user_id))
         except Exception:  # noqa: BLE001 - display only
             return []
+
+    def _display_minutes_left(self, active) -> int:
+        """Whole minutes remaining, clamped to the platform validity window.
+
+        ``active.seconds_left`` derives from a persisted ``valid_until``. A
+        stale or provider-skewed row (e.g. ``valid_until`` written ~100 minutes
+        out) would otherwise make "My numbers" claim the customer owns the
+        number far longer than reality. Clamp to the platform window so the UI
+        never over-promises; the number is nonetheless expired correctly if the
+        provider lets it live longer.
+        """
+        try:
+            seconds = max(0.0, min(float(active.seconds_left), _VALIDITY_SECONDS))
+        except Exception:  # noqa: BLE001 - display only
+            seconds = 0.0
+        return max(1, int(round(seconds / 60)))
 
     def admin_panel(self, user_id: str) -> Reply:
         if not self.router._is_owner(user_id):

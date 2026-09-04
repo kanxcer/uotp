@@ -21,6 +21,7 @@ from .whitelabel import (
     SubBotMode,
     SubBotRegistry,
     validate_bot_token,
+    verify_bot_token,
 )
 
 __all__ = ["CreateBotFlow", "PendingCreation", "CreateBotResult"]
@@ -76,11 +77,18 @@ class CreateBotFlow:
     """Drives one owner's ``/createbot`` session to completion."""
 
     def __init__(
-        self, registry: SubBotRegistry, fee: Optional[PlatformFee] = None
+        self, registry: SubBotRegistry, fee: Optional[PlatformFee] = None,
+        *,
+        token_verifier=None,
     ) -> None:
         self._registry = registry
         self._fee = fee or DEFAULT_PLATFORM_FEE
         self._pending: dict[str, PendingCreation] = {}
+        #: Live Telegram ``getMe`` check run at confirm, so a fabricated /
+        #: revoked token is refused up front instead of producing a dead bot.
+        #: Injectable (defaults to the real network verifier) so offline tests
+        #: and userless environments can stub it.
+        self._verify_token = token_verifier or verify_bot_token
 
     # -- lifecycle -------------------------------------------------------
     def start(self, owner_id: str) -> CreateBotResult:
@@ -229,6 +237,21 @@ class CreateBotFlow:
     def _confirm(self, p: PendingCreation) -> CreateBotResult:
         if p.bot is None:
             return CreateBotResult("Nothing to confirm; send /createbot to start.")
+        # LIVE token check: a structurally-valid token that Telegram rejects
+        # (never issued by @BotFather, revoked) would otherwise save a bot that
+        # never replies. Confirm with getMe BEFORE persisting so the owner hears
+        # it now, with the reason, instead of a silently-dead clone.
+        ok, info = self._verify_token(p.bot.bot_token)
+        if not ok:
+            return CreateBotResult(
+                "⚠️ That bot token was rejected by Telegram — your bot would "
+                "never reply.\n\n"
+                f"Reason: {info}\n\n"
+                "Create a fresh bot with @BotFather → /newbot, copy the token "
+                "exactly (a numeric ID, a colon, then ~35 chars), and /createbot "
+                "again. Nothing was created or charged.",
+                finished=True,
+            )
         try:
             self._registry.add(p.bot)
         except Exception as exc:  # noqa: BLE001 - surface anything, never half-create

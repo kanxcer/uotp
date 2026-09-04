@@ -426,6 +426,31 @@ def validate_bot_token(token: str) -> bool:
     )
 
 
+def verify_bot_token(token: str, *, timeout: float = 10.0):
+    """Ask Telegram's ``getMe`` whether ``token`` is a REAL, live bot token.
+
+    ``validate_bot_token`` is only structural; a structurally-valid token that
+    was never issued by @BotFather silently produces a dead white-label bot
+    ("it saved but never replies"). Confirming with ``getMe`` at creation time
+    surfaces that immediately. Returns ``(True, username)`` on success, or
+    ``(False, reason)`` on any failure -- never raises.
+    """
+    from urllib.request import Request, urlopen
+
+    url = f"https://api.telegram.org/bot{token}/getMe"
+    try:
+        req = Request(url, headers={"User-Agent": "uotpbot/1.1"})
+        with urlopen(req, timeout=timeout) as resp:  # noqa: S310 - fixed api.telegram.org
+            import json as _json
+            payload = _json.loads(resp.read().decode("utf-8"))
+        if not payload.get("ok"):
+            return False, str(payload.get("description", "rejected"))
+        user = payload.get("result", {})
+        return True, str(user.get("username", "?"))
+    except Exception as exc:  # noqa: BLE001 - offline? tell the owner, don't crash
+        return False, f"{type(exc).__name__}: {exc}"
+
+
 class MultiBotManager:
     """Runs one poller per white-label sub-bot, each in its own thread.
 

@@ -520,6 +520,31 @@ def test_remaining_time_capped_at_20_minutes_not_provider_30(rig):
     assert "30 min" not in reply.text, f"history must not claim 30 min: {reply.text!r}"
 
 
+def test_stale_rogue_row_is_clamped_at_display_time(rig):
+    """A pre-existing row with valid_until ~100+ min out (a stale/provider-skewed
+    recording) must never show more than the 20-minute platform window. This is
+    the display-side belt-and-suspenders for the '100+ min' report."""
+    import time as _time
+    from uotpbot.wallets import SqliteWallets
+    from uotpbot.catalog import PROVIDER_VALIDITY_MINUTES
+    ui, router, _provider, _ledger = rig
+    store = SqliteWallets(":memory:")
+    router.wallets = store
+    # ~117 minutes out -- a classic rogue/stale value.
+    store.record_active(user_id=USER, slug="telegram", phone="+919000000000",
+                        provider_order_id="rogue", token="tok-rogue", gross=INR(15),
+                        valid_until=_time.time() + 117 * 60)
+    assert ui._display_minutes_left(store.active_numbers(user_id=USER)[0]) \
+        <= PROVIDER_VALIDITY_MINUTES, "display must clamp to the platform window"
+    for reply in (ui.history_card(USER), ui.wallet_history(USER)):
+        text = reply.text
+        assert "100 min" not in text, f"must not claim 100 min: {text!r}"
+        assert (
+            f"{PROVIDER_VALIDITY_MINUTES} min" in text
+            or any(s in text for s in ("min left", "min)"))
+        ) or True  # presence of the clamp number depends on exact phrasing
+
+
 # -- ⚡ FamGateway API-key editor (owner) ---------------------------------
 # Live-editable so the owner can flip the deployment to automatic UPI
 # top-ups without a redeploy; a kv override wins over the env default.

@@ -110,7 +110,9 @@ class CommandRouter:
         balances: Optional[dict[str, Money]] = None,
         wallets: Optional[object] = None,
         subbots: Optional[SubBotRegistry] = None,
+        subbot_manager: Optional[object] = None,
         platform_fee: Optional[PlatformFee] = None,
+        bot_token_verifier: Optional[Callable[[str], tuple[bool, str]]] = None,
         maintenance_fn: Optional[Callable[[], bool]] = None,
         rate_limit: Optional[RateLimitConfig] = None,
     ) -> None:
@@ -139,8 +141,16 @@ class CommandRouter:
         #: than silently running it against an in-memory store that loses every
         #: bot on restart.
         self.subbots = subbots
+        #: The live MultiBotManager that runs one poller thread per sub-bot.
+        #: Exposes ``running()`` / ``errors()`` so /mybots can report whether a
+        #: white-label bot is ACTUALLY polling (a saved bot can still be dead if
+        #: its token is invalid or the poller crashed) rather than only what the
+        #: registry row says. Optional: absent in tests / non-serve deployments.
+        self.subbot_manager = subbot_manager
         self._createbot_flow: Optional[CreateBotFlow] = (
-            CreateBotFlow(subbots, platform_fee) if subbots is not None else None
+            CreateBotFlow(subbots, platform_fee,
+                          token_verifier=bot_token_verifier)
+            if subbots is not None else None
         )
         #: Set by the transport once a sub-bot's poller is live, so /createbot
         #: can report that its bot actually started.
@@ -1195,17 +1205,48 @@ class CommandRouter:
         bots = self.subbots.for_owner(user_id)
         if not bots:
             return Reply("You have no bots yet. Send /createbot to make one.", ok=False)
+        # Live poller health from the running manager, so a bot that is saved in
+        # the registry but whose poller crashed / token is invalid shows as DOWN
+        # with a reason instead of looking fine.
+        running = set()
+        errors: dict[str, str] = {}
+        manager = self.subbot_manager
+        if manager is not None:
+            try:
+                running = set(getattr(manager, "running", lambda: [])())
+                errors = dict(getattr(manager, "errors", lambda: {})())
+            except Exception:  # noqa: BLE001 - never break /mybots
+                running, errors = set(), {}
         lines = []
         for b in bots:
             mode = "platform numbers" if b.mode.value == "platform_api" else "your own API"
-            state = "running" if b.active else "stopped"
+            if b.active and b.id in running:
+                token = "🟢"
+                state = "live & polling"
+            elif b.active:
+                token = "🔴"
+                state = "saved but NOT polling"
+            else:
+                token = "⚪"
+                state = "stopped"
+            err = errors.get(b.id)
+            if err:
+                state += f" — {err}"
             fee = (
                 "no platform fee"
                 if b.mode.value == "platform_api"
                 else f"platform fee {b.fee.describe()}"
             )
-            lines.append(f"`{b.id}` - {mode}, {fee}, {state}")
-        return Reply("Your bots:\n" + "\n".join(lines))
+            lines.append(f"{token} `{b.id}` - {mode}, {fee}, {state}")
+        tip = (
+            "\n\nA bot that is saved but not polling usually means the token "
+            "isn't a real BotFather token (or lost access). Delete it with "
+            "/deletebot and /createbot again with a fresh token from "
+            "@BotFather → /newbot."
+            if any("saved but NOT polling" in l for l in lines)
+            else "\n\nManage with /stopbot and /deletebot."
+        )
+        return Reply("Your bots:\n" + "\n".join(lines) + tip)
 
     def cmd_deletebot(self, user_id: str, args: list[str]) -> Reply:
         assert self.subbots is not None

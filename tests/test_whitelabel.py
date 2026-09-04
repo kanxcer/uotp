@@ -330,9 +330,14 @@ def test_invalid_tokens_rejected(token):
 
 
 # ------------------------------------------------------------ createbot flow
+def _stub_verifier(token, *, timeout=10.0):
+    """Offline stand-in for verify_bot_token: accept any structurally-valid token."""
+    return True, "testbot"
+
+
 def make_flow(fee=None) -> tuple[CreateBotFlow, SubBotRegistry]:
     reg = SubBotRegistry()
-    return CreateBotFlow(reg, fee=fee), reg
+    return CreateBotFlow(reg, fee=fee, token_verifier=_stub_verifier), reg
 
 
 def test_flow_starts_by_asking_for_a_token():
@@ -755,7 +760,7 @@ def test_configured_rate_is_what_the_owner_is_shown(monkeypatch):
     monkeypatch.setenv("PLATFORM_FEE_RATE", "0.12")
     fee = _platform_fee(from_environment())
     reg = SubBotRegistry()
-    flow = CreateBotFlow(reg, fee)
+    flow = CreateBotFlow(reg, fee, token_verifier=_stub_verifier)
     flow.start("u1")
     shown = flow.on_text("u1", GOOD_TOKEN)
     assert "12% of each sale" in shown.reply
@@ -815,7 +820,8 @@ def _wl_router():
                                            poll_interval=0.01))
     registry = SubBotRegistry()
     router = CommandRouter(engine, catalog, pricer, ledger, owner_id="111",
-                           allowed_users=("111",), subbots=registry)
+                           allowed_users=("111",), subbots=registry,
+                           bot_token_verifier=_stub_verifier)
     return router, registry, ledger
 
 
@@ -997,6 +1003,42 @@ def test_on_callback_edits_message_and_answers_query():
     router.handle_callback.assert_called_once_with("42", "cb:createbot:confirm")
     query.message.edit_text.assert_awaited_once_with("done", reply_markup=None)
     # Answer must be empty-text so no "OK" toast popup shows on a tap.
+    query.answer.assert_awaited_once_with()
+
+
+def test_callback_on_a_photo_message_replies_fresh_text_not_edit():
+    """A callback on the QR (photo) message must reply a NEW text message.
+
+    Telegram forbids ``edit_text`` on a photo message, which is exactly why the
+    Add-half "✅ I've paid / 🔄 Check status" buttons used to look dead: the
+    transport tried to edit the photo and silently failed. The fix detects a
+    photo message and replies with fresh text carrying the buttons.
+    """
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock
+
+    from uotpbot.bot.telegram import TelegramFrontend
+
+    router = MagicMock()
+    router.handle_callback.return_value = type("R", (), {
+        "text": "done", "ok": True, "buttons": (),
+    })()
+    frontend = TelegramFrontend(router)
+    query = MagicMock()
+    query.from_user.id = 42
+    query.data = "cb:createbot:confirm"
+    query.message = MagicMock()
+    query.message.edit_text = AsyncMock()
+    query.message.reply_text = AsyncMock()
+    # A real PTB photo message exposes ``photo`` as a non-empty list.
+    query.message.photo = ["photo_size"]
+    query.answer = AsyncMock()
+    update = MagicMock()
+    update.callback_query = query
+    asyncio.run(frontend.on_callback(update, None))
+    # Never attempted an edit on the photo; replied fresh text instead.
+    query.message.edit_text.assert_not_awaited()
+    query.message.reply_text.assert_awaited_once_with("done", reply_markup=None)
     query.answer.assert_awaited_once_with()
 
 
