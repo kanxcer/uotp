@@ -73,7 +73,8 @@ services:
       # tokens in plaintext is a standing compromise. Any long random string
       # works (a Fernet key is derived from it); e.g. `openssl rand -hex 32`.
       - key: SECRET_KEY
-        sync: false
+        # value set below; REPLACE with your own `openssl rand -hex 32` before
+        # a public release, and never re-commit after rotation.
         value: "c2d180e9dd0afcd867413840fcf2f57561c2e4bb75648cf0b8a2c393f9084934"
       # --- HTTP surface ---------------------------------------------------
       # Shared secret for /metrics (P&L, wallet balances, order counters).
