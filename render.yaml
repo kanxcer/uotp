@@ -60,10 +60,13 @@ services:
       - key: TELEGRAM_ALLOWED_USERS
         sync: false
       # --- white-label sub-bots -----------------------------------------
-      # Off by default. With DATABASE_URL set, sub-bot records live in
-      # Postgres alongside the ledger, so no SUBBOTS_PATH is needed.
+      # On: lets any customer create a clone of this bot (/createbot). With
+      # DATABASE_URL set, sub-bot records live in Postgres alongside the
+      # ledger, so no SUBBOTS_PATH is needed. SECRET_KEY (below, sync:false)
+      # is the required encryption key -- it MUST be set as a secret on the
+      # service or the bot refuses to boot.
       - key: WHITELABEL_ENABLED
-        value: "false"
+        value: "true"
       # Encrypts sub-bot credentials (Telegram tokens, own-API provider keys)
       # at rest in the registry. REQUIRED whenever WHITELABEL_ENABLED=true --
       # the bot refuses to boot without it, because a registry holding live
