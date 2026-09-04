@@ -288,3 +288,69 @@ def test_cancel_message_shows_exact_time_left():
     rep = router.cancel_wait(token)
     assert "You can cancel in" in rep.text
     assert "minute" in rep.text or "seconds" in rep.text
+
+
+# ── #4b (CRITICAL) an order must never be refunded more than once ─────────
+def test_order_refunded_exactly_once_under_concurrent_polls():
+    """Several pollers resolve the SAME order; the wallet and ledger must see
+    exactly ONE customer refund, never a triple credit."""
+    wallets = SqliteWallets(":memory:")
+    router, provider, ledger, _ = _rig(wallets=wallets)
+    provider.force_next(MockOutcome("success", otp="777777"))
+    start = wallets.balance(USER)  # ₹500 before the buy (fixture credit)
+    r = router.alloc_and_wait(USER, "telegram")
+    token = _wait_token(r)
+    assert token
+    after_buy = wallets.balance(USER)  # debited once by the purchase
+    assert after_buy < start
+
+    # Simulate THREE independent resolutions of the same order: the background
+    # auto-poller, a manual Check OTP, and a late poll after a Cancel. Each gets
+    # its own engine poll; the engine times out (no OTP) and tries to refund.
+    from uotpbot.provider.base import OtpResult
+    asyncio_loop = None
+    # Poll #1: auto-poller (blocks in wait_for_otp then times out).
+    _t, reply1 = router.poll_once(token, wait_seconds=1)
+    # Poll #2: a second concurrent poller on the same token.
+    _t, reply2 = router.poll_once(token, wait_seconds=1)
+    # Poll #3: a third.
+    _t, reply3 = router.poll_once(token, wait_seconds=1)
+
+    # The wallet must have been credited exactly once (net back to start).
+    assert wallets.balance(USER) == start, \
+        f"expected one refund (balance back to {start}), got {wallets.balance(USER)}"
+    # Exactly one customer-refund ledger line for this order (idempotent).
+    # One customer refund = one CASH credit posting (double-entry makes two
+    # journal rows per refund). Count the cash-credit rows: must be exactly one.
+    refund_lines = [h for h in ledger.history()
+                    if (h[5] or "") in ("no OTP", "user_cancelled")
+                    and "cash" in str(h[2])
+                    and int(h[4]) > 0]
+    assert len(refund_lines) == 1, f"expected 1 customer refund, got {len(refund_lines)}"
+
+
+def test_cancel_then_timeout_poll_does_not_double_refund():
+    """Cancel an order, then let its in-flight poll resolve: still ONE refund."""
+    wallets = SqliteWallets(":memory:")
+    router, provider, ledger, _ = _rig(wallets=wallets)
+    provider.force_next(MockOutcome("success", otp="888888"))
+    start = wallets.balance(USER)  # ₹500 before the buy
+    r = router.alloc_and_wait(USER, "telegram")
+    token = _wait_token(r)
+
+    # Cancel first (this is the customer's action in the reported bug).
+    cancel_reply = router.cancel_wait(token)
+    assert cancel_reply.ok and "Cancelled" in cancel_reply.text
+    assert wallets.balance(USER) == start  # exactly one credit from the cancel
+
+    # Now the in-flight auto-poller resolves (would have refunded in the old code).
+    _t, reply = router.poll_once(token, wait_seconds=1)
+    # Still exactly one refund on the wallet and in the ledger.
+    assert wallets.balance(USER) == start
+    # One customer refund = one CASH credit posting (double-entry makes two
+    # journal rows per refund). Count the cash-credit rows: must be exactly one.
+    refund_lines = [h for h in ledger.history()
+                    if (h[5] or "") in ("no OTP", "user_cancelled")
+                    and "cash" in str(h[2])
+                    and int(h[4]) > 0]
+    assert len(refund_lines) == 1, f"expected 1 customer refund, got {len(refund_lines)}"

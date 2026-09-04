@@ -21,6 +21,7 @@ from ..economics import EconomicsError
 from ..engine import BotEngine
 from ..ledger import Ledger
 from ..money import INR, Money
+from ..orders import OrderState
 from ..pricing import Pricer
 from ..ratelimit import RateLimitConfig, RateLimiter
 from ..refund import DurableRefund
@@ -741,11 +742,27 @@ class CommandRouter:
             except Exception:  # noqa: BLE001
                 pass
         gross = result.order.gross_price if result is not None and result.order else Money(0)
+        # Idempotent: if a concurrent poll already refunded this order, don't
+        # credit again -- tell the truth instead.
+        already = self.refunds.is_processed(token)
+        # Mark the in-flight order REFUNDED so a concurrent engine poll that is
+        # still waiting on this number does NOT post a second customer-refund
+        # ledger line when it finally times out.
+        order = getattr(result, "order", None)
+        if order is not None and not already:
+            try:
+                if not order.state.is_terminal:
+                    order.transition(OrderState.FAILED)
+                if order.state is not OrderState.REFUNDED:
+                    order.transition(OrderState.REFUNDED)
+            except Exception:  # noqa: BLE001 - best effort
+                pass
         # GUARANTEED refund: post the ledger line + wallet credit through the
         # durable outbox, so a confirmed release can never leave the customer
         # silently out of pocket (and the books stay accurate).
         ok, _ = self.refunds.request(user_id, gross, token, reason="user_cancelled")
-        self._record_cancel(user_id, slug, gross)
+        if not already:
+            self._record_cancel(user_id, slug, gross)
         name = self.catalog.get(slug).name if self.catalog.has(slug) else slug
         if ok:
             return Reply(
@@ -891,10 +908,33 @@ class CommandRouter:
             )
             self._terminal[token] = reply
             return reply
-        # Still waiting (or timed out to a refund).  If poll_otp refunded, reflect it.
-        if result.refunded.paise > 0:
-            self.credit(user_id, result.refunded)
+        # Still waiting (or timed out to a refund). If poll_otp refunded, credit
+        # the customer's wallet -- but ONLY once per order. Several concurrent
+        # pollers (a manual 💰 Check OTP, the background auto-poller, a late
+        # Check after a Cancel) can resolve the SAME order, and each used to
+        # refund it again, so a single order could be credited three times.
+        # The idempotent outbox guard makes the wallet credit happen exactly once.
         if not result.success:
+            # Capture the "already processed" state BEFORE we apply: applying the
+            # refund marks the outbox done, so a post-check would always look done.
+            already_resolved = self.refunds.is_processed(token)
+            if result.refunded.paise > 0 and not already_resolved:
+                self.refunds.apply_timeout_refund(
+                    token, user_id, result.refunded, reason="no OTP"
+                )
+            if already_resolved:
+                # A Cancel or an earlier poll already refunded this order: never
+                # credit or record it again. Return the genuine terminal reply if
+                # we have one, else a benign "already done" message.
+                term = self._terminal.get(token)
+                if term is not None:
+                    return term
+                return Reply(
+                    "✔️ This order is already resolved and refunded — no further "
+                    "charge was made. See 🧾 My numbers.",
+                    ok=False,
+                    rows=((("🧾 My numbers", "o"), ("🏠 Menu", "m")),),
+                )
             # Terminal (timed out / refunded) -- clear it and the active number.
             self._awaiting.pop(token, None)
             self._record_order(user_id, slug, result.order.gross_price, result)
@@ -961,12 +1001,16 @@ class CommandRouter:
         provider_id = getattr(alloc, "order_id", "") if alloc else ""
         # Absolute epoch expiry so the row stays viewable until the number is
         # actually dead, surviving the message/navigation and a redeploy.
-        import datetime
+        # Clamp to the REAL provider validity: the provider's clock / reported
+        # validity can skew high and made the UI claim "30 min" when the number
+        # is only yours for 20 min, which confused customers.
+        from ..catalog import PROVIDER_VALIDITY_MINUTES
+        max_valid = PROVIDER_VALIDITY_MINUTES * 60
         if alloc is not None:
-            seconds_left = alloc.seconds_left()
-            valid_until = time.time() + max(seconds_left, 0)
+            seconds_left = min(max(alloc.seconds_left(), 0), max_valid)
+            valid_until = time.time() + seconds_left
         else:
-            valid_until = time.time() + 20 * 60  # provider validity default
+            valid_until = time.time() + max_valid  # provider validity default
         try:
             rec(user_id=user_id, slug=slug, phone=result.phone or "",
                 provider_order_id=provider_id, token=token, gross=price,

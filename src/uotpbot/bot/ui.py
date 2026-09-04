@@ -90,6 +90,7 @@ _VALIDITY = "20 minutes"
 _REPLY_MENU: tuple[tuple[tuple[str, str], ...], ...] = (
     (("🛒 Buy Number", "l"), ("🧾 My Numbers", "o")),
     (("💰 Wallet", "w"), ("❓ Help", "h")),
+    (("⭐ Favourites", "fav"), ("🆘 Support", "support")),
     (("⚙️ Admin Panel", "a"),),
 )
 REPLY_MENU_LABELS: dict[str, str] = {
@@ -132,7 +133,10 @@ class MenuUI:
         self.router = router
         self.catalog: Catalog = router.catalog
         self.pricer: Pricer = router.pricer
-        self.support_contact = support_contact.strip()
+        #: Default support contact (from SUPPORT_CONTACT env). The owner can
+        #: change it live from the admin panel, which persists an override in
+        #: the wallet store's kv table; ``support_contact`` reads that first.
+        self._support_default = support_contact.strip()
         #: UPI VPA customers pay to (owner sets PAY_UPI_ID). The QR image is
         #: set by the owner from inside the bot and persisted in the wallet
         #: store's kv table -- it survives redeploys, unlike disk files.
@@ -142,17 +146,132 @@ class MenuUI:
         #: Session-scoped by design; say that on the screen.
         self._history: dict[str, list[tuple[float, str, bool, str]]] = {}
         self._history_size = history_size
+        #: In-memory favourites fallback when there is no kv store (tests/dev).
+        self._fav_fallback: dict[str, list[str]] = {}
         self._now = now or time.time
         #: Active top-up / QR wizards. Session-scoped is fine: a restart
         #: just makes the customer re-tap Add Money, it never loses money
         #: (rows are written only after the screenshot lands).
         self._wizard: dict[str, dict] = {}
 
+    def favourites_card(self, user_id: str) -> Reply:
+        """⭐ Favourites: the services this customer starred, each buyable."""
+        favs = self.favourites(user_id)
+        if not favs:
+            return Reply(
+                "⭐ Favourites\n\nYou haven't starred anything yet. Open a service "
+                "and tap ★ to save it here for one-tap access.",
+                rows=((("🛒 Browse services", "l"), ("🏠 Menu", "m")),),
+            )
+        rows: list[tuple[tuple[str, str], ...]] = []
+        lines = ["⭐ Your favourites:\n"]
+        for slug in favs:
+            try:
+                cost = self.catalog.get(slug)
+                name = cost.name
+                price = self.pricer.price(cost).gross_price
+            except Exception:  # noqa: BLE001 - a removed service shouldn't blank it
+                continue
+            lines.append(f"{_emoji(slug)} {name} · {price}")
+            rows.append(((f"✅ Buy · {price}", f"y:{slug}"),
+                         (f"★ Remove", f"fvt:{slug}")))
+        rows.append((("🛒 Browse services", "l"), ("🏠 Menu", "m")))
+        return Reply("\n".join(lines), rows=tuple(rows))
+
+    def support_card(self, user_id: str) -> Reply:
+        """🆘 Support screen: how to reach the owner."""
+        contact = self.support_contact
+        if contact:
+            # If it's a bare @username, keep the @; the helper formats it.
+            handle = contact if contact.startswith("@") else f"@{contact}"
+            lines = (
+                f"🆘 Need help?\n\n"
+                f"Message the owner on Telegram: {handle}\n\n"
+                "For issues, include the order/number and what happened. "
+                "Refunds happen automatically if no OTP arrives."
+            )
+            rows = (("🛒 Buy a number", "l"), ("🧾 My numbers", "o"),
+                    ("🏠 Menu", "m"))
+            return Reply(lines, rows=rows)
+        return Reply(
+            "🆘 Need help?\n\n"
+            "Support is being set up — message the bot owner directly for now.",
+            rows=((("🛒 Buy a number", "l"), ("🏠 Menu", "m")),),
+        )
+
     # -- stores / small helpers -------------------------------------------
     @property
     def _store(self):
         """The wallet store backing top-ups, or None in dict-mode (tests/dev)."""
         return getattr(self.router, "wallets", None)
+
+    @property
+    def support_contact(self) -> str:
+        """The support username customers see, live-editable by the owner.
+
+        An owner-set override wins (persisted in the wallet kv table, so it
+        survives redeploys); otherwise the SUPPORT_CONTACT env default is used.
+        """
+        store = self._store_for_kv()
+        if store is not None:
+            try:
+                v = store.kv_get("support_contact")
+                if v:
+                    return v
+            except Exception:  # noqa: BLE001 - fall back to default
+                pass
+        return self._support_default
+
+    def _set_support_contact(self, value: str) -> None:
+        """Persist the owner-edited support username."""
+        store = self._store_for_kv()
+        if store is not None:
+            try:
+                store.kv_set("support_contact", value.strip())
+                return
+            except Exception:  # noqa: BLE001
+                pass
+        # In-memory fallback (tests / no kv store).
+        self._support_default = value.strip()
+
+    # -- favourites ------------------------------------------------------
+    def _fav_key(self, user_id: str) -> str:
+        return f"fav:{user_id}"
+
+    def favourites(self, user_id: str) -> list[str]:
+        """The slugs this user has starred, in the order added."""
+        store = self._store_for_kv()
+        raw = ""
+        if store is not None:
+            try:
+                raw = store.kv_get(self._fav_key(user_id)) or ""
+            except Exception:  # noqa: BLE001
+                raw = ""
+        else:
+            raw = ",".join(self._fav_fallback.get(user_id, []))
+        return [s for s in raw.split(",") if s and self.catalog.has(s)]
+
+    def is_favourite(self, user_id: str, slug: str) -> bool:
+        return slug in self.favourites(user_id)
+
+    def toggle_favourite(self, user_id: str, slug: str) -> bool:
+        """Flip a service's starred state; returns True if now a favourite."""
+        cur = self.favourites(user_id)
+        if slug in cur:
+            cur.remove(slug)
+            fav = False
+        else:
+            cur.append(slug)
+            fav = True
+        store = self._store_for_kv()
+        if store is not None:
+            try:
+                store.kv_set(self._fav_key(user_id), ",".join(cur))
+            except Exception:  # noqa: BLE001 - non-fatal
+                pass
+        else:
+            self._fav_fallback[user_id] = cur
+        return fav
 
     def maintenance_on(self) -> bool:
         """True while the owner has paused buying (admin panel toggle)."""
@@ -263,10 +382,12 @@ class MenuUI:
     # -- the menu tree ---------------------------------------------------
     def main_menu(self, user_id: str) -> Reply:
         balance = self.router.balance_of(user_id)
+        fav_slug = self.favourites(user_id)
         rows = [
             (("🛒 Buy a number", "l"),),
             ((f"💰 Balance: {balance}", "w"), ("🧾 My numbers", "o")),
-            (("❓ How it works", "h"),),
+            ((f"⭐ Favourites ({len(fav_slug)})", "fav"), ("❓ How it works", "h")),
+            (("🆘 Support", "support"),),
         ]
         if self._can_createbot():
             rows.append((("🤖 Run your own bot", "cb"),))
@@ -385,8 +506,11 @@ class MenuUI:
                 if balance.paise < advice.gross_price.paise
                 else f"\n\n💰 Your balance covers it ({balance})."
             )
+            fav_label = "★ Remove from favourites" if self.is_favourite(user_id, slug) \
+                else "⭐ Save to favourites"
             rows = (
                 ((f"✅ Buy now · {advice.gross_price}", f"y:{slug}"),),
+                ((fav_label, f"fvt:{slug}"),),
                 (("◀️ Back to services", "l"), ("🏠 Menu", "m")),
             )
             return Reply(
@@ -421,6 +545,9 @@ class MenuUI:
             if page < pages - 1:
                 nav.append(("Next ▶️", f"s:{slug}:{page + 1}"))
             rows.append(tuple(nav))
+        fav_label = "★ Remove from favourites" if self.is_favourite(user_id, slug) \
+            else "⭐ Save to favourites"
+        rows.append(((fav_label, f"fvt:{slug}"),))
         rows.append((("◀️ Back to services", "l"), ("🏠 Menu", "m")))
 
         cheapest = live[0]
@@ -590,6 +717,10 @@ class MenuUI:
             "broadcast": ("📢 BROADCAST TO ALL CUSTOMERS",
                           "Send your announcement text, e.g.\n"
                           "`Big sale today on all numbers!`"),
+            "support": ("🆘 EDIT SUPPORT USERNAME",
+                        "Send the support username customers see on the 🆘 "
+                        "Support screen, e.g.\n`@your_support`\n"
+                        f"(current: `{self.support_contact or 'not set'}`)"),
         }[action]
         self._wizard[user_id] = {"flow": "admin", "action": action, "step": "input"}
         return Reply(f"{prompt[0]}\n\n{prompt[1]}\n\nTap ✖️ Cancel to abort.",
@@ -624,6 +755,18 @@ class MenuUI:
                     return Reply("Please send the announcement text.",
                                  ok=False, rows=((("✖️ Cancel", "a"),),))
                 return self.router.handle(user_id, f"/broadcast {text}")
+            if action == "support":
+                val = (body.strip() or "").lstrip("@")
+                if not val:
+                    return Reply("Please send the support username, e.g. `@your_support`.",
+                                 ok=False, rows=((("✖️ Cancel", "a"),),))
+                self._set_support_contact(val)
+                return Reply(
+                    f"✅ Support username set to @{val}.\n\n"
+                    f"It's now shown on the 🆘 Support screen.",
+                    ok=True, rows=((("🆘 Preview Support", "support"),),
+                                   (("📊 Admin Panel", "a"),)),
+                )
             self._wizard.pop(user_id, None)
             return self.main_menu(user_id)
 
@@ -866,6 +1009,7 @@ class MenuUI:
                 (("📢 Broadcast", "ax:broadcast"), ("📊 Metrics", "ax:metrics")),
                 (("🛠 Toggle maintenance", "a:mm"), ("🖼 Payment QR", "a:qr")),
                 (("🕳 Sunk cost", "ax:sunkcost"), ("🏦 Provider", "ax:provider")),
+                (("🆘 Support username", "ax:support"),),
                 (("🏠 Menu", "m"),),
             ),
         )
@@ -1043,7 +1187,23 @@ class MenuUI:
                 return self._with_back(self.router.handle(user_id, f"/{action}"))
             if action in {"credit", "debit", "ban", "broadcast"}:
                 return self._admin_input_prompt(user_id, action)
+            if action == "support":
+                # ✏️ Edit the support username customers see on 🆘 Support.
+                return self._admin_input_prompt(user_id, "support")
             return self._badtap()
+        if kind == "fav":
+            return self.favourites_card(user_id)
+        if kind == "support":
+            return self.support_card(user_id)
+        if kind == "fvt" and len(parts) == 2:
+            # Star/unstar a service; return to its screen.
+            fav = self.toggle_favourite(user_id, parts[1])
+            name = self.catalog.get(parts[1]).name if self.catalog.has(parts[1]) else parts[1]
+            tiny = "added to" if fav else "removed from"
+            return self._with_back(
+                Reply(f"⭐ {name} {tiny} your favourites.", rows=((("⭐ Favourites", "fav"),),)),
+                back_data="fav", back_label="⭐ Favourites",
+            )
         if kind == "l":
             return self.services_grid(user_id, page=_int(parts[1], 0) if len(parts) == 2 else 0)
         if kind == "c":

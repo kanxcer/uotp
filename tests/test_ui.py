@@ -423,3 +423,98 @@ def test_typed_my_numbers_matches_the_button_screen(tmp_path):
             or "No live numbers" in reply.text, phrase
         assert reply.text.strip() and "✳️ YCOTP Numbers" != reply.text.strip()
     store.close()
+
+# -- Favourites & Support & admin support-username edit --------------------
+
+def test_menu_has_favourites_and_support_buttons(rig):
+    ui, _router, _provider, _ledger = rig
+    reply = ui.main_menu(USER)
+    datas_ = datas(reply)
+    assert "fav" in datas_, f"menu must have a Favourites button, got {datas_}"
+    assert "support" in datas_, f"menu must have a Support button, got {datas_}"
+    # Favourites sits on the SAME row as How it works.
+    hrow = [r for r in reply.rows if any(d == "h" for _l, d in r)]
+    frow = [r for r in reply.rows if any(d == "fav" for _l, d in r)]
+    assert hrow and frow and hrow == frow, "Favourites must be parallel with How it works"
+
+
+def test_favourites_flow_star_toggle_and_card(rig):
+    ui, _router, _provider, _ledger = rig
+    # No favourites yet.
+    reply = ui.favourites_card(USER)
+    assert "haven't starred anything" in reply.text
+    # Star telegram from its service card.
+    card = ui.service_card(USER, "telegram")
+    assert "fvt:telegram" in datas(card), "service card needs a star button"
+    ui.toggle_favourite(USER, "telegram")
+    assert ui.is_favourite(USER, "telegram")
+    reply = ui.favourites_card(USER)
+    assert "Telegram" in reply.text
+    # The menu shows the count on the Favourites button itself.
+    m_labels = [l for row in ui.main_menu(USER).rows for l, _d in row]
+    assert any("Favourites (1)" in l for l in m_labels), m_labels
+    # Unstar via the favourites card "Remove" button.
+    assert "fvt:telegram" in datas(reply)
+    ui.toggle_favourite(USER, "telegram")
+    assert not ui.is_favourite(USER, "telegram")
+
+
+def test_support_button_shows_configurable_contact(rig):
+    ui, _router, _provider, _ledger = rig
+    reply = ui.support_card(USER)
+    assert "@support" in reply.text
+
+
+def test_admin_can_edit_support_username_and_it_persists(rig):
+    ui, _router, _provider, _ledger = rig
+    # Admin panel has the edit button.
+    panel = ui.admin_panel(OWNER)
+    assert "ax:support" in datas(panel), "admin needs a Support username edit"
+    # Owner edits support username; it shows to a customer.
+    r = ui.button(OWNER, "ax:support")  # opens the input wizard
+    assert "EDIT SUPPORT USERNAME" in r.text
+    r2 = ui.text(OWNER, "new_support")
+    assert "✅" in r2.text
+    assert ui.support_contact == "new_support"
+    assert "@new_support" in ui.support_card(USER).text
+
+
+def test_support_button_hidden_when_no_contact_set(rig):
+    ui, _router, _provider, _ledger = rig
+    # Fail gracefully when no default and no override.
+    ui._support_default = ""
+    reply = ui.support_card(USER)
+    assert "being set up" in reply.text
+
+
+# -- 20-minute validity display --------------------------------------------
+
+def test_remaining_time_capped_at_20_minutes_not_provider_30(rig):
+    """The provider's clock can report 30-minute validity, but the number is
+    only ours for 20. _record_active must cap the persisted valid_until to 20
+    minutes so the 'min left' screens never claim 30."""
+    import time as _time
+    from uotpbot.wallets import SqliteWallets
+    from uotpbot.catalog import PROVIDER_VALIDITY_MINUTES
+    ui, router, _provider, _ledger = rig
+    store = SqliteWallets(":memory:")
+    router.wallets = store
+
+    class _Alloc:
+        order_id = "alloc_prov"
+        def seconds_left(self):  # provider claims 30 minutes
+            return 30 * 60
+
+    class _Result:  # simulates a provider result whose allocation is 30-min
+        phone = "+919000000000"
+        _alloc = _Alloc()
+
+    router._record_active(USER, "telegram", INR(15), _Result(), "tok-t")
+    active = store.active_numbers(user_id=USER)
+    assert active, "active row should exist"
+    left = active[0].seconds_left
+    assert left <= PROVIDER_VALIDITY_MINUTES * 60 + 1, \
+        f"provider claimed 30 min but UI must cap to 20; got {left/60:.1f} min"
+    # And every screen renders <= 20 min, never 30.
+    reply = ui.history_card(USER)
+    assert "30 min" not in reply.text, f"history must not claim 30 min: {reply.text!r}"

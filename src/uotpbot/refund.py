@@ -87,19 +87,63 @@ class DurableRefund:
 
     def request(self, user_id: str, amount: Money, order_token: str,
                 reason: str) -> tuple[bool, str]:
-        """Refund ``amount`` to ``user_id`` for ``order_token``.
+        """Refund ``amount`` to ``user_id`` for ``order_token`` (cancel path).
 
         Writes the outbox first (durable + idempotent: one refund per order),
-        then attempts the credit. Returns ``(ok_tried_now, refund_id)``.
-        Even when ``ok`` is False the refund WILL be retried.
+        then attempts the credit. Returns ``(ok_tried_now, refund_id)``. If the
+        order was ALREADY refunded (a concurrent poll raced the Cancel), this
+        does NOT credit again and returns ``(False, ...)`` so the caller can
+        tell the customer honestly. Even when ``ok`` is False for a transient
+        DB blip, the refund WILL still be retried.
         """
+        if self.is_processed(order_token):
+            log.info("refund request for %s skipped: already processed", order_token)
+            return False, ""
         refund_id = self._write(user_id, amount, order_token, reason)
         ok = refund_once(self.router, user_id, amount, order_token, reason)
         self._mark(refund_id, done=ok, error="" if ok else "first attempt failed")
-        # A `done` row must not be "pending" just because the idempotent insert
-        # reused another order's row; if we wrote nothing (already pending) the
-        # worker will pick it up. Report what actually happened.
         return ok, refund_id
+
+    def is_processed(self, order_token: str) -> bool:
+        """True if this order's customer refund has already been applied (done).
+
+        The single guard that makes a refund happen exactly ONCE per order, even
+        when several independent code paths (a manual Check, the background
+        auto-poller, a Cancel) resolve the same order concurrently. Without it a
+        single order could be refunded several times.
+        """
+        store = self._store
+        if store is None or not order_token \
+                or not callable(getattr(store, "get_refund", None)):
+            return False
+        try:
+            row = store.get_refund(order_token)
+        except Exception:  # noqa: BLE001 - fail open to allow the credit
+            return False
+        return row is not None and row.status == "done"
+
+    def apply_timeout_refund(self, order_token: str, user_id: str,
+                             amount: Money, reason: str) -> bool:
+        """Credit a timeout/auto-refund, guarded so it only happens once.
+
+        The ENGINE already posted the customer-refund ledger line when the OTP
+        timed out (that is its job); this only credits the wallet, and only if
+        the order's refund was not already applied. Returns True when this call
+        applied the credit, False when it was already done (no double credit).
+        """
+        if self.is_processed(order_token):
+            return False
+        try:
+            self.router.credit(user_id, amount)
+        except Exception as exc:  # noqa: BLE001 - retryable
+            log.warning("timeout refund credit failed user=%s amt=%s: %s",
+                        user_id, amount, exc)
+            return False
+        # Record it as done (the ledger line is the engine's; here we only
+        # persist that the WALLET credit happened, so nothing re-credits).
+        refund_id = self._write(user_id, amount, order_token, reason)
+        self._mark(refund_id, done=True, error="")
+        return True
 
     def retry_all(self) -> int:
         """Retry every pending refund; returns how many succeeded."""

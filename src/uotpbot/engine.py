@@ -647,12 +647,19 @@ class BotEngine:
         if not order.state.is_terminal:
             order.transition(OrderState.FAILED)
         result.message = message
-        if self.config.auto_refund and refund_customer:
+        # Idempotent customer refund: _fail can be reached by SEVERAL concurrent
+        # pollers for the SAME order (a manual 💰 Check OTP, the background
+        # auto-poller, and a late Check after a Cancel all share this order), and
+        # each used to post its own customer-refund line and re-set refunded, so a
+        # single order could be refunded multiple times. Only post the line the
+        # FIRST time the order reaches REFUNDED; once it is terminal-REFUNDED
+        # every further _fail is a no-op for money.
+        if (self.config.auto_refund and refund_customer
+                and order.state is not OrderState.REFUNDED):
             refund = order.gross_price
             self.ledger.record_customer_refund(refund, ref=order.order_id, memo="no OTP")
             result.refunded = refund
-            if order.state is OrderState.FAILED:
-                order.transition(OrderState.REFUNDED)
+            order.transition(OrderState.REFUNDED)
         return result
 
     # -- reporting -------------------------------------------------------
