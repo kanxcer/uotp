@@ -326,10 +326,14 @@ def _serve(settings: Settings) -> int:
         log.info("connected to %s; wallet %s", provider.name, balance.credit)
 
     from .bot.commands import CommandRouter
+    from .createbot import platform_username_from_token
     from .store import make_wallets
 
     wallets = make_wallets(settings)
     subbots = _make_whitelabel(settings, catalog, ledger, pricer, wallets)
+    platform_username = platform_username_from_token(settings.telegram_token)
+    if platform_username:
+        log.info("platform bot @%s", platform_username)
 
     # Bridge that edits a customer's QR message to a success note when a payment
     # is confirmed. Must exist BEFORE the router so every credit path (webhook,
