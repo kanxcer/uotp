@@ -54,7 +54,7 @@ def test_unknown_command(rig):
 def test_plain_text_gets_help(rig):
     router, _, _ = rig
     reply = router.handle(USER, "hello")
-    assert "YCOTP bot" in reply.text
+    assert "YC OTP bot" in reply.text
 
 
 def test_outsider_is_refused(rig):

@@ -249,7 +249,7 @@ class UotpConfig:
 class UotpProvider:
     """Talks to UOTP's ``handler_api.php`` endpoint."""
 
-    name = "uotp"
+    name = "YC OTP"
 
     def __init__(self, config: Optional[UotpConfig] = None, *, opener: Any = None) -> None:
         self.config = config or UotpConfig()

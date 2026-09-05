@@ -45,7 +45,7 @@ __all__ = ["CommandRouter", "HELP_TEXT"]
 #: chars; ~40 ids with balance + last-seen stays comfortably under that.
 _USERS_PAGE = 40
 
-HELP_TEXT = """YCOTP bot
+HELP_TEXT = """YC OTP bot
 
 /buy <service>        Buy a number and wait for the OTP
 /price <service>      Price and margin for one service

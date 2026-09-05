@@ -470,7 +470,7 @@ def test_typed_my_numbers_matches_the_button_screen(tmp_path):
         reply = ui.text(USER, phrase)
         assert "my numbers" in reply.text.lower() or "Your numbers" in reply.text \
             or "No numbers yet" in reply.text, phrase
-        assert reply.text.strip() and "✳️ YCOTP Numbers" != reply.text.strip()
+        assert reply.text.strip() and "✳️ YC OTP Numbers" != reply.text.strip()
     store.close()
 
 # -- Favourites & Support & admin support-username edit --------------------

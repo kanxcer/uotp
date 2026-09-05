@@ -1,5 +1,5 @@
 """Provider vocabulary + live-diagnosed request shape, and the owner's
-maintenance switch + YCOTP rebrand.
+maintenance switch + YC OTP rebrand.
 
 Every getNumber request requires a numeric ``operator`` id (verified against
 the live endpoint: names/any/0/1 -> BAD_OPERATOR, 2..10 pass validation) and
@@ -169,8 +169,9 @@ def test_user_facing_copy_says_ycotp():
     ui, _ = _rig()
     texts = [ui.button(USER, "m").text, ui.button(USER, "h").text]
     joined = "\n".join(texts)
-    assert "YCOTP" in joined
+    assert "YC OTP" in joined
     assert "UOTP" not in joined
+    assert "YCOTP" not in joined
 
 
 def test_unavailable_service_via_card_is_a_clean_no(tmp_path):
@@ -235,3 +236,9 @@ def test_all_bare_no_stock_reports_clean_number_unavailable():
                      "NO_NUMBERS", "NO_NUMBERS", "NO_NUMBERS")
     with pytest.raises(NumberUnavailable):
         p.buy_number("bigbasket", "22")
+
+
+def test_provider_display_name_is_yc_otp():
+    """Owner /provider and /status show YC OTP, never the old uotp slug."""
+    p, _ = _provider("ACCESS_BALANCE:1")
+    assert p.name == "YC OTP"

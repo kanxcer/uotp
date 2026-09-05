@@ -4,7 +4,7 @@ Walks an owner through: paste a bot token, pick their extra % on OUR selling
 price (suggested 38%), read the terms, confirm.
 
 Clone bots always use platform numbers and the platform FamGateway. There is
-no "own UOTP API" option — that path leaked provider access and a second
+no "own YC OTP API" option — that path leaked provider access and a second
 payment rail. The extra % is stored with the bot so the terms they agreed
 are the terms charged.
 """
@@ -88,7 +88,7 @@ def clone_about(main_username: str = "") -> str:
     """Telegram About (setMyShortDescription). Plain text, ≤120 chars."""
     handle = clone_handle(main_username)
     powered = f" Powered by {handle}." if handle else ""
-    text = f"Real 🇮🇳 SIMs · 1,000+ apps · OTP in seconds.{powered}".strip()
+    text = f"YC OTP · Real 🇮🇳 SIMs · 1,000+ apps · OTP in seconds.{powered}".strip()
     return text[:ABOUT_MAX]
 
 
@@ -97,7 +97,7 @@ def clone_description(main_username: str = "") -> str:
     handle = clone_handle(main_username)
     powered = f"Powered by {handle}. " if handle else ""
     text = (
-        "Get a real 🇮🇳 Indian number. OTP in seconds.\n\n"
+        "YC OTP — Get a real 🇮🇳 Indian number. OTP in seconds.\n\n"
         "1,000+ apps — Telegram, WhatsApp, Uber, Blinkit, Zomato, every "
         "service you use. Real Indian SIMs.\n\n"
         "Tap. See the price. Pay. Done. No hidden fees, no sign-up, no papers.\n\n"
@@ -331,7 +331,7 @@ class CreateBotFlow:
             f"Example: if a service is {sample} here, at 38% your customers "
             f"pay {example}.\n\n"
             "You keep 95% of that extra; we keep 5% as the platform fee. "
-            "Numbers always come from us — you cannot add your own UOTP API.\n\n"
+            "Numbers always come from us — you cannot add your own YC OTP API.\n\n"
             "Tap a percentage below.",
             rows=self._margin_rows(),
         )
@@ -388,7 +388,7 @@ class CreateBotFlow:
             self.cancel(owner_id)
             if data == CB_OWN_API:
                 return CreateBotResult(
-                    "Your own UOTP API is not available on clone bots. "
+                    "Your own YC OTP API is not available on clone bots. "
                     "Tap ➕ Create / add bot to start again — you'll pick an extra % "
                     "on our selling price instead.",
                     finished=True,

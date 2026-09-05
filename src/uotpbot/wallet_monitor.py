@@ -129,7 +129,7 @@ class WalletMonitor:
                 f"🔴 CRITICAL: provider wallet almost empty\n\n"
                 f"Balance: ₹{paise / 100:.2f}\n"
                 f"Orders will FAIL with NO_BALANCE soon.\n\n"
-                f"Top up at uotp.store NOW.",
+                f"Top up the YC OTP supplier wallet NOW.",
                 interval=self.critical_alert_interval,
             )
         elif paise < self.low_paise:

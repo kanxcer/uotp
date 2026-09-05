@@ -225,7 +225,7 @@ class SubBot:
                 "Payments: customers pay through our UPI (FamGateway). "
                 "You do not set a QR, UPI id, or provider API key.\n"
                 "Earnings land on Withdraw in your admin panel.\n"
-                "You cannot plug in your own UOTP API.\n"
+                "You cannot plug in your own YC OTP API.\n"
                 "These terms cannot change after you create the bot."
             )
         return (

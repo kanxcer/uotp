@@ -81,7 +81,7 @@ def test_createbot_never_offers_own_api():
     flow.on_text("u1", GOOD_TOKEN)
     shown = flow.on_button("u1", CB_MARGIN_SUGGESTED)
     assert "38%" in shown.reply
-    assert "own UOTP API" in shown.reply
+    assert "own YC OTP API" in shown.reply
 
 
 def _clone_rig():

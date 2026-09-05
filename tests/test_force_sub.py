@@ -101,7 +101,7 @@ def test_unjoined_user_is_walled(rig):
     assert "Join our channel" in ui.button(USER, "l").text
     assert "Join our channel" in ui.photo(USER, "file-1").text
     # Owner is never walled.
-    assert "YCOTP" in ui.text(OWNER, "/start").text
+    assert "YC OTP" in ui.text(OWNER, "/start").text
 
 
 def test_ive_joined_rechecks_membership(rig):
@@ -115,7 +115,7 @@ def test_ive_joined_rechecks_membership(rig):
     welcome = ui.button(USER, "fs:ok")
     assert welcome.ok
     assert "You're in" in welcome.text
-    assert "YCOTP" in welcome.text
+    assert "YC OTP" in welcome.text
 
 
 def test_member_can_use_bot(rig):
@@ -124,7 +124,7 @@ def test_member_can_use_bot(rig):
                        "title": "OTP", "link": "https://t.me/otpclub"})
     ui.chat_member_fn = lambda chat, uid: "member"
     menu = ui.text(USER, "/start")
-    assert menu.ok and "YCOTP" in menu.text
+    assert menu.ok and "YC OTP" in menu.text
 
 
 def test_api_error_fails_open(rig):

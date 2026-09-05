@@ -35,7 +35,7 @@ log = logging.getLogger("uotpbot.ui")
 
 __all__ = ["MenuUI", "WELCOME"]
 
-WELCOME = """👋 Welcome to YCOTP numbers.
+WELCOME = """👋 Welcome to YC OTP numbers.
 
 Get a real phone number, receive your OTP in Telegram, pay only on success.
 Prices include everything — no hidden fees, and a failed order refunds itself
@@ -997,7 +997,7 @@ class MenuUI:
         )
         return Reply(
             f"{banner}"
-            "✳️ YCOTP Numbers\n\n"
+            "✳️ YC OTP Numbers\n\n"
             f"⚡ {count:,} services · 🇮🇳 real SIMs · 🛟 auto-refund if no OTP\n"
             f"💰 Your balance: {balance}\n\n"
             "Tap 🛒 Buy a number below, or just type the service name "
@@ -2015,7 +2015,7 @@ class MenuUI:
             "We keep 5% of your extra; you keep 95% — credited when a "
             "customer gets their OTP.\n"
             "Customers pay through our UPI. You cannot add a QR, UPI id, "
-            "or your own UOTP API.\n\n"
+            "or your own YC OTP API.\n\n"
             f"👥 Your customers: {users}\n"
             f"🛠 Maintenance: {'🟢 ON' if self.maintenance_on() else '⚪ off'}\n"
             f"🔓 Users may use bot: {'on' if self.bot_enabled() else 'off'}\n"

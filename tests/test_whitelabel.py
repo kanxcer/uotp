@@ -112,7 +112,7 @@ def test_platform_api_disclosure_states_zero_fee():
     bot = SubBot(owner_id="u", bot_token=GOOD_TOKEN, mode=SubBotMode.PLATFORM_API,
                  fee=DEFAULT_PLATFORM_FEE, reseller_rate=Decimal("0.38"))
     text = bot.fee_disclosure()
-    assert "You cannot plug in your own UOTP API" in text
+    assert "You cannot plug in your own YC OTP API" in text
     assert "38%" in text
     assert "₹20.01" in text or "20.01" in text
 
@@ -399,6 +399,8 @@ def test_clone_profile_copy_fits_telegram_limits_and_names_main_bot():
     assert len(about) <= 120
     assert len(desc) <= 512
     assert "@ycotpbot" in about
+    assert "YC OTP" in about
+    assert "YC OTP" in desc
     assert "@ycotpbot" in desc
     assert "1,000+" in desc
     assert "20 min" in desc
@@ -479,9 +481,9 @@ def test_flow_offers_both_modes_with_the_fee_named_up_front():
     result = flow.on_text("u1", GOOD_TOKEN)
     labels = _labels(result)
     assert "38%" in labels
-    assert "own" not in labels.lower() or "UOTP" in result.reply
+    assert "own" not in labels.lower() or "YC OTP" in result.reply
     assert flow.pending("u1").step == Step.AWAIT_MARGIN
-    assert "cannot add your own UOTP API" in result.reply
+    assert "cannot add your own YC OTP API" in result.reply
 
 
 def test_extra_percent_is_a_button_grid():
@@ -512,7 +514,7 @@ def test_platform_path_discloses_then_creates():
     flow.start("u1")
     flow.on_text("u1", GOOD_TOKEN)
     shown = flow.on_button("u1", CB_MARGIN_SUGGESTED)
-    assert "You cannot plug in your own UOTP API" in shown.reply
+    assert "You cannot plug in your own YC OTP API" in shown.reply
     assert "38%" in shown.reply
     assert reg.count() == 0  # not created until confirmed
 
@@ -530,7 +532,7 @@ def test_own_api_path_shows_the_signup_link_and_the_fee_before_creation():
     flow.start("u1")
     flow.on_text("u1", GOOD_TOKEN)
     asked = flow.on_button("u1", CB_OWN_API)
-    assert "own UOTP API is not available" in asked.reply
+    assert "own YC OTP API is not available" in asked.reply
     assert asked.finished
     assert reg.count() == 0
 
@@ -890,7 +892,7 @@ def test_configured_rate_is_what_the_owner_is_shown(monkeypatch):
     flow.start("u1")
     shown = flow.on_text("u1", GOOD_TOKEN)
     assert "38%" in shown.reply
-    assert "own UOTP API" in shown.reply
+    assert "own YC OTP API" in shown.reply
     flow.on_text("u1", "38")
     created = flow.on_button("u1", CB_CONFIRM).created
     assert created.mode is SubBotMode.PLATFORM_API
@@ -997,7 +999,7 @@ def test_full_own_api_flow_through_the_router_with_typed_choices():
         assert "Create my bot" in _labels(disclosure)
         assert "Read this" in disclosure.text
         assert "38%" in disclosure.text
-        assert "own UOTP API" in disclosure.text
+        assert "own YC OTP API" in disclosure.text
         created = router.handle("111", "yes")
         assert "created" in created.text.lower()
         assert registry.count() == 1
@@ -1029,7 +1031,7 @@ def test_cancel_from_midflow_works_through_the_router():
         assert "Cancelled" in reply.text
         assert registry.count() == 0
         # and plain text after cancelling goes back to help, not into the flow
-        assert "YCOTP bot" in router.handle("111", "random text").text
+        assert "YC OTP bot" in router.handle("111", "random text").text
     finally:
         ledger.close()
 
