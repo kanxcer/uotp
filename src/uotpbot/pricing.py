@@ -22,7 +22,8 @@ from .catalog import Catalog, ServiceCost
 from .economics import FeeModel, OrderEconomics, PricingAdvice
 from .money import INR, PAISE_PER_RUPEE, Money, Rate, quantize_money, rate
 
-__all__ = ["Strategy", "PriceLadder", "Pricer", "PRICE_LADDER", "DEFAULT_LADDER"]
+__all__ = ["Strategy", "PriceLadder", "Pricer", "ResellerPricer",
+           "PRICE_LADDER", "DEFAULT_LADDER"]
 
 _ONE = Decimal(1)
 
@@ -304,3 +305,53 @@ class Pricer:
             "wallet_multiplier": f"{self._multiplier:.6f}",
             "best_pack": self.catalog.best_pack().label if self.catalog.best_pack() else None,
         }
+
+
+class ResellerPricer:
+    """Clone-bot pricer: our shelf price × (1 + extra %).
+
+    Wraps the platform :class:`Pricer` so a ₹14.50 Blinkit at 38% extra
+    becomes ₹20.01 on the clone, with no own-API path.
+    """
+
+    def __init__(self, inner: Pricer, extra_rate: Decimal) -> None:
+        self._inner = inner
+        self.extra_rate = Decimal(extra_rate)
+        self.catalog = inner.catalog
+        self.fees = inner.fees
+        self.ladder = inner.ladder
+        self.strategy = inner.strategy
+        self.target_margin = inner.target_margin
+        self.markup = inner.markup
+        self.retry_cap = inner.retry_cap
+        self._multiplier = inner._multiplier
+
+    def price(self, cost: ServiceCost, *, sticker: Optional[Money] = None
+              ) -> PricingAdvice:
+        from .reseller import clone_price
+
+        advice = self._inner.price(cost, sticker=sticker)
+        gross = clone_price(advice.gross_price, self.extra_rate)
+        sticker_used = sticker if sticker is not None else self.catalog.sticker_price(cost.slug)
+        econ = OrderEconomics.for_service(
+            cost, gross, fees=self.fees, wallet_multiplier=self._multiplier,
+            retry_cap=self.retry_cap, sticker_price=sticker_used,
+        )
+        return PricingAdvice(
+            service=cost, gross_price=gross, break_even=advice.break_even,
+            econ=econ,
+            reason=(
+                f"clone extra {self.extra_rate:.0%} on {advice.gross_price} "
+                f"= {gross}"
+            ),
+        )
+
+    def price_book(self, slugs: Optional[Iterable[str]] = None) -> list[PricingAdvice]:
+        items = (
+            [self.catalog.get(s) for s in slugs]
+            if slugs is not None
+            else list(self.catalog.services())
+        )
+        return sorted(
+            (self.price(c) for c in items), key=lambda a: a.service.list_price.paise
+        )

@@ -92,7 +92,8 @@ CREATE TABLE IF NOT EXISTS subbots (
     disclosed_at   TEXT    NOT NULL,
     disclosure     TEXT    NOT NULL,
     created_at     TEXT    NOT NULL,
-    active         INTEGER NOT NULL DEFAULT 1
+    active         INTEGER NOT NULL DEFAULT 1,
+    reseller_rate  TEXT    NOT NULL DEFAULT '0'
 );
 CREATE INDEX IF NOT EXISTS idx_subbots_owner ON subbots(owner_id);
 """
@@ -151,6 +152,8 @@ class SubBot:
     id: str = field(default_factory=lambda: secrets.token_hex(8))
     provider_key: str = ""
     provider_url: str = ""
+    #: Extra on the *platform selling price* (0.38 = 38%). 0 = same price as us.
+    reseller_rate: Decimal = field(default_factory=lambda: Decimal("0"))
     disclosed_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds")
     )
@@ -170,6 +173,11 @@ class SubBot:
         if self.mode is SubBotMode.PLATFORM_API and self.provider_key:
             raise WhiteLabelError(
                 "PLATFORM_API mode takes no provider key; the platform supplies numbers"
+            )
+        object.__setattr__(self, "reseller_rate", Decimal(self.reseller_rate or 0))
+        if self.reseller_rate < 0 or self.reseller_rate > Decimal("2"):
+            raise WhiteLabelError(
+                f"reseller extra must be in [0, 2], got {self.reseller_rate}"
             )
         if not self.disclosure:
             self.disclosure = self.fee_disclosure()
@@ -200,13 +208,25 @@ class SubBot:
     def fee_disclosure(self) -> str:
         """The exact terms shown to the owner. Stored with the bot record."""
         if self.mode is SubBotMode.PLATFORM_API:
+            extra_pct = (self.reseller_rate * 100).quantize(Decimal("0.01"))
+            extra_txt = f"{extra_pct.normalize()}%"
+            from .money import INR
+            from .reseller import clone_price, reseller_split
+            sample = INR("14.50")
+            theirs = clone_price(sample, self.reseller_rate)
+            split = reseller_split(theirs, self.reseller_rate, self.fee.rate)
+            cut_pct = (self.fee.rate * 100).quantize(Decimal("1"))
             return (
-                "Mode: platform numbers.\n"
-                "You buy numbers from this bot's wallet at the wholesale price "
-                "shown by /price, and set your own selling price.\n"
-                "Platform fee: none. The platform earns the spread already built "
-                "into the wholesale price.\n"
-                "You keep 100% of what you charge above that price."
+                "Mode: you sell OUR numbers at your extra %.\n"
+                f"Your extra: {extra_txt} on our selling price.\n"
+                f"Example: our {sample} → your customers pay {theirs}.\n"
+                f"Of that extra ({split.extra}): we keep {cut_pct}% "
+                f"({split.platform_cut}); you keep {split.owner_share}.\n"
+                "Payments: customers pay through our UPI (FamGateway). "
+                "You do not set a QR, UPI id, or provider API key.\n"
+                "Earnings land on Withdraw in your admin panel.\n"
+                "You cannot plug in your own UOTP API.\n"
+                "These terms cannot change after you create the bot."
             )
         return (
             "Mode: your own provider API.\n"
@@ -264,7 +284,19 @@ class SubBotRegistry:
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.executescript(SCHEMA)
+            self._migrate()
             self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Add reseller_rate to registries created before clone extras existed."""
+        try:
+            cols = {r[1] for r in self._conn.execute("PRAGMA table_info(subbots)")}
+        except Exception:  # noqa: BLE001 - postgres overrides this
+            cols = set()
+        if cols and "reseller_rate" not in cols:
+            self._conn.execute(
+                "ALTER TABLE subbots ADD COLUMN reseller_rate TEXT NOT NULL DEFAULT '0'"
+            )
 
     def close(self) -> None:
         with self._lock:
@@ -320,12 +352,12 @@ class SubBotRegistry:
         self._write(
             "INSERT INTO {t} (id, owner_id, bot_token, mode, provider_key, "
             "provider_url, fee_rate, fee_fixed_p, disclosed_at, disclosure, "
-            "created_at, active) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "created_at, active, reseller_rate) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 bot.id, bot.owner_id, self._enc(bot.bot_token), bot.mode.value,
                 self._enc(bot.provider_key), bot.provider_url, str(bot.fee.rate),
                 bot.fee.fixed.paise, bot.disclosed_at, bot.disclosure,
-                bot.created_at, int(bot.active),
+                bot.created_at, int(bot.active), str(bot.reseller_rate),
             ),
         )
         return bot
@@ -340,6 +372,12 @@ class SubBotRegistry:
 
     # -- reading ---------------------------------------------------------
     def _row_to_bot(self, row: tuple) -> SubBot:
+        reseller = Decimal("0")
+        if len(row) > 12 and row[12] not in (None, ""):
+            try:
+                reseller = Decimal(str(row[12]))
+            except ArithmeticError:
+                reseller = Decimal("0")
         return SubBot(
             id=row[0], owner_id=row[1], bot_token=self._dec(row[2]),
             mode=SubBotMode(row[3]),
@@ -347,10 +385,12 @@ class SubBotRegistry:
             fee=PlatformFee(rate=Decimal(row[6]), fixed=Money(int(row[7]))),
             disclosed_at=row[8], disclosure=row[9], created_at=row[10],
             active=bool(row[11]),
+            reseller_rate=reseller,
         )
 
     _COLS = ("id, owner_id, bot_token, mode, provider_key, provider_url, "
-             "fee_rate, fee_fixed_p, disclosed_at, disclosure, created_at, active")
+             "fee_rate, fee_fixed_p, disclosed_at, disclosure, created_at, "
+             "active, reseller_rate")
 
     def find_by_token(self, token: str) -> Optional[SubBot]:
         """Find a registered bot by its (plaintext) Telegram token.

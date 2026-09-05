@@ -347,7 +347,7 @@ class MenuUI:
         An owner-set override wins (persisted in the wallet kv table so it
         survives redeploys); otherwise the FAMGATEWAY_API_KEY env default.
         """
-        store = self._store_for_kv()
+        store = self._fg_store()
         if store is not None:
             try:
                 v = store.kv_get("famgateway_api_key")
@@ -359,7 +359,9 @@ class MenuUI:
 
     def _set_famgateway_api_key(self, value: str) -> None:
         """Persist the owner-edited FamGateway API key."""
-        store = self._store_for_kv()
+        if self._is_clone:
+            return
+        store = self._fg_store()
         if store is not None:
             try:
                 store.kv_set("famgateway_api_key", value.strip())
@@ -798,6 +800,24 @@ class MenuUI:
             return store
         return None
 
+    @property
+    def _is_clone(self) -> bool:
+        return bool(getattr(self.router, "is_clone", False))
+
+    def _fg_store(self):
+        """Unscoped store for FamGateway order mappings.
+
+        Clone wallets are namespaced ``<bot>:<uid>``. The webhook/sweep live
+        on the platform store and look up ``fg_order:<id>`` without a prefix,
+        so clone payments must write those keys unscoped and tag
+        ``fg_scope:<id>`` with the clone bot id so credit lands on the clone
+        wallet.
+        """
+        plat = getattr(self.router, "platform_wallets", None)
+        if plat is not None and callable(getattr(plat, "kv_get", None)):
+            return plat
+        return self._store_for_kv()
+
     def _qr_file_id(self) -> Optional[str]:
         store = self._store
         if store is None:
@@ -818,7 +838,7 @@ class MenuUI:
             return
         try:
             from .alerts import pay_message
-            pay_message(store, notifier, order_id, money)
+            pay_message(self._fg_store() or store, notifier, order_id, money)
         except Exception:  # noqa: BLE001 - the credit already happened
             pass
 
@@ -832,12 +852,15 @@ class MenuUI:
         (``fg_msg:<order>``) like the order/amount mappings, so it survives a
         redeploy; missing or unparseable values simply skip the edit.
         """
-        store = self._store
+        store = self._fg_store()
         set_ = getattr(store, "kv_set", None) if store is not None else None
         if not callable(set_):
             return
         try:
             set_(f"fg_msg:{order_id}", f"{chat_id}:{message_id}")
+            token = getattr(self.router, "clone_bot_token", "") or ""
+            if token:
+                set_(f"fg_token:{order_id}", token)
         except Exception:  # noqa: BLE001 - an edit is a nicety, never fatal
             log.warning("could not persist fg_msg for %s", order_id)
 
@@ -1239,6 +1262,15 @@ class MenuUI:
                 f"Message {self.support_contact or 'the bot owner'} to add money.",
                 ok=False, rows=((("🏠 Menu", "m"),),),
             )
+        if self._is_clone and not self.fg_enabled:
+            return Reply(
+                "➕ Add money\n\n"
+                "Payments on this bot go through the platform's UPI. "
+                "That's not set up yet — message the owner, or try again later.\n\n"
+                "You cannot pay a clone owner directly.",
+                ok=False,
+                rows=((("◀️ Back", "w"), ("🏠 Menu", "m")),),
+            )
         if self.fg_enabled:
             # Automated UPI top-up: no screenshot, no manual approval. The money
             # is verified live by FamGateway and credited in seconds.
@@ -1414,6 +1446,8 @@ class MenuUI:
                 )
             if action == "fs":
                 return self._apply_force_sub_input(user_id, body)
+            if action == "withdraw":
+                return self._apply_withdraw(user_id, body)
             self._wizard.pop(user_id, None)
             return self.main_menu(user_id)
 
@@ -1431,6 +1465,13 @@ class MenuUI:
             # Automated flow: create a live FamGateway order, then show the QR
             # and poll. No screenshot, no owner approval.
             return self._begin_fg_topup(user_id, amount)
+        if self._is_clone:
+            self._wizard.pop(user_id, None)
+            return Reply(
+                "Clone bots don't take screenshots. Payments go through "
+                "the platform UPI, which isn't available right now.",
+                ok=False, rows=((("🏠 Menu", "m"),),),
+            )
         self._wizard[user_id] = {"flow": "topup", "step": "screenshot", "amount": amount.paise}
         return Reply(
             f"Amount noted: {amount}\n\n"
@@ -1482,12 +1523,18 @@ class MenuUI:
             # Also persist order->user+amount in the kv store so the async
             # FamGateway webhook can credit the right wallet even if the
             # process restarts between order creation and payment.
-            store = self._store
+            store = self._fg_store()
             set_ = getattr(store, "kv_set", None) if store is not None else None
             if callable(set_):
                 try:
                     set_(f"fg_order:{order.order_id}", uid)
                     set_(f"fg_amt:{order.order_id}", str(amount_dec))
+                    scope = getattr(self.router, "clone_bot_id", "") or ""
+                    if scope:
+                        set_(f"fg_scope:{order.order_id}", scope)
+                    token = getattr(self.router, "clone_bot_token", "") or ""
+                    if token:
+                        set_(f"fg_token:{order.order_id}", token)
                 except Exception:  # noqa: BLE001 - webhook then does not credit
                     log.warning("could not persist FamGateway order %s", order.order_id)
             qr_hint = (
@@ -1524,7 +1571,7 @@ class MenuUI:
         """
         # Resolve the order's user + amount. Prefer the persisted kv mapping
         # (survives a redeploy); the in-memory map is a fast path when present.
-        store = self._store
+        store = self._fg_store() or self._store
         get_ = getattr(store, "kv_get", None) if store is not None else None
         stored = self._fg_orders.get(order_id)
         uid = amount_dec = None
@@ -1599,7 +1646,7 @@ class MenuUI:
         Uses the wallet's atomic ``adjust`` and the ``kv`` record so a repeated
         check (or a duplicate webhook) can never double-credit.
         """
-        store = self._store
+        store = self._fg_store() or self._store
         if store is None:
             return Reply("Wallet is offline right now.", ok=False)
         try:
@@ -1674,6 +1721,13 @@ class MenuUI:
         wizard = self._wizard.get(user_id) or {}
         flow, step = wizard.get("flow"), wizard.get("step")
         if flow == "topup" and step == "screenshot":
+            if self._is_clone:
+                self._wizard.pop(user_id, None)
+                return Reply(
+                    "Clone bots don't accept payment screenshots. "
+                    "Use ➕ Add money for the platform UPI QR.",
+                    ok=False, rows=((("💰 Balance", "w"), ("🏠 Menu", "m")),),
+                )
             store = self._store
             if store is None:
                 self._wizard.pop(user_id, None)
@@ -1888,6 +1942,8 @@ class MenuUI:
             # replaces the leftover "⚙️ Admin Panel" key for this customer.
             menu = self.main_menu(user_id)
             return replace(menu, text="Owner only.\n\n" + menu.text, ok=False)
+        if self._is_clone:
+            return self._clone_admin_panel(user_id)
         status = self.router.engine.status()
         pnl = status["pnl"]
         pending = self._pending_topups()
@@ -1908,6 +1964,9 @@ class MenuUI:
             if self.router.subbots is not None else
             "🤖 Clone-bot (not enabled here)"
         )
+        from ..reseller import pending_withdrawals
+        wd_store = self._fg_store()
+        n_wd = len(pending_withdrawals(wd_store)) if wd_store is not None else 0
         return Reply(
             "📊 Owner panel\n\n"
             f"🏦 Provider wallet: {status['provider_wallet']}\n"
@@ -1916,6 +1975,7 @@ class MenuUI:
             f"📈 Net profit: {pnl['net_profit']}\n"
             f"👥 Total users: {users}{float_line}\n"
             f"💳 Payments waiting: {len(pending)}\n"
+            f"💸 Clone payouts waiting: {n_wd}\n"
             f"🖼 Payment QR: {qr_state}\n"
             f"📒 Top-up mode: {fg_state}\n"
             f"🛠 Maintenance: {'🟢 ON — buying paused for customers' if self.maintenance_on() else '⚪ off'}\n"
@@ -1928,6 +1988,7 @@ class MenuUI:
                 (("🔓 Users may use bot", "a:on"), ("🤖 Clone-bot on/off", "a:cb")),
                 (("📢 Force sub", "a:fs"),),
                 ((f"🧾 Top-ups ({len(pending)} pending)", "a:t"), ("📊 Metrics", "ax:metrics")),
+                ((f"💸 Clone payouts ({n_wd})", "a:wd"),),
                 (("📦 Orders & per-order profit", "a:o"),),
                 (("💳 Add balance", "ax:credit"), ("↩️ Deduct", "ax:debit")),
                 (("📢 Broadcast", "ax:broadcast"), ("👥 Customers", "ax:users")),
@@ -1936,6 +1997,150 @@ class MenuUI:
                 (("🆘 Support username", "ax:support"), ("💳 FamGateway", "ax:fg")),
                 (("🏠 Menu", "m"),),
             ),
+        )
+
+    def _clone_admin_panel(self, user_id: str) -> Reply:
+        """Clone-owner admin: no money rails, no cloning, no FamGateway."""
+        from ..reseller import earnings_balance
+        extra = getattr(self.router, "reseller_rate", 0) or 0
+        extra_pct = f"{(extra * 100):.0f}%"
+        store = getattr(self.router, "platform_wallets", None) or self._store
+        earn = earnings_balance(store, user_id) if store is not None else Money.zero()
+        fs = self._float_stats()
+        users = int(fs["users"]) if fs and fs.get("users") is not None else 0
+        return Reply(
+            "📊 Your clone panel\n\n"
+            f"📈 Extra on our prices: {extra_pct} (locked)\n"
+            f"💸 Withdrawable earnings: {earn}\n"
+            "We keep 5% of your extra; you keep 95% — credited when a "
+            "customer gets their OTP.\n"
+            "Customers pay through our UPI. You cannot add a QR, UPI id, "
+            "or your own UOTP API.\n\n"
+            f"👥 Your customers: {users}\n"
+            f"🛠 Maintenance: {'🟢 ON' if self.maintenance_on() else '⚪ off'}\n"
+            f"🔓 Users may use bot: {'on' if self.bot_enabled() else 'off'}\n"
+            f"📢 Force sub: {self.force_sub_label()}",
+            rows=(
+                ((f"💸 Withdraw ({earn})", "ax:withdraw"),),
+                ((f"👥 All users ({users})", "ax:users"), ("🚫 Ban/Unban", "ax:ban")),
+                (("🔓 Users may use bot", "a:on"), ("📢 Force sub", "a:fs")),
+                (("📦 Orders", "a:o"), ("📢 Broadcast", "ax:broadcast")),
+                (("🛠 Toggle maintenance", "a:mm"), ("🆘 Support username", "ax:support")),
+                (("🏠 Menu", "m"),),
+            ),
+        )
+
+    def withdraw_prompt(self, user_id: str) -> Reply:
+        """Clone owner: start a payout request."""
+        if not self.router._is_owner(user_id) or not self._is_clone:
+            return Reply("Owner only.", ok=False, rows=((("🏠 Menu", "m"),),))
+        from ..reseller import earnings_balance
+        store = getattr(self.router, "platform_wallets", None) or self._store
+        earn = earnings_balance(store, user_id) if store is not None else Money.zero()
+        self._wizard[user_id] = {"flow": "admin", "action": "withdraw", "step": "input"}
+        return Reply(
+            f"💸 Withdraw earnings\n\n"
+            f"Available: {earn}\n\n"
+            "Send the amount and your UPI id on one line, e.g.\n"
+            "`500 name@okaxis`\n\n"
+            "We'll pay it out and deduct it from your earnings. "
+            "If we decline, the money is put back.",
+            rows=((("✖️ Cancel", "a"),),),
+        )
+
+    def _apply_withdraw(self, user_id: str, body: str) -> Reply:
+        from ..reseller import request_withdraw
+        store = getattr(self.router, "platform_wallets", None) or self._store
+        if store is None:
+            return Reply("Earnings store is offline.", ok=False,
+                         rows=((("◀️ Back", "a"),),))
+        tokens = (body or "").strip().split()
+        if len(tokens) < 2:
+            return Reply(
+                "Format: <amount> <upi id> — e.g. `500 name@okaxis`.",
+                ok=False, rows=((("✖️ Cancel", "a"),),),
+            )
+        amount = self._parse_amount(tokens[0])
+        if amount is None:
+            # Allow amounts below ₹10 for small extras (min 1 rupee).
+            raw = tokens[0].replace("₹", "").replace(",", "").strip()
+            try:
+                from decimal import Decimal as _D
+                rupees = _D(raw)
+                if rupees <= 0:
+                    raise ValueError
+                amount = Money(int(rupees * 100))
+            except Exception:  # noqa: BLE001
+                return Reply("That doesn't look like an amount.",
+                             ok=False, rows=((("✖️ Cancel", "a"),),))
+        upi = tokens[1]
+        try:
+            wd_id = request_withdraw(store, user_id, amount, upi)
+        except ValueError as exc:
+            return Reply(str(exc), ok=False, rows=((("✖️ Cancel", "a"),),))
+        self._wizard.pop(user_id, None)
+        plat = getattr(self.router, "platform_owner_id", "") or ""
+        notify = (
+            ((plat,
+              f"💸 Clone payout request #{wd_id}: {amount} to `{upi}` "
+              f"from clone owner `{user_id}`."),)
+            if plat else ()
+        )
+        return Reply(
+            f"✅ Payout requested: {amount} to `{upi}`.\n"
+            f"Request id `{wd_id}`. We'll settle it and ping you.",
+            rows=((("◀️ Clone panel", "a"),),),
+            notify=notify,
+        )
+
+    def payouts_screen(self, user_id: str) -> Reply:
+        """Platform owner: pending clone-owner withdrawals."""
+        if not self.router._is_owner(user_id) or self._is_clone:
+            return Reply("Owner only.", ok=False, rows=((("🏠 Menu", "m"),),))
+        from ..reseller import pending_withdrawals
+        store = self._fg_store()
+        pending = pending_withdrawals(store) if store is not None else []
+        if not pending:
+            return Reply(
+                "💸 Clone payouts\n\nNothing waiting.",
+                rows=((("◀️ Owner panel", "a"),),),
+            )
+        lines = ["💸 Clone payouts waiting:"]
+        rows: list[tuple[tuple[str, str], ...]] = []
+        for w in pending[:15]:
+            amt = Money(int(w.get("amount_paise") or 0))
+            lines.append(
+                f"\n#{w.get('id')} · {amt} · `{w.get('upi')}` · owner `{w.get('owner_id')}`"
+            )
+            rows.append((
+                (f"✅ Paid #{w.get('id')}", f"apw:{w.get('id')}"),
+                (f"❌ Decline #{w.get('id')}", f"adw:{w.get('id')}"),
+            ))
+        rows.append((("◀️ Owner panel", "a"),))
+        return Reply("\n".join(lines), rows=tuple(rows))
+
+    def settle_payout(self, user_id: str, wd_id: str, *, paid: bool) -> Reply:
+        if not self.router._is_owner(user_id) or self._is_clone:
+            return Reply("Owner only.", ok=False)
+        from ..reseller import settle_withdraw
+        store = self._fg_store()
+        data = settle_withdraw(store, wd_id, paid=paid) if store is not None else None
+        if data is None:
+            return Reply("That request isn't pending.", ok=False,
+                         rows=((("💸 Payouts", "a:wd"),),))
+        amt = Money(int(data.get("amount_paise") or 0))
+        owner = str(data.get("owner_id") or "")
+        if paid:
+            note = f"✅ Marked paid — {amt} to `{data.get('upi')}`."
+            ping = f"🎉 Payout of {amt} sent to `{data.get('upi')}`."
+        else:
+            note = f"❌ Declined — {amt} returned to the clone owner's earnings."
+            ping = f"⚠️ Payout of {amt} was declined. The amount is back in your earnings."
+        fresh = self.payouts_screen(user_id)
+        return Reply(
+            f"{note}\n\n{fresh.text}",
+            rows=fresh.rows,
+            notify=((owner, ping),) if owner else (),
         )
 
     def _float_stats(self):
@@ -2074,6 +2279,12 @@ class MenuUI:
         gated = self._force_sub_gate(user_id, allow_check=(kind == "fs"))
         if gated is not None:
             return gated
+        if self._is_clone and self._clone_admin_blocked(kind, parts):
+            return Reply(
+                "That tool isn't on clone bots. Customers pay through our UPI; "
+                "you withdraw your extra from 💸 Withdraw.",
+                ok=False, rows=((("◀️ Clone panel", "a"),),),
+            )
         # Navigating away silently cancels any half-done top-up wizard; the
         # payment itself only exists once the screenshot lands, so nothing is lost.
         if kind not in {"t", "ap", "ad", "fg"} and user_id in self._wizard:
@@ -2098,6 +2309,8 @@ class MenuUI:
         if kind == "a" and len(parts) == 2:
             if parts[1] == "t":
                 return self.topups_screen(user_id)
+            if parts[1] == "wd":
+                return self.payouts_screen(user_id)
             if parts[1] == "qr":
                 return self.qr_screen(user_id)
             if parts[1] == "o":
@@ -2183,6 +2396,8 @@ class MenuUI:
                 return self._admin_input_prompt(user_id, "fg")
             if action == "fs":
                 return self._admin_input_prompt(user_id, "fs")
+            if action == "withdraw":
+                return self.withdraw_prompt(user_id)
             return self._badtap()
         if kind == "fs":
             if len(parts) == 2 and parts[1] == "ok":
@@ -2233,6 +2448,10 @@ class MenuUI:
             if not self._can_createbot():
                 return Reply("White-label bots are not enabled on this bot.",
                              ok=False, rows=((("🏠 Menu", "m"),),))
+            # Hub buttons (cb:hub:add / cb:hub:mine) go through the router
+            # callback path so they work without a pending create session.
+            if len(parts) >= 2:
+                return self.router.handle_callback(user_id, data)
             return self.router.handle(user_id, "/createbot")
         if kind == "nop":
             return Reply("Already handled.", rows=((("🏠 Menu", "m"),),))
@@ -2358,6 +2577,19 @@ class MenuUI:
                 (("🏠 Menu", "m"),),
             )
         return replace(reply, rows=rows)
+
+    @staticmethod
+    def _clone_admin_blocked(kind: str, parts: list[str]) -> bool:
+        """True for platform-only admin tools that clone owners must not use."""
+        if kind in {"ap", "ad", "apw", "adw"}:
+            return True
+        if kind == "a" and len(parts) >= 2 and parts[1] in {"t", "qr", "cb", "wd"}:
+            return True
+        if kind == "ax" and len(parts) >= 2 and parts[1] in {
+            "credit", "debit", "fg", "upi", "sunkcost", "provider", "metrics",
+        }:
+            return True
+        return False
 
     def _can_createbot(self) -> bool:
         return getattr(self.router, "subbots", None) is not None \

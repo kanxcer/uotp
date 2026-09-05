@@ -17,7 +17,7 @@ import uuid
 
 from ..catalog import Catalog
 from ..cancel_tracker import CancelTracker
-from ..createbot import CreateBotFlow, CreateBotResult
+from ..createbot import CB_HUB_ADD, CB_HUB_MINE, CreateBotFlow, CreateBotResult
 from ..economics import EconomicsError
 from ..engine import BotEngine
 from ..ledger import Ledger
@@ -120,6 +120,15 @@ class CommandRouter:
         maintenance_fn: Optional[Callable[[], bool]] = None,
         rate_limit: Optional[RateLimitConfig] = None,
         payment_notifier: Optional[object] = None,
+        is_clone: bool = False,
+        reseller_rate=None,
+        clone_bot_id: str = "",
+        platform_wallets: Optional[object] = None,
+        platform_owner_id: str = "",
+        margin_fee_rate=None,
+        clone_bot_token: str = "",
+        platform_bot_username: str = "",
+        bot_profile_applier=None,
     ) -> None:
         self.engine = engine
         # Owner panel sets this to pause buying during provider incidents:
@@ -151,6 +160,15 @@ class CommandRouter:
         #: path (Check status / I've paid tap) uses it so the QR is updated no
         #: matter which path credited the order.
         self.payment_notifier = payment_notifier
+        #: Clone (white-label) bot: sells our numbers at an extra %; no own API.
+        from decimal import Decimal as _Dec
+        self.is_clone = bool(is_clone)
+        self.reseller_rate = _Dec(reseller_rate or 0)
+        self.clone_bot_id = clone_bot_id or ""
+        self.platform_wallets = platform_wallets
+        self.platform_owner_id = platform_owner_id or ""
+        self.margin_fee_rate = _Dec(margin_fee_rate if margin_fee_rate is not None else "0.05")
+        self.clone_bot_token = clone_bot_token or ""
         #: The live MultiBotManager that runs one poller thread per sub-bot.
         #: Exposes ``running()`` / ``errors()`` so /mybots can report whether a
         #: white-label bot is ACTUALLY polling (a saved bot can still be dead if
@@ -161,9 +179,14 @@ class CommandRouter:
         #: bot" button about whether cloning is enabled. ``None`` means
         #: enabled (the historical behaviour when no UI owns the flag).
         self.createbot_enabled_fn: Optional[Callable[[], bool]] = None
+        self.platform_bot_username = (platform_bot_username or "").lstrip("@")
         self._createbot_flow: Optional[CreateBotFlow] = (
-            CreateBotFlow(subbots, platform_fee,
-                          token_verifier=bot_token_verifier)
+            CreateBotFlow(
+                subbots, platform_fee,
+                token_verifier=bot_token_verifier,
+                platform_username=self.platform_bot_username,
+                profile_applier=bot_profile_applier,
+            )
             if subbots is not None else None
         )
         #: Set by the transport once a sub-bot's poller is live, so /createbot
@@ -471,12 +494,26 @@ class CommandRouter:
     def handle_callback(self, user_id: str, data: str) -> Reply:
         """Route one inline-keyboard press from the transport.
 
-        Callback data can only advance or cancel a pending /createbot -- it
+        Hub buttons (My bots / Create) work without a pending session. Other
+        ``cb:*`` data can only advance or cancel a pending /createbot -- it
         cannot invoke any other command, so a forged press is inert.
         """
         if not self._authorised(user_id):
             return Reply("You are not authorised to use this bot.", ok=False)
-        if self._createbot_flow is None or not self._createbot_flow.pending(user_id):
+        if self._createbot_flow is None:
+            return Reply("That menu has expired. Send /createbot to start again.", ok=False)
+        if data == CB_HUB_ADD:
+            fn = getattr(self, "createbot_enabled_fn", None)
+            if callable(fn) and not fn():
+                return Reply(
+                    "🤖 'Run your own bot' is currently turned OFF by the owner. "
+                    "You can't create a clone right now.",
+                    ok=False,
+                )
+            return self._createbot_reply(self._createbot_flow.start(user_id))
+        if data == CB_HUB_MINE:
+            return self.cmd_mybots(user_id, [])
+        if not self._createbot_flow.pending(user_id):
             return Reply("That menu has expired. Send /createbot to start again.", ok=False)
         return self._createbot_reply(self._createbot_flow.on_button(user_id, data))
 
@@ -1150,6 +1187,26 @@ class CommandRouter:
         except Exception:  # noqa: BLE001 - a display cache must not block delivery
             pass
 
+    def _credit_clone_owner(self, clone_gross: Money) -> None:
+        """Credit the clone owner 95% of their extra (5% stays with us)."""
+        if not getattr(self, "is_clone", False):
+            return
+        store = getattr(self, "platform_wallets", None) or self.wallets
+        if store is None:
+            return
+        from ..reseller import credit_earnings, reseller_split
+        split = reseller_split(
+            clone_gross,
+            getattr(self, "reseller_rate", 0) or 0,
+            getattr(self, "margin_fee_rate", None) or 0,
+        )
+        if split.owner_share.is_zero:
+            return
+        try:
+            credit_earnings(store, self.owner_id, split.owner_share)
+        except Exception:  # noqa: BLE001 - never block a customer delivery
+            log.exception("clone earnings credit failed for %s", self.owner_id)
+
     def _record_order(self, user_id: str, slug: str, price: Money, result,
                       *, keep_active: bool = False) -> None:
         """Persist a durable order row for history + per-order profit.
@@ -1163,6 +1220,8 @@ class CommandRouter:
         """
         store = self.wallets
         rec = getattr(store, "record_order", None)
+        if result.success:
+            self._credit_clone_owner(price)
         if not callable(rec):
             return
         # Rich history fields: status/reason, what was refunded, what the
@@ -1234,10 +1293,10 @@ class CommandRouter:
                 ok=False,
             )
         if args:
-            # `/createbot <token>` is accepted as a shortcut.
+            # `/createbot <token>` is accepted as a shortcut past the hub.
             self._createbot_flow.start(user_id)
             return self._createbot_reply(self._createbot_flow.on_text(user_id, args[0]))
-        return self._createbot_reply(self._createbot_flow.start(user_id))
+        return self._createbot_reply(self._createbot_flow.hub())
 
     def cmd_cancel(self, user_id: str, args: list[str]) -> Reply:
         if self._createbot_flow and self._createbot_flow.pending(user_id):
@@ -1247,9 +1306,14 @@ class CommandRouter:
 
     def cmd_mybots(self, user_id: str, args: list[str]) -> Reply:
         assert self.subbots is not None
+        add_row = ((("➕ Create / add bot", CB_HUB_ADD),),)
         bots = self.subbots.for_owner(user_id)
         if not bots:
-            return Reply("You have no bots yet. Send /createbot to make one.", ok=False)
+            return Reply(
+                "You have no bots yet. Tap ➕ Create / add bot to make one.",
+                ok=False,
+                rows=add_row,
+            )
         # Live poller health from the running manager, so a bot that is saved in
         # the registry but whose poller crashed / token is invalid shows as DOWN
         # with a reason instead of looking fine.
@@ -1277,11 +1341,14 @@ class CommandRouter:
             err = errors.get(b.id)
             if err:
                 state += f" — {err}"
-            fee = (
-                "no platform fee"
-                if b.mode.value == "platform_api"
-                else f"platform fee {b.fee.describe()}"
-            )
+            extra = getattr(b, "reseller_rate", None)
+            if b.mode.value == "platform_api":
+                if extra:
+                    fee = f"extra {extra:.0%} on our prices · we keep 5% of extra"
+                else:
+                    fee = "platform numbers, no extra set"
+            else:
+                fee = f"platform fee {b.fee.describe()}"
             lines.append(f"{token} `{b.id}` - {mode}, {fee}, {state}")
         tip = (
             "\n\nA bot that is saved but not polling usually means the token "
@@ -1291,7 +1358,10 @@ class CommandRouter:
             if any("saved but NOT polling" in l for l in lines)
             else "\n\nManage with /stopbot and /deletebot."
         )
-        return Reply("Your bots:\n" + "\n".join(lines) + tip)
+        return Reply(
+            "Your bots:\n" + "\n".join(lines) + tip,
+            rows=add_row,
+        )
 
     def cmd_deletebot(self, user_id: str, args: list[str]) -> Reply:
         assert self.subbots is not None
@@ -1313,7 +1383,11 @@ class CommandRouter:
                     f"did not start ({type(exc).__name__}). Use /restart to try again.",
                     ok=False,
                 )
-        return Reply(result.reply, buttons=tuple(result.buttons))
+        return Reply(
+            result.reply,
+            buttons=tuple(result.buttons),
+            rows=tuple(result.rows) if getattr(result, "rows", None) else (),
+        )
 
     def cmd_report(self, user_id: str, args: list[str]) -> Reply:
         if not self._is_owner(user_id):
@@ -1415,6 +1489,12 @@ class CommandRouter:
         """💳 /credit <user_id> <amount> — add balance to a customer."""
         if not self._is_owner(user_id):
             return Reply("Owner only.", ok=False)
+        if getattr(self, "is_clone", False):
+            return Reply(
+                "Clone bots can't add or deduct balances. Customers pay "
+                "through our UPI.",
+                ok=False,
+            )
         if len(args) < 2:
             return Reply("Usage: /credit <user_id> <amount> (e.g. /credit 123456789 250)", ok=False)
         target, amount_s = args[0], args[1]
@@ -1437,6 +1517,12 @@ class CommandRouter:
         """↩️ /debit <user_id> <amount> — take back a balance (admin adjust)."""
         if not self._is_owner(user_id):
             return Reply("Owner only.", ok=False)
+        if getattr(self, "is_clone", False):
+            return Reply(
+                "Clone bots can't add or deduct balances. Customers pay "
+                "through our UPI.",
+                ok=False,
+            )
         if len(args) < 2:
             return Reply("Usage: /debit <user_id> <amount>", ok=False)
         target, amount_s = args[0], args[1]

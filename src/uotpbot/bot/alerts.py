@@ -17,15 +17,19 @@ import logging
 log = logging.getLogger("uotpbot.alert")
 
 
-def _telegram_http(app, method: str, payload: dict) -> tuple[bool, str]:
+def _telegram_http(app, method: str, payload: dict, *,
+                   token: str = "") -> tuple[bool, str]:
     """Call the Telegram Bot HTTP API synchronously (no event loop needed).
 
     python-telegram-bot >= 21 does not expose ``Application.loop``. The
     FamGateway webhook and the sweep run on OTHER threads, so they cannot
     ``await app.bot.*``. Posting to ``api.telegram.org`` works from any
     thread and is how we actually edit the QR / ping the owner in production.
+
+    ``token`` overrides the app bot token — clone-bot QR messages were sent
+    by the clone, so the edit must use that clone's token.
     """
-    token = getattr(getattr(app, "bot", None), "token", None)
+    token = token or getattr(getattr(app, "bot", None), "token", None)
     if not token:
         return False, "no-token"
     import json
@@ -136,16 +140,20 @@ class PaymentNotifier:
         """Capture the poller loop (called from PTB post_init, when it exists)."""
         self._loop = loop
 
-    def edit_order_message(self, chat_id, message_id: int, text: str) -> bool:
+    def edit_order_message(self, chat_id, message_id: int, text: str,
+                           *, bot_token: str = "") -> bool:
         """Edit the QR message in ``chat_id`` to ``text`` (success note).
 
         The QR is a PHOTO message with a caption + inline keyboard, so we edit
         the CAPTION (which Telegram allows and keeps the buttons); if that
         fails we fall back to editing the message text. Returns True when an
         edit succeeded.
+
+        ``bot_token`` is the token of the bot that SENT the QR (a clone's
+        token, not the platform bot's). Empty uses the attached app's token.
         """
         app = self._app
-        if app is None or chat_id is None or message_id is None:
+        if (app is None and not bot_token) or chat_id is None or message_id is None:
             log.info("[no-app] edit payment message for order skipped")
             return False
         try:
@@ -165,7 +173,8 @@ class PaymentNotifier:
                 "caption": text[:1024],
                 "reply_markup": done_markup,
             }
-            ok, err = _telegram_http(app, "editMessageCaption", payload)
+            ok, err = _telegram_http(app, "editMessageCaption", payload,
+                                    token=bot_token)
             if ok or "message is not modified" in err.lower():
                 log.info("payment message caption edited in chat %s", chat_id)
                 return True
@@ -175,7 +184,7 @@ class PaymentNotifier:
                 "message_id": int(message_id),
                 "text": text[:4096],
                 "reply_markup": done_markup,
-            })
+            }, token=bot_token)
             if ok2 or "message is not modified" in err2.lower():
                 log.info("payment message text edited in chat %s", chat_id)
                 return True
@@ -207,11 +216,20 @@ def pay_message(store, notifier, order_id: str, money) -> None:
         if not loc or ":" not in loc:
             return
         chat_id, msg_id = loc.split(":", 1)
+        bot_token = ""
+        try:
+            bot_token = (get_(f"fg_token:{order_id}") or "").strip()
+        except Exception:  # noqa: BLE001
+            bot_token = ""
         text = (
             "✅ Payment received!\n\n"
             f"{money} added to your balance.\n\n"
             "Tap 💰 Balance to see it, or start buying 🛒"
         )
-        notifier.edit_order_message(chat_id, int(msg_id), text)
+        try:
+            notifier.edit_order_message(
+                chat_id, int(msg_id), text, bot_token=bot_token)
+        except TypeError:
+            notifier.edit_order_message(chat_id, int(msg_id), text)
     except Exception as exc:  # noqa: BLE001 - the credit already happened
         log.warning("could not edit QR message for %s: %s", order_id, exc)

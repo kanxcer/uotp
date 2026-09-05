@@ -294,7 +294,12 @@ def test_createbot_conversation_is_not_hijacked_by_the_menu(rig):
     # Cloning is off by default; the owner enables it from the admin panel.
     ui.button(OWNER, "a:cb")
     assert ui.createbot_enabled() is True
-    start = ui.text(USER, "/createbot")
+    hub = ui.text(USER, "/createbot")
+    assert hub.ok
+    labels = " ".join(l for l, _ in all_buttons(hub))
+    assert "My bots" in labels
+    assert "Create" in labels or "add bot" in labels.lower()
+    start = ui.button(USER, "cb:hub:add")
     assert start.ok and "token" in start.text.lower()
     step = ui.text(USER, "123456:ABCDEF")  # an (invalid) token reaches the flow
     assert "token" in step.text.lower() or "valid" in step.text.lower()
@@ -852,6 +857,11 @@ def test_admin_toggle_clonebot_hides_and_blocks(rig):
     assert ui.createbot_enabled() is True
     assert ui._can_createbot() is True
     assert ("🤖 Run your own bot", "cb") in all_buttons(ui.main_menu(USER))
+    landing = ui.button(USER, "cb")
+    labs = " ".join(l for l, _ in all_buttons(landing))
+    assert "My bots" in labs
+    assert "Create" in labs or "add bot" in labs.lower()
+    assert "Paste the **bot token**" not in landing.text
 
     # Owner turns it back OFF.
     r2 = ui.button(OWNER, "a:cb")

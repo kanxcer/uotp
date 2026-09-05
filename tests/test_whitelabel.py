@@ -16,10 +16,16 @@ import pytest
 from uotpbot.catalog import Catalog, ServiceCost, WalletPack
 from uotpbot.createbot import (
     CB_CONFIRM,
+    CB_HUB_ADD,
+    CB_HUB_MINE,
+    CB_MARGIN_SUGGESTED,
     CB_OWN_API,
     CB_PLATFORM,
     CreateBotFlow,
     Step,
+    apply_clone_profile,
+    clone_about,
+    clone_description,
 )
 from uotpbot.engine import BotEngine, EngineConfig, EngineError
 from uotpbot.economics import EconomicsError
@@ -104,8 +110,11 @@ def test_own_api_disclosure_shows_rate_link_and_per_sale_charging():
 
 def test_platform_api_disclosure_states_zero_fee():
     bot = SubBot(owner_id="u", bot_token=GOOD_TOKEN, mode=SubBotMode.PLATFORM_API,
-                 fee=DEFAULT_PLATFORM_FEE)
-    assert "Platform fee: none" in bot.fee_disclosure()
+                 fee=DEFAULT_PLATFORM_FEE, reseller_rate=Decimal("0.38"))
+    text = bot.fee_disclosure()
+    assert "You cannot plug in your own UOTP API" in text
+    assert "38%" in text
+    assert "₹20.01" in text or "20.01" in text
 
 
 def test_disclosure_is_captured_at_creation_and_immutable():
@@ -268,6 +277,12 @@ def test_registry_round_trips_both_modes(tmp_path):
     assert found.fee.rate == Decimal("0.07")
     assert found.provider_key == "k" * 16
     assert found.disclosure == own.disclosure  # terms survive a restart
+    plat = SubBot(owner_id="u2", bot_token=GOOD_TOKEN_2,
+                  mode=SubBotMode.PLATFORM_API, fee=DEFAULT_PLATFORM_FEE,
+                  reseller_rate=Decimal("0.38"))
+    reopened.add(plat)
+    again = reopened.find(plat.id)
+    assert again.reseller_rate == Decimal("0.38")
     reopened.close()
 
 
@@ -335,9 +350,30 @@ def _stub_verifier(token, *, timeout=10.0):
     return True, "testbot"
 
 
+def _stub_profile(token, *, main_username=""):
+    """Offline stand-in: skip live setMyDescription / setMyShortDescription."""
+    return True, "ok"
+
+
 def make_flow(fee=None) -> tuple[CreateBotFlow, SubBotRegistry]:
     reg = SubBotRegistry()
-    return CreateBotFlow(reg, fee=fee, token_verifier=_stub_verifier), reg
+    return CreateBotFlow(
+        reg, fee=fee, token_verifier=_stub_verifier,
+        profile_applier=_stub_profile, platform_username="ycotpbot",
+    ), reg
+
+
+def _labels(reply) -> str:
+    labs = [l for l, _ in (getattr(reply, "buttons", ()) or ())]
+    for row in getattr(reply, "rows", ()) or ():
+        labs.extend(l for l, _ in row)
+    return " ".join(labs)
+
+
+def _start_create(router, uid="111"):
+    """Hub landing, then Create/add — the path a real tap takes."""
+    router.handle(uid, "/createbot")
+    return router.handle_callback(uid, CB_HUB_ADD)
 
 
 def test_flow_starts_by_asking_for_a_token():
@@ -346,6 +382,86 @@ def test_flow_starts_by_asking_for_a_token():
     assert "bot token" in result.reply.lower()
     assert "@BotFather" in result.reply
     assert flow.pending("u1").step == Step.AWAIT_TOKEN
+
+
+def test_hub_does_not_start_a_pending_session():
+    flow, _ = make_flow()
+    hub = flow.hub()
+    labels = " ".join(l for row in hub.rows for l, _ in row)
+    assert "My bots" in labels
+    assert "Create" in labels
+    assert flow.pending("u1") is None
+
+
+def test_clone_profile_copy_fits_telegram_limits_and_names_main_bot():
+    about = clone_about("ycotpbot")
+    desc = clone_description("ycotpbot")
+    assert len(about) <= 120
+    assert len(desc) <= 512
+    assert "@ycotpbot" in about
+    assert "@ycotpbot" in desc
+    assert "1,000+" in desc
+    assert "20 min" in desc
+    assert "Telegram" in desc and "WhatsApp" in desc
+    assert "Uber" in desc and "Blinkit" in desc and "Zomato" in desc
+    assert "/start" in desc
+    assert "Support" in desc
+    assert "auto-refund" in desc.lower() or "Auto-refund" in desc
+    longest_about = clone_about("x" * 32)
+    longest_desc = clone_description("x" * 32)
+    assert len(longest_about) <= 120
+    assert len(longest_desc) <= 512
+
+
+def test_apply_clone_profile_posts_about_and_description():
+    calls = []
+
+    def api(token, method, payload):
+        calls.append((token, method, payload))
+        return True, {"ok": True}
+
+    ok, reason = apply_clone_profile(GOOD_TOKEN, main_username="ycotpbot", api=api)
+    assert ok and reason == "ok"
+    methods = [c[1] for c in calls]
+    assert "setMyShortDescription" in methods
+    assert "setMyDescription" in methods
+    short = next(c[2] for c in calls if c[1] == "setMyShortDescription")
+    assert "@ycotpbot" in short["short_description"]
+    assert len(short["short_description"]) <= 120
+    body = next(c[2] for c in calls if c[1] == "setMyDescription")
+    assert "20" in body["description"]
+    assert len(body["description"]) <= 512
+
+
+def test_confirm_stamps_profile_on_the_new_bot():
+    seen = []
+
+    def applier(token, *, main_username=""):
+        seen.append((token, main_username))
+        return True, "ok"
+
+    flow, _ = make_flow()
+    flow._apply_profile = applier
+    flow._platform_username = "ycotpbot"
+    flow.start("u1")
+    flow.on_text("u1", GOOD_TOKEN)
+    flow.on_button("u1", CB_MARGIN_SUGGESTED)
+    done = flow.on_button("u1", CB_CONFIRM)
+    assert done.created is not None
+    assert seen == [(GOOD_TOKEN, "ycotpbot")]
+    assert "could not set" not in done.reply.lower()
+
+
+def test_profile_failure_does_not_block_creation():
+    flow, reg = make_flow()
+    flow._apply_profile = lambda token, *, main_username="": (False, "network")
+    flow.start("u1")
+    flow.on_text("u1", GOOD_TOKEN)
+    flow.on_button("u1", CB_MARGIN_SUGGESTED)
+    done = flow.on_button("u1", CB_CONFIRM)
+    assert done.created is not None
+    assert reg.count() == 1
+    assert "could not set" in done.reply.lower()
 
 
 def test_flow_rejects_a_malformed_token():
@@ -363,59 +479,56 @@ def test_flow_offers_both_modes_with_the_fee_named_up_front():
     result = flow.on_text("u1", GOOD_TOKEN)
     assert result.buttons
     labels = " ".join(label for label, _ in result.buttons)
-    assert "no % fee" in labels
-    assert "5%" in labels
-    assert flow.pending("u1").step == Step.AWAIT_MODE
+    assert "38%" in labels
+    assert "own" not in labels.lower() or "UOTP" in result.reply
+    assert flow.pending("u1").step == Step.AWAIT_MARGIN
+    assert "cannot add your own UOTP API" in result.reply
 
 
 def test_mode_button_label_follows_the_configured_fee():
-    """The label must not hardcode 5%: a configured 7% shown as 5% is a
-    misrepresentation that gets quoted back at you on the first dispute."""
+    """Own-API is retired: after the token we ask for extra %, not a fee mode."""
     fee = PlatformFee(rate=Decimal("0.07"))
     flow, _ = make_flow(fee=fee)
     flow.start("u1")
     result = flow.on_text("u1", GOOD_TOKEN)
     labels = " ".join(label for label, _ in result.buttons)
-    assert "7%" in labels and "5%" not in labels
+    assert "38%" in labels
+    assert "7%" not in labels
 
 
 def test_platform_path_discloses_then_creates():
     flow, reg = make_flow()
     flow.start("u1")
     flow.on_text("u1", GOOD_TOKEN)
-    shown = flow.on_button("u1", CB_PLATFORM)
-    assert "Platform fee: none" in shown.reply
+    shown = flow.on_button("u1", CB_MARGIN_SUGGESTED)
+    assert "You cannot plug in your own UOTP API" in shown.reply
+    assert "38%" in shown.reply
     assert reg.count() == 0  # not created until confirmed
 
     done = flow.on_button("u1", CB_CONFIRM)
     assert done.created is not None
     assert done.created.mode is SubBotMode.PLATFORM_API
+    assert done.created.reseller_rate == Decimal("0.38")
     assert reg.count() == 1
     assert flow.pending("u1") is None
 
 
 def test_own_api_path_shows_the_signup_link_and_the_fee_before_creation():
+    """Stale own-API buttons cancel; clones never take a provider key."""
     flow, reg = make_flow()
     flow.start("u1")
     flow.on_text("u1", GOOD_TOKEN)
     asked = flow.on_button("u1", CB_OWN_API)
-    assert API_SIGNUP_URL in asked.reply
-    assert "5%" in asked.reply
+    assert "own UOTP API is not available" in asked.reply
+    assert asked.finished
     assert reg.count() == 0
-
-    flow.on_text("u1", "k" * 20)
-    assert reg.count() == 0  # still awaiting confirmation
-    done = flow.on_button("u1", CB_CONFIRM)
-    assert done.created is not None
-    assert done.created.mode is SubBotMode.OWN_API
-    assert done.created.fee_on(INR(1000)) == INR(50)
 
 
 def test_declining_at_confirmation_creates_nothing():
     flow, reg = make_flow()
     flow.start("u1")
     flow.on_text("u1", GOOD_TOKEN)
-    flow.on_button("u1", CB_PLATFORM)
+    flow.on_button("u1", CB_MARGIN_SUGGESTED)
     result = flow.on_button("u1", "cb:createbot:abort")
     assert "Cancelled" in result.reply
     assert reg.count() == 0
@@ -434,7 +547,7 @@ def test_duplicate_token_is_refused():
     flow, reg = make_flow()
     flow.start("u1")
     flow.on_text("u1", GOOD_TOKEN)
-    flow.on_button("u1", CB_PLATFORM)
+    flow.on_button("u1", CB_MARGIN_SUGGESTED)
     flow.on_button("u1", CB_CONFIRM)
 
     flow.start("u2")
@@ -444,13 +557,14 @@ def test_duplicate_token_is_refused():
 
 
 def test_api_key_is_validated_before_use():
+    """Bad extra % is refused; the session stays on the margin step."""
     flow, reg = make_flow()
     flow.start("u1")
     flow.on_text("u1", GOOD_TOKEN)
-    flow.on_button("u1", CB_OWN_API)
     result = flow.on_text("u1", "ab")
-    assert "does not look like an API key" in result.reply
-    assert flow.pending("u1").step == Step.AWAIT_KEY
+    assert "percentage" in result.reply.lower()
+    assert flow.pending("u1").step == Step.AWAIT_MARGIN
+    assert reg.count() == 0
 
 
 def test_cancel_mid_flow_leaves_no_state():
@@ -752,22 +866,23 @@ def test_platform_fee_rate_is_read_from_the_environment(monkeypatch):
 
 
 def test_configured_rate_is_what_the_owner_is_shown(monkeypatch):
-    """What is configured, what is disclosed and what is charged must agree."""
+    """The extra-% they pick is locked on the bot; the 5% cut is of that extra."""
     from uotpbot.__main__ import _platform_fee
     from uotpbot.config import from_environment
 
     monkeypatch.setenv("UOTP_API_KEY", "dummy")
-    monkeypatch.setenv("PLATFORM_FEE_RATE", "0.12")
+    monkeypatch.setenv("PLATFORM_FEE_RATE", "0.05")
     fee = _platform_fee(from_environment())
     reg = SubBotRegistry()
     flow = CreateBotFlow(reg, fee, token_verifier=_stub_verifier)
     flow.start("u1")
     shown = flow.on_text("u1", GOOD_TOKEN)
-    assert "12% of each sale" in shown.reply
-    flow.on_button("u1", CB_OWN_API)
-    flow.on_text("u1", "k" * 20)
+    assert "38%" in shown.reply
+    assert "own UOTP API" in shown.reply
+    flow.on_text("u1", "38")
     created = flow.on_button("u1", CB_CONFIRM).created
-    assert created.fee_on(INR(1000)) == INR(120)
+    assert created.mode is SubBotMode.PLATFORM_API
+    assert created.reseller_rate == Decimal("0.38")
 
 
 @pytest.mark.parametrize("bad", ["1.5", "-0.2", "100"])
@@ -821,45 +936,62 @@ def _wl_router():
     registry = SubBotRegistry()
     router = CommandRouter(engine, catalog, pricer, ledger, owner_id="111",
                            allowed_users=("111",), subbots=registry,
-                           bot_token_verifier=_stub_verifier)
+                           bot_token_verifier=_stub_verifier,
+                           platform_bot_username="ycotpbot",
+                           bot_profile_applier=_stub_profile)
     return router, registry, ledger
+
+
+def test_createbot_command_opens_hub_not_token_paste():
+    router, _, ledger = _wl_router()
+    try:
+        hub = router.handle("111", "/createbot")
+        blob = hub.text + " " + _labels(hub)
+        assert "My bots" in blob
+        assert "Create" in blob or "add bot" in blob.lower()
+        assert "Paste the **bot token**" not in hub.text
+        start = router.handle_callback("111", CB_HUB_ADD)
+        assert "token" in start.text.lower()
+        mine = router.handle_callback("111", CB_HUB_MINE)
+        assert "no bots" in mine.text.lower()
+        assert any("Create" in l or "add bot" in l.lower() for l, _ in
+                   [item for row in (mine.rows or ()) for item in row])
+    finally:
+        ledger.close()
 
 
 def test_pasting_a_token_through_the_router_advances_the_flow():
     router, _, ledger = _wl_router()
     try:
-        start = router.handle("111", "/createbot")
+        start = _start_create(router)
         assert "token" in start.text.lower()
         reply = router.handle("111", GOOD_TOKEN)
         assert "UOTP bot" not in reply.text, "help text swallowed the token paste"
         assert "Token received" in reply.text
-        assert len(reply.buttons) == 2  # Reply must CARRY the buttons
+        assert len(reply.buttons) == 1  # 38% suggested
         assert router.handle("111", "hello").buttons or True  # no crash on junk
     finally:
         ledger.close()
 
 
 def test_full_own_api_flow_through_the_router_with_typed_choices():
-    """End to end over handle() with text choices only -- proves the flow is
-    completable even on a transport that cannot render buttons."""
+    """End to end over handle() with text choices only -- extra % not own API."""
     router, registry, ledger = _wl_router()
     try:
-        router.handle("111", "/createbot")
+        _start_create(router)
         router.handle("111", GOOD_TOKEN)
-        ask_key = router.handle("111", "2")
-        assert "API key" in ask_key.text and "uotp" in ask_key.text.lower()
-        disclosure = router.handle("111", "my-real-provider-key-9999")
+        disclosure = router.handle("111", "38")
         assert "Read this before you confirm" in disclosure.text
-        assert "5%" in disclosure.text  # the fee is named in what they accept
+        assert "38%" in disclosure.text
+        assert "own UOTP API" in disclosure.text
         created = router.handle("111", "yes")
         assert "created" in created.text.lower()
         assert registry.count() == 1
         bot = registry.all_active()[0]
-        assert bot.mode is SubBotMode.OWN_API
-        assert bot.fee.rate == Decimal("0.05")
-        # /mybots must never echo the owner's provider key back into chat.
+        assert bot.mode is SubBotMode.PLATFORM_API
+        assert bot.reseller_rate == Decimal("0.38")
         listing = router.handle("111", "/mybots")
-        assert "my-real-provider-key-9999" not in listing.text
+        assert "38%" in listing.text
     finally:
         ledger.close()
 
@@ -867,7 +999,7 @@ def test_full_own_api_flow_through_the_router_with_typed_choices():
 def test_unknown_slash_command_is_not_swallowed_by_a_pending_flow():
     router, _, ledger = _wl_router()
     try:
-        router.handle("111", "/createbot")
+        _start_create(router)
         reply = router.handle("111", "/frobnicate")
         assert not reply.ok and "Unknown command" in reply.text
     finally:
@@ -877,7 +1009,7 @@ def test_unknown_slash_command_is_not_swallowed_by_a_pending_flow():
 def test_cancel_from_midflow_works_through_the_router():
     router, registry, ledger = _wl_router()
     try:
-        router.handle("111", "/createbot")
+        _start_create(router)
         router.handle("111", GOOD_TOKEN)
         reply = router.handle("111", "/cancel")
         assert "Cancelled" in reply.text
@@ -891,10 +1023,10 @@ def test_cancel_from_midflow_works_through_the_router():
 def test_handle_callback_advances_the_flow_and_forced_presses_are_inert():
     router, registry, ledger = _wl_router()
     try:
-        router.handle("111", "/createbot")
+        _start_create(router)
         router.handle("111", GOOD_TOKEN)
-        shown = router.handle_callback("111", CB_PLATFORM)
-        assert "Platform fee: none" in shown.text
+        shown = router.handle_callback("111", CB_MARGIN_SUGGESTED)
+        assert "38%" in shown.text
         done = router.handle_callback("111", CB_CONFIRM)
         assert "created" in done.text.lower()
         assert registry.count() == 1
@@ -912,13 +1044,13 @@ def test_unauthorised_plain_text_cannot_advance_someone_elses_flow():
     owner's pending creation, no matter how valid it looks."""
     router, registry, ledger = _wl_router()
     try:
-        router.handle("111", "/createbot")
+        _start_create(router)
         router.handle("111", GOOD_TOKEN)
         router.handle("999", "888888888:AAFdeadbeefdeadbeefdeadbeefdead")
         router.handle_callback("999", CB_CONFIRM)
         assert registry.count() == 0
         # owner's flow is untouched and still completes
-        assert "API key" in router.handle("111", "2").text
+        assert "Read this before you confirm" in router.handle("111", "38").text
     finally:
         ledger.close()
 

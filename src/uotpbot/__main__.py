@@ -110,7 +110,15 @@ def _credit_fg_wallet(store, uid: str, order_id: str, amount_dec, *, notifier=No
 
     try:
         money = Money(int(amount_dec * Decimal(100)))
-        store.adjust(f"{uid}", money)
+        get_ = getattr(store, "kv_get", None)
+        scope = ""
+        if callable(get_):
+            try:
+                scope = (get_(f"fg_scope:{order_id}") or "").strip()
+            except Exception:  # noqa: BLE001
+                scope = ""
+        wallet_uid = f"{scope}:{uid}" if scope else f"{uid}"
+        store.adjust(wallet_uid, money)
         set_ = getattr(store, "kv_set", None)
         if callable(set_):
             set_(f"fg_credited:{order_id}", "1")
@@ -346,6 +354,7 @@ def _serve(settings: Settings) -> int:
             window_seconds=settings.rate_limit_window,
         ),
         payment_notifier=payment_notifier,
+        platform_bot_username=platform_username,
     )
 
     def router_factory() -> CommandRouter:
@@ -447,20 +456,42 @@ def _make_whitelabel(settings: Settings, catalog, ledger, pricer, wallets) -> Op
     def router_factory(bot):
         """One router per sub-bot.
 
-        OWN_API bots charge the platform fee, routed through the engine so the
-        split happens in the same place the sale is posted. PLATFORM_API bots
-        get no fee hook at all: their platform revenue is the wholesale spread.
+        New clones always sell our numbers at (our price × (1 + extra %)).
+        Customers pay our FamGateway. The engine posts the clone owner's
+        share as the platform-fee line so our P&L is net of what we owe them;
+        the same share is credited to their withdrawable earnings.
+        Legacy OWN_API bots (if any) still bill their own key.
         """
-        fee_fn = bot.fee.on if bot.mode.value == "own_api" else None
+        from decimal import Decimal as _Dec
+        from .pricing import ResellerPricer
+        from .reseller import reseller_split
+
+        extra = _Dec(getattr(bot, "reseller_rate", 0) or 0)
+        clone_pricer = ResellerPricer(pricer, extra) if extra > 0 else pricer
+        fee_rate = bot.fee.rate
+
+        def fee_fn(gross):
+            if bot.mode.value == "own_api":
+                return bot.fee.on(gross)
+            return reseller_split(gross, extra, fee_rate).owner_share
+
+        use_fee = fee_fn if (bot.mode.value == "own_api" or extra > 0) else None
         sub_engine = BotEngine(
-            catalog, _provider_for(bot, settings), ledger, pricer,
+            catalog, _provider_for(bot, settings), ledger, clone_pricer,
             fees=settings.fees, config=settings.engine,
-            platform_fee_fn=fee_fn, fee_disclosure=bot.disclosure,
+            platform_fee_fn=use_fee, fee_disclosure=bot.disclosure,
         )
         return CommandRouter(
-            sub_engine, catalog, pricer, ledger,
+            sub_engine, catalog, clone_pricer, ledger,
             owner_id=bot.owner_id, allowed_users=(),
             wallets=ScopedWallets(wallets, bot.id),
+            is_clone=True,
+            reseller_rate=extra,
+            clone_bot_id=bot.id,
+            platform_wallets=wallets,
+            platform_owner_id=settings.owner_id,
+            margin_fee_rate=fee_rate,
+            clone_bot_token=bot.bot_token,
         )
 
     manager = MultiBotManager(registry, router_factory,
@@ -497,7 +528,14 @@ def _run_subbot(bot, router, settings: Settings) -> None:
 
     # Sub-bots get the same button UI; their router has subbots=None, so the
     # nested "Run your own bot" entry hides itself automatically.
-    frontend = TelegramFrontend(router, bot_token=getattr(bot, "bot_token", "") or "")
+    frontend = TelegramFrontend(
+        router,
+        bot_token=getattr(bot, "bot_token", "") or "",
+        famgateway_api_key=getattr(settings, "famgateway_api_key", "") or "",
+        famgateway_base_url=getattr(settings, "famgateway_base_url",
+                                    "https://famgateway.in"),
+        public_url=getattr(settings, "public_url", "") or "",
+    )
     app = Application.builder().token(bot.bot_token).build()
     app.add_handler(CallbackQueryHandler(frontend.on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, frontend.on_message))
