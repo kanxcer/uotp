@@ -323,6 +323,12 @@ def _serve(settings: Settings) -> int:
     wallets = make_wallets(settings)
     subbots = _make_whitelabel(settings, catalog, ledger, pricer, wallets)
 
+    # Bridge that edits a customer's QR message to a success note when a payment
+    # is confirmed. Must exist BEFORE the router so every credit path (webhook,
+    # sweep AND the customer's own Check status tap) can reach it.
+    from .bot.alerts import PaymentNotifier
+    payment_notifier = PaymentNotifier()
+
     # One persistent router for the platform bot (sub-bots each get their own
     # inside _make_whitelabel). Holding it lets the health server read Phase-1
     # subsystem stats (rate limiter + cancel tracker) on /metrics.
@@ -347,11 +353,10 @@ def _serve(settings: Settings) -> int:
 
     # Phase-1 provider wallet monitor (P2): alert the owner BEFORE the wallet
     # runs dry, so an order never dies to NO_BALANCE mid-bulk.
-    from .bot.alerts import OwnerAlert, PaymentNotifier
+    from .bot.alerts import OwnerAlert
     from .wallet_monitor import WalletMonitor
 
     owner_alert = OwnerAlert(settings.owner_id)
-    payment_notifier = PaymentNotifier()
     wallet_monitor = WalletMonitor(
         provider, notify_owner=owner_alert.send,
         check_interval=float(settings.wallet_monitor_seconds),
