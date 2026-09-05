@@ -267,15 +267,16 @@ def test_createbot_conversation_is_not_hijacked_by_the_menu(rig):
     assert "What would you like to do" not in step.text
 
 
-def test_low_balance_wallet_card_shows_add_money_nudge(rig):
-    """A wallet balance below the cheapest floored sticker gets a clear
-    'add at least ₹X' nudge on the wallet card, so a near-empty balance is
-    never a silent dead end."""
+def test_low_balance_wallet_card_has_no_price_hint(rig):
+    """The wallet card must NOT reveal the cheapest service price nor nag with
+    'add at least ₹X' -- that exposed internal pricing and assumed an amount.
+    It just states the balance and still offers the add-money action."""
     ui, router, *_ = rig
     router.credit(USER, INR(5))
     card = ui.button(USER, "w")
-    assert "Add at least" in card.text
-    # the add-money button is on the card (rows, not text)
+    assert "Add at least" not in card.text
+    assert "cheapest" not in card.text
+    # the add-money button is on the card (rows, not text) - not a dead end
     labels = [label for row in card.rows for label, _ in row]
     assert "➕ Add money" in labels
 
@@ -459,6 +460,16 @@ def test_favourites_flow_star_toggle_and_card(rig):
     # The menu shows the count on the Favourites button itself.
     m_labels = [lbl for row in ui.main_menu(USER).rows for lbl, _d in row]
     assert any("Favourites (1)" in lbl for lbl in m_labels), m_labels
+    # Tapping a favourite opens the SERVICE CARD (s:slug), which shows a server
+    # picker for multi-server services -- never an instant `y:slug` buy.
+    f_buttons = dict((lbl, d) for lbl, d in all_buttons(reply))
+    open_data = f_buttons.get("🎯 Open · ₹15.00")
+    assert open_data == "s:telegram", \
+        "a favourite must open the service/server picker, not buy directly"
+    assert "y:telegram" not in f_buttons.values(), \
+        "a favourite must never trigger an instant buy without a server pick"
+    opened = ui.button(USER, open_data)
+    assert "Telegram" in opened.text  # lands on the service card
     # Unstar via the favourites card "Remove" button.
     assert "fvt:telegram" in datas(reply)
     ui.toggle_favourite(USER, "telegram")

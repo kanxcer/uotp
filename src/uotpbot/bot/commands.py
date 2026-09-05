@@ -115,6 +115,7 @@ class CommandRouter:
         bot_token_verifier: Optional[Callable[[str], tuple[bool, str]]] = None,
         maintenance_fn: Optional[Callable[[], bool]] = None,
         rate_limit: Optional[RateLimitConfig] = None,
+        payment_notifier: Optional[object] = None,
     ) -> None:
         self.engine = engine
         # Owner panel sets this to pause buying during provider incidents:
@@ -141,6 +142,11 @@ class CommandRouter:
         #: than silently running it against an in-memory store that loses every
         #: bot on restart.
         self.subbots = subbots
+        #: Bridge that edits a customer's QR message to a success note when a
+        #: payment is confirmed. Wired from the serve layer; the UI's credit
+        #: path (Check status / I've paid tap) uses it so the QR is updated no
+        #: matter which path credited the order.
+        self.payment_notifier = payment_notifier
         #: The live MultiBotManager that runs one poller thread per sub-bot.
         #: Exposes ``running()`` / ``errors()`` so /mybots can report whether a
         #: white-label bot is ACTUALLY polling (a saved bot can still be dead if

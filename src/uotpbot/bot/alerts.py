@@ -110,3 +110,33 @@ class PaymentNotifier:
         except Exception as exc:  # noqa: BLE001 - never kill a caller
             log.error("payment message edit failed: %s", exc)
             return False
+
+
+def pay_message(store, notifier, order_id: str, money) -> None:
+    """Edit a customer's QR message to a success note after a confirmed payment.
+
+    Shared by every credit path (webhook, background sweep, AND the customer's
+    own 'Check status' / 'I've paid' tap) so the QR is always updated in place
+    the moment the money lands. ``store`` holds the ``fg_msg:<order>`` location
+    the bot recorded when it sent the QR; missing value or notifier just skips
+    the edit (the credit already happened, and Check status still works).
+    Best-effort: never raises into a caller.
+    """
+    if notifier is None:
+        return
+    get_ = getattr(store, "kv_get", None)
+    if not callable(get_):
+        return
+    try:
+        loc = get_(f"fg_msg:{order_id}")
+        if not loc or ":" not in loc:
+            return
+        chat_id, msg_id = loc.split(":", 1)
+        text = (
+            "✅ Payment received!\n\n"
+            f"{money} added to your balance.\n\n"
+            "Tap 💰 Balance to see it, or start buying 🛒"
+        )
+        notifier.edit_order_message(chat_id, int(msg_id), text)
+    except Exception as exc:  # noqa: BLE001 - the credit already happened
+        log.warning("could not edit QR message for %s: %s", order_id, exc)

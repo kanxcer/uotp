@@ -216,7 +216,7 @@ class MenuUI:
             except Exception:  # noqa: BLE001 - a removed service shouldn't blank it
                 continue
             lines.append(f"{_emoji(slug)} {name} · {price}")
-            rows.append(((f"✅ Buy · {price}", f"y:{slug}"),
+            rows.append(((f"🎯 Open · {price}", f"s:{slug}"),
                          ("★ Remove", f"fvt:{slug}")))
         rows.append((("🛒 Browse services", "l"), ("🏠 Menu", "m")))
         return Reply("\n".join(lines), rows=tuple(rows))
@@ -508,6 +508,23 @@ class MenuUI:
             return None
         get = getattr(store, "kv_get", None)
         return get("pay_qr_file_id") if callable(get) else None
+
+    def _edit_paid_message(self, store, order_id: str, money) -> None:
+        """Edit a customer's QR message to a success note after a credit.
+
+        Reached by the customer's own 'Check status' / 'I've paid' tap (the
+        webhook/sweep path uses the same helper via alerts.pay_message). Routes
+        through the router's PaymentNotifier if wired; the credit is already
+        done, so a missing message or notifier simply skips the edit.
+        """
+        notifier = getattr(self.router, "payment_notifier", None)
+        if notifier is None:
+            return
+        try:
+            from .alerts import pay_message
+            pay_message(store, notifier, order_id, money)
+        except Exception:  # noqa: BLE001 - the credit already happened
+            pass
 
     def remember_fg_message(self, order_id: str, chat_id, message_id) -> None:
         """Record where a FamGateway QR message was sent so the webhook/sweep
@@ -812,19 +829,13 @@ class MenuUI:
 
     def wallet_card(self, user_id: str) -> Reply:
         balance = self.router.balance_of(user_id)
-        floor = self.catalog.cheapest_sticker()
-        nudge = ""
-        if floor is not None and balance.paise < floor.paise:
-            short = Money(floor.paise - balance.paise)
-            nudge = (
-                f"\n\n⚠️ Your balance is below the cheapest service (from {floor}). "
-                f"Add at least {short} to start buying.\n"
-                "Top up via UPI — it is credited after a quick check."
-            )
+        # Deliberately NO "cheapest service" / "you need ₹X" hint here: it
+        # revealed internal pricing to the customer and assumed an amount to
+        # top up. The balance screen just states the balance and offers actions.
         return Reply(
             f"💰 Your balance: {balance}\n\n"
             "Every successful top-up is credited here and never expires.\n"
-            "Refunds land here automatically." + nudge,
+            "Refunds land here automatically.",
             rows=(
                 (("➕ Add money", "t"), ("🧾 Transaction history", "tx")),
                 (("🛒 Buy a number", "l"),),
@@ -1280,6 +1291,9 @@ class MenuUI:
             if callable(set_):
                 set_(key, "1")
             self._fg_orders.pop(order_id, None)
+            # Edit the QR message the customer was looking at to a success note
+            # so they SEE the credit instantly (same as the webhook/sweep path).
+            self._edit_paid_message(store, order_id, money)
             return Reply(
                 f"✅ Payment received! {money} added to your balance\n"
                 f"({self.router.balance_of(uid)} now).\n\n"

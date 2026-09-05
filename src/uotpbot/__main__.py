@@ -132,24 +132,8 @@ def _notify_paid(store, order_id: str, money, notifier) -> None:
     stored message location, or a failure means we simply don't edit -- the
     credit is already done and 'Check status' still works.
     """
-    if notifier is None:
-        return
-    get_ = getattr(store, "kv_get", None)
-    if not callable(get_):
-        return
-    try:
-        loc = get_(f"fg_msg:{order_id}")
-        if not loc or ":" not in loc:
-            return
-        chat_id, msg_id = loc.split(":", 1)
-        text = (
-            "✅ Payment received!\n\n"
-            f"{money} added to your balance.\n\n"
-            "Tap 💰 Balance to see it, or start buying 🛒"
-        )
-        notifier.edit_order_message(chat_id, int(msg_id), text)
-    except Exception as exc:  # noqa: BLE001 - the credit already happened
-        log.warning("could not edit QR message for %s: %s", order_id, exc)
+    from .bot.alerts import pay_message
+    pay_message(store, notifier, order_id, money)
 
 
 def _live_fg_key(store, env_key: str) -> str:
@@ -355,6 +339,7 @@ def _serve(settings: Settings) -> int:
             max_buys=settings.rate_limit_max_buys,
             window_seconds=settings.rate_limit_window,
         ),
+        payment_notifier=payment_notifier,
     )
 
     def router_factory() -> CommandRouter:
