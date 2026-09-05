@@ -207,6 +207,15 @@ def _normalize_rows(rows) -> list[list[tuple[str, str]]]:
     return [pairs_of(r) for r in rows]
 
 
+def _inline_button(label: str, data: str):
+    """One inline button: ``url:https://...`` becomes a URL button, else callback."""
+    if isinstance(data, str) and data.startswith("url:"):
+        url = data[4:].strip()
+        if url:
+            return InlineKeyboardButton(label, url=url)
+    return InlineKeyboardButton(label, callback_data=data)
+
+
 def _reply_markup(reply) -> object:
     """Turn a Reply's buttons into an inline keyboard.
 
@@ -221,15 +230,112 @@ def _reply_markup(reply) -> object:
     rows = _normalize_rows(getattr(reply, "rows", ()) or ())
     if rows:
         return InlineKeyboardMarkup([
-            [InlineKeyboardButton(label, callback_data=data) for label, data in row]
+            [_inline_button(label, data) for label, data in row]
             for row in rows
         ])
     buttons = getattr(reply, "buttons", ()) or ()
     if not buttons:
         return None
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(label, callback_data=data)] for label, data in buttons
+        [_inline_button(label, data)] for label, data in buttons
     ])
+
+
+def _forwarded_channel_ref(message: Any) -> Optional[str]:
+    """@username or numeric id of a forwarded channel post, else None."""
+    chat = getattr(message, "forward_from_chat", None)
+    if chat is None:
+        origin = getattr(message, "forward_origin", None)
+        chat = getattr(origin, "chat", None)
+    if chat is None:
+        return None
+    ctype = str(getattr(chat, "type", "") or "")
+    if ctype not in ("channel", "supergroup"):
+        return None
+    username = (getattr(chat, "username", None) or "").strip()
+    if username:
+        return "@" + username.lstrip("@")
+    cid = getattr(chat, "id", None)
+    return str(cid) if cid is not None else None
+
+
+def _bot_api(token: str, method: str, payload: dict) -> tuple[bool, dict]:
+    """Synchronous Telegram Bot HTTP API call. Never raises."""
+    import json
+    import urllib.error
+    import urllib.request
+
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = json.loads(resp.read().decode() or "{}")
+            return bool(body.get("ok")), body if isinstance(body, dict) else {}
+    except urllib.error.HTTPError as exc:
+        try:
+            body = json.loads(exc.read().decode() or "{}")
+            return False, body if isinstance(body, dict) else {"description": str(exc)}
+        except Exception:
+            return False, {"description": str(exc)}
+    except Exception as exc:  # noqa: BLE001
+        return False, {"description": str(exc)}
+
+
+def attach_force_sub_checks(ui, token: str) -> None:
+    """Wire live Telegram getChat / getChatMember into the UI force-sub gate.
+
+    The UI stays transport-free: these callables are the only Telegram I/O.
+    """
+    if not token or ui is None:
+        return
+
+    def chat_info(chat: str) -> dict:
+        ok, body = _bot_api(token, "getChat", {"chat_id": chat})
+        if not ok:
+            return {"ok": False, "error": str((body or {}).get("description") or "getChat failed")}
+        result = body.get("result") or {}
+        me_ok, me = _bot_api(token, "getMe", {})
+        bot_id = (me.get("result") or {}).get("id") if me_ok else None
+        admin = False
+        if bot_id is not None:
+            m_ok, mbody = _bot_api(token, "getChatMember", {
+                "chat_id": chat, "user_id": int(bot_id),
+            })
+            st = str(((mbody.get("result") or {}).get("status") if m_ok else "") or "")
+            admin = st in ("administrator", "creator")
+        username = (result.get("username") or "").strip()
+        invite = (result.get("invite_link") or "").strip()
+        if not invite and username:
+            invite = f"https://t.me/{username}"
+        return {
+            "ok": True,
+            "id": str(result.get("id") or chat),
+            "title": result.get("title") or username or str(chat),
+            "username": username,
+            "invite_link": invite,
+            "bot_is_admin": admin,
+        }
+
+    def member(chat: str, user_id: str) -> str:
+        try:
+            uid = int(str(user_id))
+        except (TypeError, ValueError):
+            return "left"
+        ok, body = _bot_api(token, "getChatMember", {"chat_id": chat, "user_id": uid})
+        if not ok:
+            desc = str((body or {}).get("description") or "").lower()
+            if any(s in desc for s in ("user not found", "chat not found",
+                                       "kicked", "member list is inaccessible",
+                                       "bot is not a member")):
+                return "left"
+            return "error"
+        return str((body.get("result") or {}).get("status") or "left")
+
+    ui.chat_info_fn = chat_info
+    ui.chat_member_fn = member
 
 
 class TelegramFrontend:
@@ -245,6 +351,7 @@ class TelegramFrontend:
         famgateway_api_key: str = "",
         famgateway_base_url: str = "https://famgateway.in",
         public_url: str = "",
+        bot_token: str = "",
     ) -> None:
         self.router = router
         self.ui = ui or MenuUI(
@@ -253,6 +360,8 @@ class TelegramFrontend:
             famgateway_base_url=famgateway_base_url,
             public_url=public_url,
         )
+        if bot_token:
+            attach_force_sub_checks(self.ui, bot_token)
         # /buy (typed) and button buys must agree on maintenance mode:
         # the flag lives in the UI's store; the router just consults it.
         self.router.maintenance_fn = self.ui.maintenance_on
@@ -269,11 +378,22 @@ class TelegramFrontend:
         cross-thread use.
         """
         message = getattr(update, "message", None) or getattr(update, "edited_message", None)
-        if message is None or not getattr(message, "text", None):
+        if message is None:
             return
         user = getattr(message, "from_user", None)
         user_id = str(getattr(user, "id", "")) if user else ""
         if not user_id:
+            return
+        # Owner setting force-sub can forward a channel post instead of typing
+        # @username — that's the reliable way to capture a private channel id.
+        fwd = _forwarded_channel_ref(message)
+        if fwd:
+            wizard = (getattr(self.ui, "_wizard", None) or {}).get(user_id) or {}
+            if wizard.get("flow") == "admin" and wizard.get("action") == "fs":
+                reply = await _run_offloop(self.ui.text, user_id, fwd)
+                await self._deliver_reply(message, reply)
+                return
+        if not getattr(message, "text", None):
             return
         reply = await _run_offloop(self.ui.text, user_id, message.text)
         deferred = getattr(reply, "deferred", None)
@@ -645,6 +765,7 @@ def build_from_settings(settings: Settings, router_factory: Any) -> Any:
         raise RuntimeError(
             "python-telegram-bot is not installed. Run: pip install 'uotpbot[telegram]'"
         )
+    token = settings.require_telegram()
     frontend = TelegramFrontend(
         router_factory(),
         support_contact=getattr(settings, "support_contact", ""),
@@ -653,6 +774,7 @@ def build_from_settings(settings: Settings, router_factory: Any) -> Any:
         famgateway_base_url=getattr(settings, "famgateway_base_url",
                                     "https://famgateway.in"),
         public_url=getattr(settings, "public_url", ""),
+        bot_token=token,
     )
     # Durable refunds: boot the retry worker so any refund left pending by an
     # earlier crash/redeploy is credited now (idempotent; safe on rebuilds).

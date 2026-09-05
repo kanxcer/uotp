@@ -497,7 +497,7 @@ def _run_subbot(bot, router, settings: Settings) -> None:
 
     # Sub-bots get the same button UI; their router has subbots=None, so the
     # nested "Run your own bot" entry hides itself automatically.
-    frontend = TelegramFrontend(router)
+    frontend = TelegramFrontend(router, bot_token=getattr(bot, "bot_token", "") or "")
     app = Application.builder().token(bot.bot_token).build()
     app.add_handler(CallbackQueryHandler(frontend.on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, frontend.on_message))

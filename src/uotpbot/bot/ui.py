@@ -17,7 +17,9 @@ postings exist in precisely one place.
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 import time
 from dataclasses import replace
 from decimal import Decimal
@@ -199,6 +201,19 @@ class MenuUI:
         #: just makes the customer re-tap Add Money, it never loses money
         #: (rows are written only after the screenshot lands).
         self._wizard: dict[str, dict] = {}
+        #: Force-subscribe channel. Empty chat = off. Persisted in kv;
+        #: this dict is the in-memory fallback for tests / no store.
+        self._force_sub_memory: dict[str, str] = {
+            "chat": "", "title": "", "username": "", "link": "",
+        }
+        #: Injected by the Telegram transport: (chat_id, user_id) -> member
+        #: status string (creator/administrator/member/restricted/left/kicked/error).
+        self.chat_member_fn: Optional[Callable[[str, str], str]] = None
+        #: Injected: chat identifier -> {ok, id, title, username, invite_link, bot_is_admin}.
+        self.chat_info_fn: Optional[Callable[[str], dict]] = None
+        #: user_id -> (epoch, is_member). Short TTL so a join is picked up
+        #: quickly without calling getChatMember on every tap.
+        self._fs_cache: dict[str, tuple[float, bool]] = {}
 
     def favourites_card(self, user_id: str) -> Reply:
         """⭐ Favourites: the services this customer starred, each buyable."""
@@ -498,6 +513,269 @@ class MenuUI:
             )
         return None
 
+    # -- force subscribe --------------------------------------------------
+    _FS_TTL = 90.0
+    _FS_MEMBER = frozenset({"creator", "administrator", "member", "restricted"})
+
+    def force_sub_config(self) -> Optional[dict[str, str]]:
+        """The live force-sub channel, or None when the feature is off."""
+        data = dict(self._force_sub_memory)
+        store = self._store_for_kv()
+        if store is not None:
+            try:
+                raw = store.kv_get("force_sub") or ""
+                if raw:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict):
+                        data.update({k: str(parsed.get(k) or "") for k in
+                                     ("chat", "title", "username", "link")})
+            except Exception:  # noqa: BLE001
+                pass
+        chat = (data.get("chat") or "").strip()
+        if not chat:
+            return None
+        return data
+
+    def _set_force_sub(self, cfg: Optional[dict[str, str]]) -> None:
+        payload = {"chat": "", "title": "", "username": "", "link": ""}
+        if cfg and (cfg.get("chat") or "").strip():
+            payload = {k: str(cfg.get(k) or "").strip() for k in payload}
+        self._force_sub_memory = payload
+        self._fs_cache.clear()
+        store = self._store_for_kv()
+        if store is not None:
+            try:
+                store.kv_set("force_sub", json.dumps(payload))
+            except Exception:  # noqa: BLE001
+                pass
+
+    def force_sub_label(self) -> str:
+        cfg = self.force_sub_config()
+        if not cfg:
+            return "off"
+        handle = cfg.get("username") or ""
+        if handle:
+            return "ON · @" + handle.lstrip("@")
+        title = cfg.get("title") or cfg.get("chat") or ""
+        return f"ON · {title}" if title else "ON"
+
+    @staticmethod
+    def _parse_channel(raw: str) -> Optional[str]:
+        """Normalise owner input to ``@username`` / ``-100id``, or ``''`` to disable.
+
+        Returns None when the input isn't a channel at all (e.g. an invite
+        hash with no chat id — getChatMember cannot use those).
+        """
+        s = (raw or "").strip()
+        if not s:
+            return None
+        if s.lower() in ("off", "disable", "none", "clear", "-", "0"):
+            return ""
+        s = s.replace("https://", "").replace("http://", "")
+        s = s.replace("www.", "")
+        for prefix in ("t.me/", "telegram.me/", "telegram.dog/"):
+            if s.lower().startswith(prefix):
+                s = s[len(prefix):]
+                break
+        s = s.strip().strip("/")
+        if not s or s.startswith("+") or s.lower().startswith("joinchat"):
+            return None
+        if s.startswith("@"):
+            name = s[1:].split("/", 1)[0]
+            return f"@{name}" if name else None
+        if s.replace("-", "").isdigit():
+            if s.startswith("-"):
+                return s
+            # Channel ids are -100… ; a pasted 100… is the same id unsigned.
+            if s.startswith("100") and len(s) >= 10:
+                return "-" + s
+            return s
+        # Bare public username.
+        name = s.split("/", 1)[0]
+        if re.match(r"^[A-Za-z][A-Za-z0-9_]{3,31}$", name):
+            return "@" + name
+        return None
+
+    def _is_force_subscribed(self, user_id: str, *, fresh: bool = False) -> bool:
+        """True when the user is a member of the force-sub channel (or feature off)."""
+        cfg = self.force_sub_config()
+        if not cfg:
+            return True
+        chat = cfg.get("chat") or ""
+        if not chat:
+            return True
+        now = self._now()
+        if not fresh:
+            hit = self._fs_cache.get(user_id)
+            if hit is not None and now - hit[0] < self._FS_TTL:
+                return hit[1]
+        fn = self.chat_member_fn
+        if not callable(fn):
+            # No Telegram wire (tests without a stub): treat as NOT joined so
+            # the gate is actually exercised. Production always injects fn.
+            joined = False
+        else:
+            try:
+                status = str(fn(chat, user_id) or "")
+            except Exception:  # noqa: BLE001 - never freeze the shop
+                log.warning("force-sub membership check failed", exc_info=True)
+                status = "error"
+            if status in self._FS_MEMBER:
+                joined = True
+            elif status == "error":
+                # Telegram blip: fail OPEN so a getChatMember outage does not
+                # lock paying customers out. Left/kicked still block.
+                log.warning("force-sub check errored for %s; allowing this tap", user_id)
+                joined = True
+            else:
+                joined = False
+        self._fs_cache[user_id] = (now, joined)
+        return joined
+
+    def _force_sub_prompt(self, *, again: bool = False) -> Reply:
+        cfg = self.force_sub_config() or {}
+        handle = (cfg.get("username") or "").lstrip("@")
+        title = cfg.get("title") or (f"@{handle}" if handle else "our channel")
+        link = (cfg.get("link") or "").strip()
+        if not link and handle:
+            link = f"https://t.me/{handle}"
+        lead = (
+            "⚠️ You're not in the channel yet. Join, then tap ✅ I've joined."
+            if again else
+            "🔒 Join our channel to use this bot."
+        )
+        rows: list[tuple[tuple[str, str], ...]] = []
+        if link:
+            rows.append((("📢 Join channel", f"url:{link}"),))
+        rows.append((("✅ I've joined", "fs:ok"),))
+        where = f"@{handle}" if handle else title
+        return Reply(
+            f"{lead}\n\n"
+            f"1. Tap 📢 Join channel and join {where}\n"
+            "2. Come back here and tap ✅ I've joined\n\n"
+            "The bot checks membership for real — just tapping isn't enough.",
+            ok=False,
+            rows=tuple(rows),
+        )
+
+    def _force_sub_gate(self, user_id: str, *, allow_check: bool = False) -> Optional[Reply]:
+        """Join-wall for non-owners when force-sub is on. None = let them through."""
+        if self.router._is_owner(user_id):
+            return None
+        if not self.force_sub_config():
+            return None
+        if allow_check:
+            return None
+        if self._is_force_subscribed(user_id):
+            return None
+        return self._force_sub_prompt()
+
+    def _force_sub_recheck(self, user_id: str) -> Reply:
+        """✅ I've joined — live membership check, then menu or the wall again."""
+        if self._is_force_subscribed(user_id, fresh=True):
+            menu = self.main_menu(user_id)
+            return replace(menu, text="✅ You're in. Welcome!\n\n" + menu.text)
+        return self._force_sub_prompt(again=True)
+
+    def force_sub_admin(self, user_id: str) -> Reply:
+        """Owner screen: current channel + set / turn off."""
+        if not self.router._is_owner(user_id):
+            return Reply("Owner only.", ok=False, rows=((("🏠 Menu", "m"),),))
+        cfg = self.force_sub_config()
+        if cfg:
+            handle = (cfg.get("username") or "").lstrip("@")
+            shown = f"@{handle}" if handle else (cfg.get("title") or cfg.get("chat"))
+            text = (
+                "📢 Force subscribe — ON\n\n"
+                f"Channel: {shown}\n"
+                f"Chat id: `{cfg.get('chat')}`\n\n"
+                "Customers must join this channel before they can use the bot.\n"
+                "This bot must stay an administrator there so it can check "
+                "membership via Telegram."
+            )
+            rows = (
+                (("✏️ Change channel", "ax:fs"), ("🔴 Turn off", "a:fsoff")),
+                (("◀️ Owner panel", "a"),),
+            )
+        else:
+            text = (
+                "📢 Force subscribe — OFF\n\n"
+                "When ON, every customer has to join a channel you choose "
+                "before they can use the bot.\n\n"
+                "1. Add THIS bot as an administrator in your channel "
+                "(membership check needs it).\n"
+                "2. Tap ✏️ Set channel and send @username, or forward a post "
+                "from the channel."
+            )
+            rows = (
+                (("✏️ Set channel", "ax:fs"),),
+                (("◀️ Owner panel", "a"),),
+            )
+        return Reply(text, rows=rows)
+
+    def _apply_force_sub_input(self, user_id: str, body: str) -> Reply:
+        """Persist / disable the force-sub channel from owner input."""
+        ident = self._parse_channel(body)
+        if ident is None:
+            return Reply(
+                "That doesn't look like a channel.\n\n"
+                "Send `@username` (public) or the numeric id (`-100…`), "
+                "or forward a post from the channel.\n"
+                "Invite links alone aren't enough — Telegram needs the chat id "
+                "to check membership.\n\n"
+                "Send `off` to disable.",
+                ok=False, rows=((("✖️ Cancel", "a"),),),
+            )
+        if ident == "":
+            self._set_force_sub(None)
+            self._wizard.pop(user_id, None)
+            return Reply(
+                "✅ Force subscribe is OFF. Anyone can use the bot again.",
+                rows=((("📊 Admin Panel", "a"),),),
+            )
+        title = ident
+        username = ident[1:] if ident.startswith("@") else ""
+        link = f"https://t.me/{username}" if username else ""
+        chat = ident
+        info_fn = self.chat_info_fn
+        if callable(info_fn):
+            try:
+                info = info_fn(ident) or {}
+            except Exception as exc:  # noqa: BLE001
+                log.warning("force-sub getChat failed: %s", exc)
+                info = {"ok": False, "error": str(exc)}
+            if not info.get("ok"):
+                err = info.get("error") or "couldn't reach that chat"
+                return Reply(
+                    f"⚠️ Couldn't use that channel ({err}).\n\n"
+                    "Add THIS bot as an administrator in the channel, then "
+                    "send @username or forward a post from it again.",
+                    ok=False, rows=((("✖️ Cancel", "a"),),),
+                )
+            if not info.get("bot_is_admin"):
+                return Reply(
+                    "⚠️ I can see the channel but I'm not an admin there.\n\n"
+                    "Make this bot an administrator (any role is fine), then "
+                    "send the channel again so membership checks work.",
+                    ok=False, rows=((("✖️ Cancel", "a"),),),
+                )
+            chat = str(info.get("id") or chat)
+            title = str(info.get("title") or title)
+            username = str(info.get("username") or username)
+            link = str(info.get("invite_link") or link)
+        self._set_force_sub({
+            "chat": chat, "title": title, "username": username, "link": link,
+        })
+        self._wizard.pop(user_id, None)
+        shown = f"@{username}" if username else title
+        return Reply(
+            f"✅ Force subscribe is ON.\n\n"
+            f"Customers must join {shown} before they can use the bot.\n"
+            "They'll see a Join channel button and ✅ I've joined — we check "
+            "membership with Telegram, not the honour system.",
+            rows=((("📢 Force sub", "a:fs"),), (("📊 Admin Panel", "a"),)),
+        )
+
     def _store_for_kv(self):
         store = self._store
         if store is not None and callable(getattr(store, "kv_get", None)) \
@@ -585,6 +863,15 @@ class MenuUI:
         closed = self._bot_closed_reply(user_id)
         if closed is not None:
             return closed
+        # Force-sub wall: owner is exempt; everyone else must be in the channel.
+        # The owner's force-sub wizard must still accept the channel they type.
+        wizard_now = self._wizard.get(user_id) or {}
+        setting_fs = (wizard_now.get("flow") == "admin"
+                      and wizard_now.get("action") == "fs")
+        if not setting_fs:
+            gated = self._force_sub_gate(user_id)
+            if gated is not None:
+                return gated
         # Persistent bottom-menu taps arrive as plain text ("🛒 Buy Number").
         # Route them straight to the same screen their inline-tap twin opens.
         # The reply keyboard reaches us lowercased, so match case-insensitively.
@@ -1017,6 +1304,15 @@ class MenuUI:
                    "Send `off` to disable and revert to the UPI + screenshot "
                    "flow.\n"
                    f"(current: {'set ✅' if self.famgateway_api_key else 'not set ❌'})"),
+            "fs": ("📢 FORCE SUBSCRIBE CHANNEL",
+                   "Send the channel customers must join:\n"
+                   "• `@username` for a public channel\n"
+                   "• or forward a post from the channel (best for private)\n"
+                   "• or the numeric id `-100…`\n\n"
+                   "Add THIS bot as an administrator in that channel first "
+                   "so membership can be checked.\n\n"
+                   "Send `off` to disable.\n"
+                   f"(current: {self.force_sub_label()})"),
         }[action]
         self._wizard[user_id] = {"flow": "admin", "action": action, "step": "input"}
         return Reply(f"{prompt[0]}\n\n{prompt[1]}\n\nTap ✖️ Cancel to abort.",
@@ -1100,6 +1396,8 @@ class MenuUI:
                     ok=True, rows=((("💰 Preview Add Money", "t"),),
                                    (("📊 Admin Panel", "a"),)),
                 )
+            if action == "fs":
+                return self._apply_force_sub_input(user_id, body)
             self._wizard.pop(user_id, None)
             return self.main_menu(user_id)
 
@@ -1350,6 +1648,12 @@ class MenuUI:
 
     def photo(self, user_id: str, file_id: str) -> Reply:
         """A photo message arrives: payment screenshot, QR, or confusion."""
+        closed = self._bot_closed_reply(user_id)
+        if closed is not None:
+            return closed
+        gated = self._force_sub_gate(user_id)
+        if gated is not None:
+            return gated
         wizard = self._wizard.get(user_id) or {}
         flow, step = wizard.get("flow"), wizard.get("step")
         if flow == "topup" and step == "screenshot":
@@ -1599,11 +1903,13 @@ class MenuUI:
             f"📒 Top-up mode: {fg_state}\n"
             f"🛠 Maintenance: {'🟢 ON — buying paused for customers' if self.maintenance_on() else '⚪ off'}\n"
             f"🔓 Users may use bot: {'on' if self.bot_enabled() else 'off'}\n"
+            f"📢 Force sub: {self.force_sub_label()}\n"
             f"{cbt_line}\n\n"
             "Full P&L: /report · Health: /status",
             rows=(
                 ((f"👥 All users ({users})", "ax:users"), ("🚫 Ban/Unban", "ax:ban")),
                 (("🔓 Users may use bot", "a:on"), ("🤖 Clone-bot on/off", "a:cb")),
+                (("📢 Force sub", "a:fs"),),
                 ((f"🧾 Top-ups ({len(pending)} pending)", "a:t"), ("📊 Metrics", "ax:metrics")),
                 (("📦 Orders & per-order profit", "a:o"),),
                 (("💳 Add balance", "ax:credit"), ("↩️ Deduct", "ax:debit")),
@@ -1746,6 +2052,10 @@ class MenuUI:
                          rows=((("🏠 Menu", "m"),),))
         parts = data.split(":")
         kind = parts[0]
+        # Join-wall: only the ✅ I've joined recheck (and the owner) pass.
+        gated = self._force_sub_gate(user_id, allow_check=(kind == "fs"))
+        if gated is not None:
+            return gated
         # Navigating away silently cancels any half-done top-up wizard; the
         # payment itself only exists once the screenshot lands, so nothing is lost.
         if kind not in {"t", "ap", "ad", "fg"} and user_id in self._wizard:
@@ -1816,6 +2126,16 @@ class MenuUI:
                     "on here to allow more."
                 )
                 return Reply(text, rows=((("◀️ Owner panel", "a"),),))
+            if parts[1] == "fs":
+                return self.force_sub_admin(user_id)
+            if parts[1] == "fsoff":
+                if not self.router._is_owner(user_id):
+                    return Reply("Owner only.", ok=False, rows=((("🏠 Menu", "m"),),))
+                self._set_force_sub(None)
+                return Reply(
+                    "✅ Force subscribe is OFF. Anyone can use the bot again.",
+                    rows=((("📢 Force sub", "a:fs"),), (("◀️ Owner panel", "a"),)),
+                )
             return self._badtap()
         if kind == "ax":
             # Admin-panel action button. Display-only actions run the owner
@@ -1840,7 +2160,13 @@ class MenuUI:
             if action == "fg":
                 # 💳 Edit the FamGateway API key (auto-credit top-ups).
                 return self._admin_input_prompt(user_id, "fg")
+            if action == "fs":
+                return self._admin_input_prompt(user_id, "fs")
             return self._badtap()
+        if kind == "fs":
+            if len(parts) == 2 and parts[1] == "ok":
+                return self._force_sub_recheck(user_id)
+            return self._force_sub_prompt()
         if kind == "fav":
             return self.favourites_card(user_id)
         if kind == "support":
