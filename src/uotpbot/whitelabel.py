@@ -431,6 +431,13 @@ class SubBotRegistry:
         )
         return [self._row_to_bot(r) for r in rows]
 
+    def all_bots(self) -> list[SubBot]:
+        """Every registered clone, including stopped ones."""
+        rows = self._execute(
+            f"SELECT {self._COLS} FROM {{t}} ORDER BY created_at"
+        )
+        return [self._row_to_bot(r) for r in rows]
+
     def count(self) -> int:
         return int(self._execute("SELECT COUNT(*) FROM {t}")[0][0])
 

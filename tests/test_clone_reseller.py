@@ -289,3 +289,71 @@ def test_clone_run_your_own_bot_follows_platform_switch():
     finally:
         ledger.close()
 
+def test_main_admin_lists_every_clone_with_owner_and_stats():
+    """Platform owner panel has a Clone bots list: owner, extra %, status."""
+    catalog = Catalog({
+        "blinkit": ServiceCost(
+            "blinkit", "Blinkit", "food", INR(10),
+            Decimal("0.94"), Decimal("0.04"), Decimal("0.95"),
+        ),
+    }, (WalletPack("Pro", INR(1000), INR(1150)),))
+    ledger = Ledger()
+    pricer = Pricer(catalog)
+    provider = MockProvider({"blinkit": INR(10)}, balance=INR(5000), seed=3)
+    engine = BotEngine(catalog, provider, ledger, pricer)
+    store = SqliteWallets(":memory:")
+    registry = SubBotRegistry()
+    a = SubBot(
+        owner_id="ownerA", bot_token=GOOD_TOKEN,
+        mode=SubBotMode.PLATFORM_API, fee=DEFAULT_PLATFORM_FEE,
+        reseller_rate=Decimal("0.38"),
+    )
+    b = SubBot(
+        owner_id="ownerB",
+        bot_token="987654321:AAG9876543210zyxwvutsrqponmlkjihgfedc",
+        mode=SubBotMode.PLATFORM_API, fee=DEFAULT_PLATFORM_FEE,
+        reseller_rate=Decimal("0.20"),
+    )
+    registry.add(a)
+    registry.add(b)
+    router = CommandRouter(
+        engine, catalog, pricer, ledger, owner_id="platform-owner",
+        wallets=store, subbots=registry, platform_fee=DEFAULT_PLATFORM_FEE,
+    )
+    ui = MenuUI(router)
+    try:
+        panel = ui.admin_panel("platform-owner")
+        blob = panel.text + " ".join(l for row in (panel.rows or ()) for l, _ in row)
+        assert "Clone bots" in blob
+        assert "a:cl" in {d for row in (panel.rows or ()) for _l, d in row}
+        assert "ownerA" not in panel.text  # list is on the dedicated screen
+        listing = ui.button("platform-owner", "a:cl")
+        assert listing.ok
+        assert "ownerA" in listing.text
+        assert "ownerB" in listing.text
+        assert "38%" in listing.text
+        assert "20%" in listing.text
+        assert a.id[:8] in listing.text
+        assert a.bot_token not in listing.text
+        detail = ui.button("platform-owner", f"a:cld:{a.id}")
+        assert detail.ok
+        assert "ownerA" in detail.text
+        assert "38%" in detail.text
+        assert a.bot_token not in detail.text
+        assert "a:clr:" + a.id in {d for row in (detail.rows or ()) for _l, d in row}
+        # A clone owner must not open this platform tool.
+        clone_router = CommandRouter(
+            engine, catalog, pricer, ledger, owner_id="ownerA",
+            wallets=ScopedWallets(store, a.id),
+            is_clone=True, clone_bot_id=a.id, platform_wallets=store,
+            subbots=registry, platform_fee=DEFAULT_PLATFORM_FEE,
+        )
+        clone_ui = MenuUI(clone_router)
+        blocked = clone_ui.button("ownerA", "a:cl")
+        assert not blocked.ok
+        clone_panel = clone_ui.admin_panel("ownerA")
+        datas = {d for row in (clone_panel.rows or ()) for _l, d in row}
+        assert "a:cl" not in datas
+    finally:
+        ledger.close()
+

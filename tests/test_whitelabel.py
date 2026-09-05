@@ -17,6 +17,7 @@ from uotpbot.catalog import Catalog, ServiceCost, WalletPack
 from uotpbot.createbot import (
     CB_CONFIRM,
     CB_HUB_ADD,
+    CB_HUB_BACK,
     CB_HUB_MINE,
     CB_MARGIN_SUGGESTED,
     CB_OWN_API,
@@ -390,6 +391,8 @@ def test_hub_does_not_start_a_pending_session():
     labels = " ".join(l for row in hub.rows for l, _ in row)
     assert "My bots" in labels
     assert "Create" in labels
+    assert "Back" in labels
+    assert any(d == "m" for row in hub.rows for _l, d in row)
     assert flow.pending("u1") is None
 
 
@@ -980,6 +983,10 @@ def test_createbot_command_opens_hub_not_token_paste():
         assert "no bots" in mine.text.lower()
         assert any("Create" in l or "add bot" in l.lower() for l, _ in
                    [item for row in (mine.rows or ()) for item in row])
+        assert any("Back" in l for l, _ in
+                   [item for row in (mine.rows or ()) for item in row])
+        back = router.handle_callback("111", CB_HUB_BACK)
+        assert "Run your own bot" in back.text
     finally:
         ledger.close()
 

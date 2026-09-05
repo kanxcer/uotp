@@ -21,6 +21,7 @@ from ..createbot import (
     CB_DEL_PREFIX,
     CB_DELOK_PREFIX,
     CB_HUB_ADD,
+    CB_HUB_BACK,
     CB_HUB_MINE,
     CB_RST_PREFIX,
     CreateBotFlow,
@@ -521,6 +522,8 @@ class CommandRouter:
             return self._createbot_reply(self._createbot_flow.start(user_id))
         if data == CB_HUB_MINE:
             return self.cmd_mybots(user_id, [])
+        if data == CB_HUB_BACK:
+            return self._createbot_reply(self._createbot_flow.hub())
         if data.startswith(CB_RST_PREFIX):
             return self._restart_mybot(user_id, data[len(CB_RST_PREFIX):])
         if data.startswith(CB_DEL_PREFIX):
@@ -1323,13 +1326,15 @@ class CommandRouter:
 
     def cmd_mybots(self, user_id: str, args: list[str]) -> Reply:
         assert self.subbots is not None
-        add_row = ((("➕ Create / add bot", CB_HUB_ADD),),)
         bots = self.subbots.for_owner(user_id)
         if not bots:
             return Reply(
                 "You have no bots yet. Tap ➕ Create / add bot to make one.",
                 ok=False,
-                rows=add_row,
+                rows=(
+                    (("➕ Create / add bot", CB_HUB_ADD),),
+                    (("◀️ Back", CB_HUB_BACK),),
+                ),
             )
         # Live poller health from the running manager, so a bot that is saved in
         # the registry but whose poller crashed / token is invalid shows as DOWN
@@ -1376,6 +1381,7 @@ class CommandRouter:
                 (f"🗑 Delete {short}", f"{CB_DEL_PREFIX}{b.id}"),
             ))
         rows.append((("➕ Create / add bot", CB_HUB_ADD),))
+        rows.append((("◀️ Back", CB_HUB_BACK), ("🏠 Menu", "m")))
         tip = (
             "\n\n🔴 Saved but not polling: tap 🔄 Restart. "
             "If it stays down, tap 🗑 Delete and create again with a fresh "

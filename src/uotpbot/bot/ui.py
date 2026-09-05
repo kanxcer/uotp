@@ -1988,6 +1988,28 @@ class MenuUI:
         from ..reseller import pending_withdrawals
         wd_store = self._fg_store()
         n_wd = len(pending_withdrawals(wd_store)) if wd_store is not None else 0
+        n_clones = n_live = 0
+        if self.router.subbots is not None:
+            try:
+                n_clones = int(self.router.subbots.count())
+            except Exception:  # noqa: BLE001
+                n_clones = 0
+            mgr = getattr(self.router, "subbot_manager", None)
+            if mgr is not None:
+                try:
+                    n_live = len(set(mgr.running() or []))
+                except Exception:  # noqa: BLE001
+                    n_live = 0
+        clones_line = (
+            f"🤖 Clones: {n_live} live / {n_clones} total\n"
+            if self.router.subbots is not None else ""
+        )
+        payouts_row = ((f"💸 Clone payouts ({n_wd})", "a:wd"),)
+        if self.router.subbots is not None:
+            payouts_row = (
+                (f"💸 Clone payouts ({n_wd})", "a:wd"),
+                (f"🤖 Clone bots ({n_clones})", "a:cl"),
+            )
         return Reply(
             "📊 Owner panel\n\n"
             f"🏦 Provider wallet: {status['provider_wallet']}\n"
@@ -1997,6 +2019,7 @@ class MenuUI:
             f"👥 Total users: {users}{float_line}\n"
             f"💳 Payments waiting: {len(pending)}\n"
             f"💸 Clone payouts waiting: {n_wd}\n"
+            f"{clones_line}"
             f"🖼 Payment QR: {qr_state}\n"
             f"📒 Top-up mode: {fg_state}\n"
             f"🛠 Maintenance: {'🟢 ON — buying paused for customers' if self.maintenance_on() else '⚪ off'}\n"
@@ -2009,7 +2032,7 @@ class MenuUI:
                 (("🔓 Users may use bot", "a:on"), ("🤖 Clone-bot on/off", "a:cb")),
                 (("📢 Force sub", "a:fs"),),
                 ((f"🧾 Top-ups ({len(pending)} pending)", "a:t"), ("📊 Metrics", "ax:metrics")),
-                ((f"💸 Clone payouts ({n_wd})", "a:wd"),),
+                payouts_row,
                 (("📦 Orders & per-order profit", "a:o"),),
                 (("💳 Add balance", "ax:credit"), ("↩️ Deduct", "ax:debit")),
                 (("📢 Broadcast", "ax:broadcast"), ("👥 Customers", "ax:users")),
@@ -2019,6 +2042,213 @@ class MenuUI:
                 (("🏠 Menu", "m"),),
             ),
         )
+
+    _CLONES_PAGE = 6
+
+    def clones_screen(self, user_id: str, page: int = 0) -> Reply:
+        """Platform owner: every clone with owner, extra %, live stats."""
+        if not self.router._is_owner(user_id) or self._is_clone:
+            return Reply("Owner only.", ok=False, rows=((("🏠 Menu", "m"),),))
+        registry = getattr(self.router, "subbots", None)
+        if registry is None:
+            return Reply(
+                "Clone-bots aren't enabled on this deployment.",
+                ok=False, rows=((("◀️ Owner panel", "a"),),),
+            )
+        lister = getattr(registry, "all_bots", None) or getattr(registry, "all_active", None)
+        try:
+            bots = list(lister()) if callable(lister) else []
+        except Exception:  # noqa: BLE001
+            bots = []
+        if not bots:
+            return Reply(
+                "🤖 Clone bots\n\nNone yet. When a customer creates one from "
+                "🤖 Run your own bot, it shows up here with owner and live stats.",
+                rows=((("◀️ Owner panel", "a"),),),
+            )
+        running: set[str] = set()
+        errors: dict[str, str] = {}
+        manager = getattr(self.router, "subbot_manager", None)
+        if manager is not None:
+            try:
+                running = set(getattr(manager, "running", lambda: [])())
+                errors = dict(getattr(manager, "errors", lambda: {})())
+            except Exception:  # noqa: BLE001
+                running, errors = set(), {}
+        per = self._CLONES_PAGE
+        pages = max(1, (len(bots) + per - 1) // per)
+        page = max(0, min(int(page or 0), pages - 1))
+        window = bots[page * per: (page + 1) * per]
+        lines = [f"🤖 Clone bots ({len(bots)}) · page {page + 1}/{pages}\n"]
+        rows: list[tuple[tuple[str, str], ...]] = []
+        store = self._fg_store() or self._store
+        from ..reseller import earnings_balance
+        for b in window:
+            extra = getattr(b, "reseller_rate", 0) or 0
+            extra_s = f"{(extra * 100):.0f}%"
+            if b.active and b.id in running:
+                mark, state = "🟢", "live"
+            elif b.active:
+                mark, state = "🔴", "not polling"
+            else:
+                mark, state = "⚪", "stopped"
+            err = errors.get(b.id)
+            if err:
+                state += f" — {err}"
+            users_n = None
+            float_held = None
+            fn = getattr(store, "float_stats", None) if store is not None else None
+            if callable(fn):
+                try:
+                    st = fn(scope=b.id)
+                    users_n = int(st.get("users") or 0)
+                    float_held = st.get("float")
+                except TypeError:
+                    pass
+                except Exception:  # noqa: BLE001
+                    pass
+            earn = (
+                earnings_balance(store, b.owner_id)
+                if store is not None else Money.zero()
+            )
+            created = (getattr(b, "created_at", None) or "")[:10]
+            user_bit = f"{users_n} users" if users_n is not None else "users n/a"
+            float_bit = f" · float {float_held}" if float_held is not None else ""
+            lines.append(
+                f"{mark} `{b.id}` · extra {extra_s}\n"
+                f"   owner `{b.owner_id}` · {user_bit}{float_bit}\n"
+                f"   {state} · {created} · earnings {earn}"
+            )
+            rows.append(((f"👁 {b.id[:8]}", f"a:cld:{b.id}"),))
+        nav: list[tuple[str, str]] = []
+        if page > 0:
+            nav.append(("◀️ Prev", f"a:cl:{page - 1}"))
+        if page < pages - 1:
+            nav.append(("Next ▶️", f"a:cl:{page + 1}"))
+        if nav:
+            rows.append(tuple(nav))
+        rows.append((("◀️ Owner panel", "a"),))
+        return Reply("\n".join(lines), rows=tuple(rows))
+
+    def clone_detail(self, user_id: str, bot_id: str) -> Reply:
+        """One clone's full card for the platform owner."""
+        if not self.router._is_owner(user_id) or self._is_clone:
+            return Reply("Owner only.", ok=False, rows=((("🏠 Menu", "m"),),))
+        registry = getattr(self.router, "subbots", None)
+        bot = registry.find(bot_id) if registry is not None else None
+        if bot is None:
+            return Reply(
+                "No clone with that id.",
+                ok=False, rows=((("◀️ Clone bots", "a:cl"),),),
+            )
+        running: set[str] = set()
+        errors: dict[str, str] = {}
+        manager = getattr(self.router, "subbot_manager", None)
+        if manager is not None:
+            try:
+                running = set(getattr(manager, "running", lambda: [])())
+                errors = dict(getattr(manager, "errors", lambda: {})())
+            except Exception:  # noqa: BLE001
+                running, errors = set(), {}
+        extra = getattr(bot, "reseller_rate", 0) or 0
+        extra_s = f"{(extra * 100):.0f}%"
+        if bot.active and bot.id in running:
+            mark, state = "🟢", "live & polling"
+        elif bot.active:
+            mark, state = "🔴", "saved but not polling"
+        else:
+            mark, state = "⚪", "stopped"
+        err = errors.get(bot.id)
+        if err:
+            state += f" — {err}"
+        store = self._fg_store() or self._store
+        from ..reseller import earnings_balance
+        users_n, float_held = "n/a", "n/a"
+        fn = getattr(store, "float_stats", None) if store is not None else None
+        if callable(fn):
+            try:
+                st = fn(scope=bot.id)
+                users_n = str(int(st.get("users") or 0))
+                float_held = str(st.get("float") or Money.zero())
+            except Exception:  # noqa: BLE001
+                pass
+        earn = (
+            earnings_balance(store, bot.owner_id)
+            if store is not None else Money.zero()
+        )
+        mode = (
+            "platform numbers"
+            if getattr(bot.mode, "value", "") == "platform_api"
+            else "own API"
+        )
+        return Reply(
+            f"🤖 Clone `{bot.id}`\n\n"
+            f"Owner: `{bot.owner_id}`\n"
+            f"Extra: {extra_s} (we keep 5% of that extra)\n"
+            f"Status: {mark} {state}\n"
+            f"Customers: {users_n} · float {float_held}\n"
+            f"Owner earnings: {earn}\n"
+            f"Created: {bot.created_at}\n"
+            f"Mode: {mode}",
+            rows=(
+                (("🔄 Restart", f"a:clr:{bot.id}"),),
+                (("◀️ Clone bots", "a:cl"), ("◀️ Owner panel", "a")),
+            ),
+        )
+
+    def clone_restart(self, user_id: str, bot_id: str) -> Reply:
+        """Platform owner: restart a clone poller."""
+        if not self.router._is_owner(user_id) or self._is_clone:
+            return Reply("Owner only.", ok=False)
+        registry = getattr(self.router, "subbots", None)
+        bot = registry.find(bot_id) if registry is not None else None
+        if bot is None:
+            return Reply(
+                "No clone with that id.",
+                ok=False, rows=((("◀️ Clone bots", "a:cl"),),),
+            )
+        mgr = getattr(self.router, "subbot_manager", None)
+        ok = False
+        if mgr is not None:
+            restart = getattr(mgr, "restart", None)
+            start = getattr(mgr, "start", None)
+            try:
+                if callable(restart):
+                    try:
+                        ok = bool(restart(bot.id, timeout=2.0))
+                    except TypeError:
+                        ok = bool(restart(bot.id))
+                elif callable(start):
+                    ok = bool(start(bot.id))
+            except Exception:  # noqa: BLE001
+                log.exception("owner restart clone %s", bot.id)
+                ok = False
+            try:
+                if bot.id in set(getattr(mgr, "running", lambda: [])()):
+                    ok = True
+            except Exception:  # noqa: BLE001
+                pass
+        detail = self.clone_detail(user_id, bot.id)
+        if mgr is None:
+            head = (
+                f"Saved `{bot.id}`. On the live bot, Restart starts it "
+                "immediately.\n\n"
+            )
+            return Reply(head + detail.text, rows=detail.rows)
+        if ok:
+            head = f"🟢 Restarted `{bot.id}`.\n\n"
+        else:
+            err = ""
+            try:
+                err = (mgr.errors() or {}).get(bot.id, "")
+            except Exception:  # noqa: BLE001
+                err = ""
+            head = (
+                f"🔴 Could not start `{bot.id}`"
+                + (f" — {err}" if err else "")
+                + ".\n\n"
+            )
+        return Reply(head + detail.text, ok=ok, rows=detail.rows)
 
     def _clone_admin_panel(self, user_id: str) -> Reply:
         """Clone-owner admin: no money rails, no clone on/off, no FamGateway."""
@@ -2377,6 +2607,8 @@ class MenuUI:
                     "on here to allow more."
                 )
                 return Reply(text, rows=((("◀️ Owner panel", "a"),),))
+            if parts[1] == "cl":
+                return self.clones_screen(user_id, 0)
             if parts[1] == "fs":
                 return self.force_sub_admin(user_id)
             if parts[1] == "fsoff":
@@ -2388,6 +2620,13 @@ class MenuUI:
                     rows=((("📢 Force sub", "a:fs"),), (("◀️ Owner panel", "a"),)),
                 )
             return self._badtap()
+        if kind == "a" and len(parts) == 3:
+            if parts[1] == "cl":
+                return self.clones_screen(user_id, _int(parts[2], 0))
+            if parts[1] == "cld":
+                return self.clone_detail(user_id, parts[2])
+            if parts[1] == "clr":
+                return self.clone_restart(user_id, parts[2])
         if kind == "ax":
             # Admin-panel action button. Display-only actions run the owner
             # command and render its reply; input actions (credit/debit/ban/
@@ -2603,7 +2842,7 @@ class MenuUI:
         """True for platform-only admin tools that clone owners must not use."""
         if kind in {"ap", "ad", "apw", "adw"}:
             return True
-        if kind == "a" and len(parts) >= 2 and parts[1] in {"t", "qr", "cb", "wd", "on"}:
+        if kind == "a" and len(parts) >= 2 and parts[1] in {"t", "qr", "cb", "wd", "on", "cl", "cld", "clr"}:
             return True
         if kind == "ax" and len(parts) >= 2 and parts[1] in {
             "credit", "debit", "fg", "upi", "sunkcost", "provider", "metrics",

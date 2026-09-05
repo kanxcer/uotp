@@ -32,6 +32,7 @@ __all__ = [
     "CreateBotResult",
     "CB_HUB_MINE",
     "CB_HUB_ADD",
+    "CB_HUB_BACK",
     "CB_RST_PREFIX",
     "CB_DEL_PREFIX",
     "CB_DELOK_PREFIX",
@@ -49,6 +50,7 @@ CB_MARGIN_SUGGESTED = "cb:createbot:margin:38"
 # Landing hub (My bots / Create) — reachable without a pending session.
 CB_HUB_MINE = "cb:hub:mine"
 CB_HUB_ADD = "cb:hub:add"
+CB_HUB_BACK = "cb:hub:back"
 # My bots: restart / delete (bot id is hex, well under Telegram's 64-byte cap).
 CB_RST_PREFIX = "cb:rst:"
 CB_DEL_PREFIX = "cb:del:"
@@ -228,7 +230,10 @@ class CreateBotFlow:
             "on our selling price; customers pay through our UPI.\n\n"
             "📋 My bots — bots you already run.\n"
             "➕ Create / add bot — paste a @BotFather token and go live.",
-            rows=[(("📋 My bots", CB_HUB_MINE), ("➕ Create / add bot", CB_HUB_ADD))],
+            rows=[
+                (("📋 My bots", CB_HUB_MINE), ("➕ Create / add bot", CB_HUB_ADD)),
+                (("◀️ Back", "m"),),
+            ],
         )
 
     def start(self, owner_id: str) -> CreateBotResult:

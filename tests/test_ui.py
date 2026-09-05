@@ -861,7 +861,12 @@ def test_admin_toggle_clonebot_hides_and_blocks(rig):
     labs = " ".join(l for l, _ in all_buttons(landing))
     assert "My bots" in labs
     assert "Create" in labs or "add bot" in labs.lower()
+    assert "Back" in labs
+    assert "m" in datas(landing)
     assert "Paste the **bot token**" not in landing.text
+    back = ui.button(USER, "m")
+    assert back.ok
+    assert "YC OTP" in back.text or "balance" in back.text.lower()
 
     # Owner turns it back OFF.
     r2 = ui.button(OWNER, "a:cb")
