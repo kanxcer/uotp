@@ -525,7 +525,8 @@ class BotEngine:
             service=service,
             country=self.config.default_country,
             charged=gross,
-            allocated_at=(datetime.fromtimestamp(allocated_ts).isoformat()
+            allocated_at=(datetime.fromtimestamp(allocated_ts, timezone.utc)
+                          .isoformat(timespec="seconds")
                           if allocated_ts else
                           datetime.now(timezone.utc).isoformat(timespec="seconds")),
         )

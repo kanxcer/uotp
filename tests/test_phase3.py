@@ -213,7 +213,7 @@ def test_persistent_menu_labels_route():
     assert "Your balance" in reply.text
     # Tapping "🧾 My Numbers" opens the history screen (case-insensitive).
     reply = ui.text(USER, "🧾 My Numbers")
-    assert "No live numbers" in reply.text or "No orders yet" in reply.text
+    assert "No numbers yet" in reply.text or "Your numbers" in reply.text
 
 
 # ── Welcome copy replaced (no "buttons at the bottom") ────────────────────
@@ -447,5 +447,7 @@ def test_my_numbers_works_while_otp_wait_runs_after_buy():
     mr = ui.button(USER, "o")
     elapsed = _t.time() - s
     assert elapsed < 3.0, f"My numbers blocked {elapsed:.2f}s behind the OTP wait"
-    assert "LIVE numbers" in mr.text, f"must show the live number: {mr.text!r}"
-    assert "Telegram" in mr.text
+    # Button-only list: the live number is a status-tagged tappable button.
+    names = [b[0] for row in mr.rows for b in row if len(b) == 2]
+    assert any("🟢 Active · Telegram" in lbl for lbl in names), \
+        f"must show the live number as a status-tagged button: {names!r}"

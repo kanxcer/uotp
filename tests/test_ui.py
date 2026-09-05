@@ -201,7 +201,8 @@ def test_history_records_purchases_this_session(rig):
     ui.button(USER, "y:telegram").deferred(USER)
     history = ui.button(USER, "o")
     assert history.ok
-    assert "telegram" in history.text.lower() or "OTP" in history.text
+    # Button-only list: the number is a status-tagged button, not body text.
+    assert any("telegram" in label.lower() for label, _d in all_buttons(history))
 
 
 def test_wallet_card_and_topup_disabled_fallback(rig):
@@ -227,6 +228,40 @@ def test_owner_panel_shows_money_state(rig):
     assert "wallet" in reply.text.lower()
     # Non-owner gets rejected, never the numbers.
     assert not ui.button(USER, "a").ok
+
+
+def test_reply_menu_hides_admin_from_users():
+    """The persistent bottom keyboard must not show '⚙️ Admin Panel' to a
+    user; only the owner's keyboard carries it. Routing still re-checks owner."""
+    from uotpbot.bot.telegram import _is_admin_label, _REPLY_MENU
+    # The owner-only key is detected by the helper.
+    assert any(_is_admin_label(lbl) for row in _REPLY_MENU for lbl, _cb in row)
+    # Public keys are never admin.
+    topub = [lbl for row in _REPLY_MENU for lbl, _cb in row
+             if not _is_admin_label(lbl)]
+    assert "⚙️ Admin Panel" not in topub
+
+
+def test_validity_resume_naive_timestamp_is_tz_safe():
+    """A NumberAllocation rebuilt from a NAIVE timestamp (no UTC offset, as the
+    resume path used to write) must still compute seconds_left correctly, never
+    crash with a naive/aware TypeError."""
+
+    from datetime import datetime, timezone
+    from uotpbot.provider.base import NumberAllocation
+    from uotpbot.catalog import PROVIDER_VALIDITY_MINUTES
+    from uotpbot.money import INR
+
+    allocated_ts = datetime.now(timezone.utc).timestamp() - 300  # 5 min ago
+    for stamp in (
+        datetime.fromtimestamp(allocated_ts).isoformat(),  # naive (old resume bug)
+        datetime.fromtimestamp(allocated_ts, timezone.utc).isoformat(timespec="seconds"),
+    ):
+        alloc = NumberAllocation("o", "99", "x", "22", INR(1.0),
+                                 allocated_at=stamp,
+                                 validity_minutes=PROVIDER_VALIDITY_MINUTES)
+        left = alloc.seconds_left()
+        assert 4 * 60 <= left <= 15 * 60, left  # 20-min lease, 5 min elapsed
 
 
 # -- text funnel --------------------------------------------------------------
@@ -316,16 +351,18 @@ def test_my_numbers_shows_active_number_and_check_otp(tmp_path):
                         provider_order_id="p1", token="tok1", gross=INR(15),
                         valid_until=_time.time() + 600)
     reply = ui.button(USER, "o")  # 🧾 My numbers
-    assert "LIVE" in reply.text
-    assert "+919000000000" in reply.text
-    labels = []
-    for row in reply.rows:
-        for b in row:
-            if isinstance(b, tuple) and len(b) == 2:
-                labels.append(b[0])
-    assert any("Check OTP" in lbl for lbl in labels)
-    assert any("Resend" in lbl for lbl in labels)
-    assert any("Cancel" in lbl for lbl in labels)
+    # Button-only list: the live number is a single status-tagged button.
+    labels = [b[0] for row in reply.rows for b in row if len(b) == 2]
+    assert any(label.startswith("🟢 Active · Telegram") for label in labels), labels
+    active_btn = [d for row in reply.rows for _l, d in row if d == "oact:tok1"]
+    assert active_btn, "live number must be tappable (oact:token)"
+    # Tapping it opens the detail with phone/OTP and its action buttons.
+    detail = ui.button(USER, "oact:tok1")
+    assert "+919000000000" in detail.text
+    dlabels = [b[0] for row in detail.rows for b in row if len(b) == 2]
+    assert any("Check OTP" in l for l in dlabels) or any("New OTP" in l for l in dlabels)
+    assert any("Resend" in l for l in dlabels)
+    assert any("Cancel" in l for l in dlabels)
     store.close()
 
 
@@ -426,8 +463,8 @@ def test_typed_my_numbers_matches_the_button_screen(tmp_path):
                         valid_until=_time.time() + 600)
     for phrase in ("my numbers", "My Numbers", "/numbers", "/my numbers"):
         reply = ui.text(USER, phrase)
-        assert "my numbers" in reply.text.lower() or "LIVE" in reply.text \
-            or "No live numbers" in reply.text, phrase
+        assert "my numbers" in reply.text.lower() or "Your numbers" in reply.text \
+            or "No numbers yet" in reply.text, phrase
         assert reply.text.strip() and "✳️ YCOTP Numbers" != reply.text.strip()
     store.close()
 

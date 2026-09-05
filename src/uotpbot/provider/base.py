@@ -147,10 +147,26 @@ class NumberAllocation:
 
     @property
     def expires_at(self) -> datetime:
-        return datetime.fromisoformat(self.allocated_at) + timedelta(minutes=self.validity_minutes)
+        """Allocation expiry as an aware UTC datetime.
+
+        ``allocated_at`` is persisted as an ISO string. Some producers (e.g.
+        the resume path that used ``datetime.fromtimestamp(...).isoformat()``)
+        write a *naive* timestamp with no ``+00:00``; subtracting an aware
+        ``now`` from a naive expiry raised ``TypeError`` and silently broke
+        every seconds-left computation for those numbers. We treat a naive
+        stamp as UTC (the sole clock the bot uses) so the math is always tz-safe.
+        """
+        dt = datetime.fromisoformat(self.allocated_at)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt + timedelta(minutes=self.validity_minutes)
 
     def seconds_left(self, now: Optional[datetime] = None) -> float:
-        return (self.expires_at - (now or datetime.now(timezone.utc))).total_seconds()
+        # ``now`` must be aware too; default to UTC when omitted or naive.
+        now = now or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        return (self.expires_at - now).total_seconds()
 
     def is_expired(self, now: Optional[datetime] = None) -> bool:
         return self.seconds_left(now) <= 0

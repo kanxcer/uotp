@@ -99,12 +99,28 @@ class PaymentNotifier:
                         chat_id=int(chat_id), message_id=int(message_id),
                         caption=text[:1024],
                     )
-                except Exception:
-                    # Not a photo (or caption not editable): edit the text.
-                    await bot.edit_message_text(
-                        chat_id=int(chat_id), message_id=int(message_id), text=text,
-                    )
-            asyncio.run_coroutine_threadsafe(_edit(), loop)
+                except Exception as caption_exc:
+                    # Not a photo (or caption not editable): edit the text so
+                    # the customer still sees the success note.
+                    try:
+                        await bot.edit_message_text(
+                            chat_id=int(chat_id), message_id=int(message_id),
+                            text=text,
+                        )
+                    except Exception as text_exc:
+                        raise text_exc from caption_exc
+
+            def _done(fut: "asyncio.Future") -> None:
+                # Surface a swallowed failure so the "QR doesn't edit" case is
+                # diagnosable in logs instead of dying silently in the future.
+                try:
+                    fut.result()
+                except Exception as exc:  # noqa: BLE001 - never kill a caller
+                    log.error("payment message edit failed for order in chat %s: %s",
+                              chat_id, exc)
+
+            fut = asyncio.run_coroutine_threadsafe(_edit(), loop)
+            fut.add_done_callback(_done)
             log.info("payment message edited for order in chat %s", chat_id)
             return True
         except Exception as exc:  # noqa: BLE001 - never kill a caller

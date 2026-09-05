@@ -133,7 +133,7 @@ except ImportError:  # pragma: no cover
     HAS_TELEGRAM = False
 
 
-def _reply_menu_markup() -> object:
+def _reply_menu_markup(include_admin: bool = False) -> object:
     """The always-visible bottom menu (ReplyKeyboardMarkup).
 
     Lives at the bottom of the chat so a customer never has to type. Only one
@@ -141,17 +141,28 @@ def _reply_menu_markup() -> object:
     the same time, so it is only attached to the persistent-menu welcome and
     never to an edit (an edit keeps the inline buttons; Telegram keeps the
     keyboard in the client once sent).
+
+    ``include_admin`` hides the owner-only "⚙️ Admin Panel" key from every
+    non-owner (customers must never see an owner screen). The routing still
+    re-checks ownership, so even a crafted press goes nowhere.
     """
     if not HAS_TELEGRAM:
         return None
     from telegram import KeyboardButton, ReplyKeyboardMarkup
 
+    rows = [row for row in _REPLY_MENU
+            if include_admin or all(not _is_admin_label(label) for label, _cb in row)]
     return ReplyKeyboardMarkup(
-        [[KeyboardButton(label) for label, _cb in row] for row in _REPLY_MENU],
+        [[KeyboardButton(label) for label, _cb in row] for row in rows],
         resize_keyboard=True,
         is_persistent=True,
         input_field_placeholder="Tap a button or type /help",
     )
+
+
+def _is_admin_label(label: str) -> bool:
+    """True for the owner-only admin menu key."""
+    return "Admin Panel" in label or label.lower() in ("⚙️ admin panel", "admin panel")
 
 
 def _is_button_pair(x) -> bool:
@@ -507,8 +518,13 @@ class TelegramFrontend:
             # the money is confirmed -- no tap needed from the customer.
             self._remember_fg_message(sent, reply)
             return
-        markup = _reply_menu_markup() if getattr(reply, "persistent_menu", False) \
-            else _reply_markup(reply)
+        is_owner = False
+        if getattr(reply, "persistent_menu", False):
+            user = getattr(message, "from_user", None)
+            uid = str(getattr(user, "id", "")) if user else ""
+            is_owner = bool(uid) and self.router._is_owner(uid)
+        markup = _reply_menu_markup(include_admin=is_owner) \
+            if getattr(reply, "persistent_menu", False) else _reply_markup(reply)
         await message.reply_text(reply.text, reply_markup=markup)
 
     async def _send_notifications(self, context: Any, reply) -> None:
