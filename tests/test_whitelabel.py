@@ -760,6 +760,16 @@ def test_make_whitelabel_builds_a_manager_when_enabled(monkeypatch, tmp_path):
         assert wl is not None
         assert wl.registry.count() == 0
         assert wl.manager.running() == []
+        bot = SubBot(
+            owner_id="u", bot_token=GOOD_TOKEN,
+            mode=SubBotMode.PLATFORM_API, fee=DEFAULT_PLATFORM_FEE,
+            reseller_rate=Decimal("0.38"),
+        )
+        router = wl.manager.router_factory(bot)
+        assert router.is_clone
+        assert router.subbots is wl.registry
+        assert router.subbot_manager is wl.manager
+        assert router.on_bot_created is not None
     finally:
         wl.registry.close()
         ledger.close()

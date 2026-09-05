@@ -477,6 +477,8 @@ class MenuUI:
 
     def _toggle_bot_enabled(self) -> bool:
         """Flip the access switch; returns the new state."""
+        if self._is_clone:
+            return self.bot_enabled()
         new = not self.bot_enabled()
         store = self._store_for_kv()
         if store is not None:
@@ -492,10 +494,14 @@ class MenuUI:
 
         The feature only exists if this router has a sub-bot registry; if not,
         the whole button/command is unavailable regardless of the toggle.
+
+        The master switch lives on the *platform* store so turning it on
+        on the main bot also shows the button on every clone. Clones never
+        write this flag.
         """
         if getattr(self.router, "subbots", None) is None:
             return False
-        store = self._store_for_kv()
+        store = self._feature_store()
         if store is not None:
             try:
                 v = store.kv_get("feature_createbot")
@@ -507,6 +513,8 @@ class MenuUI:
 
     def _toggle_createbot(self) -> bool:
         """Flip the master clone switch; returns the new state."""
+        if self._is_clone:
+            return self.createbot_enabled()
         new = not self.createbot_enabled()
         store = self._store_for_kv()
         if store is not None:
@@ -799,6 +807,19 @@ class MenuUI:
                 and callable(getattr(store, "kv_set", None)):
             return store
         return None
+
+    def _feature_store(self):
+        """Unscoped store for platform-wide flags (clone-bot on/off).
+
+        Clone wallets are namespaced ``<bot>:<key>``. The master switch is
+        written by the main bot and must be readable on clones without a
+        matching prefix.
+        """
+        if self._is_clone:
+            plat = getattr(self.router, "platform_wallets", None)
+            if plat is not None and callable(getattr(plat, "kv_get", None)):
+                return plat
+        return self._store_for_kv()
 
     @property
     def _is_clone(self) -> bool:
@@ -2000,7 +2021,7 @@ class MenuUI:
         )
 
     def _clone_admin_panel(self, user_id: str) -> Reply:
-        """Clone-owner admin: no money rails, no cloning, no FamGateway."""
+        """Clone-owner admin: no money rails, no clone on/off, no FamGateway."""
         from ..reseller import earnings_balance
         extra = getattr(self.router, "reseller_rate", 0) or 0
         extra_pct = f"{(extra * 100):.0f}%"
@@ -2018,12 +2039,11 @@ class MenuUI:
             "or your own YC OTP API.\n\n"
             f"👥 Your customers: {users}\n"
             f"🛠 Maintenance: {'🟢 ON' if self.maintenance_on() else '⚪ off'}\n"
-            f"🔓 Users may use bot: {'on' if self.bot_enabled() else 'off'}\n"
             f"📢 Force sub: {self.force_sub_label()}",
             rows=(
                 ((f"💸 Withdraw ({earn})", "ax:withdraw"),),
                 ((f"👥 All users ({users})", "ax:users"), ("🚫 Ban/Unban", "ax:ban")),
-                (("🔓 Users may use bot", "a:on"), ("📢 Force sub", "a:fs")),
+                (("📢 Force sub", "a:fs"),),
                 (("📦 Orders", "a:o"), ("📢 Broadcast", "ax:broadcast")),
                 (("🛠 Toggle maintenance", "a:mm"), ("🆘 Support username", "ax:support")),
                 (("🏠 Menu", "m"),),
@@ -2583,7 +2603,7 @@ class MenuUI:
         """True for platform-only admin tools that clone owners must not use."""
         if kind in {"ap", "ad", "apw", "adw"}:
             return True
-        if kind == "a" and len(parts) >= 2 and parts[1] in {"t", "qr", "cb", "wd"}:
+        if kind == "a" and len(parts) >= 2 and parts[1] in {"t", "qr", "cb", "wd", "on"}:
             return True
         if kind == "ax" and len(parts) >= 2 and parts[1] in {
             "credit", "debit", "fg", "upi", "sunkcost", "provider", "metrics",

@@ -160,12 +160,18 @@ def test_clone_admin_hides_platform_tools():
         assert "Top-ups" not in blob
         assert "Payment QR" not in blob
         assert "FamGateway" not in blob
+        assert "Users may use bot" not in blob
+        datas = {d for row in (panel.rows or ()) for _l, d in row}
+        assert "a:on" not in datas
+        assert "a:cb" not in datas
         blocked = ui.button("clone-owner", "ax:credit")
         assert not blocked.ok
         blocked2 = ui.button("clone-owner", "a:cb")
         assert not blocked2.ok
         blocked3 = ui.button("clone-owner", "ax:fg")
         assert not blocked3.ok
+        blocked4 = ui.button("clone-owner", "a:on")
+        assert not blocked4.ok
     finally:
         ledger.close()
 
@@ -218,3 +224,68 @@ def test_fg_order_is_written_unscoped_with_clone_scope():
         assert scoped.kv_get("fg_order:ord-clone-1") in (None, "")
     finally:
         ledger.close()
+
+def _labels(reply):
+    out = []
+    for row in (reply.rows or ()):
+        out.extend(row)
+    if reply.buttons:
+        out.extend(reply.buttons)
+    return out
+
+
+def test_clone_run_your_own_bot_follows_platform_switch():
+    """Main Clone-bot ON also shows the button on clones; clones cannot toggle it."""
+    catalog = Catalog({
+        "blinkit": ServiceCost(
+            "blinkit", "Blinkit", "food", INR(10),
+            Decimal("0.94"), Decimal("0.04"), Decimal("0.95"),
+        ),
+    }, (WalletPack("Pro", INR(1000), INR(1150)),))
+    ledger = Ledger()
+    pricer = Pricer(catalog)
+    provider = MockProvider({"blinkit": INR(10)}, balance=INR(5000), seed=3)
+    engine = BotEngine(catalog, provider, ledger, pricer)
+    store = SqliteWallets(":memory:")
+    registry = SubBotRegistry()
+    router = CommandRouter(
+        engine, catalog, pricer, ledger, owner_id="clone-owner",
+        wallets=ScopedWallets(store, "clone1"),
+        is_clone=True, reseller_rate=Decimal("0.38"),
+        clone_bot_id="clone1", platform_wallets=store,
+        platform_owner_id="platform-owner", margin_fee_rate=Decimal("0.05"),
+        subbots=registry, platform_fee=DEFAULT_PLATFORM_FEE,
+    )
+    ui = MenuUI(router)
+    try:
+        assert ui.createbot_enabled() is False
+        assert ("🤖 Run your own bot", "cb") not in _labels(ui.main_menu("cust"))
+        store.kv_set("feature_createbot", "1")
+        assert ui.createbot_enabled() is True
+        assert ("🤖 Run your own bot", "cb") in _labels(ui.main_menu("cust"))
+        landing = ui.button("cust", "cb")
+        labs = " ".join(l for l, _ in _labels(landing))
+        assert "My bots" in labs
+        assert "Create" in labs or "add bot" in labs.lower()
+        blocked = ui.button("clone-owner", "a:cb")
+        assert not blocked.ok
+        assert ui.createbot_enabled() is True
+        assert store.kv_get("feature_createbot") == "1"
+        assert ui._toggle_createbot() is True
+        assert store.kv_get("feature_createbot") == "1"
+        panel = ui.admin_panel("clone-owner")
+        blob = panel.text + " ".join(l for l, _ in _labels(panel))
+        datas = {d for _l, d in _labels(panel)}
+        assert "Users may use bot" not in blob
+        assert "Clone-bot" not in blob
+        assert "a:on" not in datas
+        assert "a:cb" not in datas
+        store.kv_set("feature_createbot", "0")
+        assert ui.createbot_enabled() is False
+        assert ("🤖 Run your own bot", "cb") not in _labels(ui.main_menu("cust"))
+        off = ui.text("cust", "/createbot")
+        assert not off.ok
+        assert "turned OFF" in off.text
+    finally:
+        ledger.close()
+

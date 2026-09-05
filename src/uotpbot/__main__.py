@@ -491,7 +491,20 @@ def _make_whitelabel(settings: Settings, catalog, ledger, pricer, wallets) -> Op
             fees=settings.fees, config=settings.engine,
             platform_fee_fn=use_fee, fee_disclosure=bot.disclosure,
         )
-        return CommandRouter(
+        mgr = mgr_box[0] if mgr_box else None
+
+        def _on_created(new_bot) -> None:
+            if mgr is None:
+                return
+            if new_bot.id in mgr.running():
+                return
+            if not mgr.start(new_bot.id):
+                err = mgr.errors().get(new_bot.id, "poller did not start")
+                log.error("could not start sub-bot %s: %s", new_bot.id, err)
+                raise RuntimeError(err)
+            log.info("sub-bot %s poller started", new_bot.id)
+
+        router = CommandRouter(
             sub_engine, catalog, clone_pricer, ledger,
             owner_id=bot.owner_id, allowed_users=(),
             wallets=ScopedWallets(wallets, bot.id),
@@ -502,10 +515,24 @@ def _make_whitelabel(settings: Settings, catalog, ledger, pricer, wallets) -> Op
             platform_owner_id=settings.owner_id,
             margin_fee_rate=fee_rate,
             clone_bot_token=bot.bot_token,
+            subbots=registry,
+            subbot_manager=mgr,
+            platform_fee=_platform_fee(settings),
+            platform_bot_username=platform_username,
         )
+        router.on_bot_created = _on_created
+        return router
 
-    manager = MultiBotManager(registry, router_factory,
-                              poller_factory=lambda b, r: (lambda: _run_subbot(b, r, settings)))
+    from .createbot import platform_username_from_token
+    platform_username = platform_username_from_token(settings.telegram_token)
+    mgr_box: list = []
+    manager = MultiBotManager(
+        registry, router_factory,
+        poller_factory=lambda b, r: (
+            lambda: _run_subbot(b, r, settings, manager=mgr_box[0] if mgr_box else None)
+        ),
+    )
+    mgr_box.append(manager)
     wl = WhiteLabel(registry=registry, manager=manager)
     return wl
 
@@ -537,8 +564,8 @@ def _run_subbot(bot, router, settings: Settings, manager=None) -> None:
     from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filters
 
     log.info("sub-bot %s starting poller", getattr(bot, "id", "?"))
-    # Sub-bots get the same button UI; their router has subbots=None, so the
-    # nested "Run your own bot" entry hides itself automatically.
+    # Sub-bots get the same button UI. When the main owner turns Clone-bot ON,
+    # "Run your own bot" also appears here (clones cannot toggle it).
     frontend = TelegramFrontend(
         router,
         bot_token=getattr(bot, "bot_token", "") or "",
