@@ -183,6 +183,14 @@ class ScopedWallets(WalletStore):
     def user_ids(self):
         return self._inner.user_ids(scope=self._scope)
 
+    def touch_user(self, user_id: str, *, scope: str = "") -> None:
+        # Scope always comes from this wrapper: a sub-bot must not write
+        # another bot's seen-user row.
+        self._inner.touch_user(user_id, scope=self._scope)
+
+    def list_users(self, *, limit: int = 40, offset: int = 0):
+        return self._inner.list_users(scope=self._scope, limit=limit, offset=offset)
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS {t} (
@@ -260,6 +268,46 @@ CREATE TABLE IF NOT EXISTS {t} (
     value TEXT NOT NULL
 )
 """
+
+#: Everyone who has used the bot, including customers who never got a wallet
+#: row (a wallet row is only written on credit/debit). Admin "All users",
+#: Total users, and broadcast UNION this with wallets/orders/topups.
+_SEEN_SCHEMA = """
+CREATE TABLE IF NOT EXISTS {t} (
+    scope TEXT NOT NULL DEFAULT '',
+    user_id TEXT NOT NULL,
+    first_seen REAL NOT NULL,
+    last_seen REAL NOT NULL,
+    PRIMARY KEY (scope, user_id)
+)
+"""
+
+
+def _bare_wallet_uid(stored: str, scope: str) -> str:
+    """Strip a ``scope:`` prefix from a wallets.user_id, if present."""
+    uid = (stored or "").strip()
+    if not uid:
+        return ""
+    if scope:
+        prefix = scope + ":"
+        if uid.startswith(prefix):
+            return uid[len(prefix):]
+    return uid
+
+
+def _page_users(ids: list[str], seen: dict[str, float], *,
+                limit: int, offset: int) -> tuple[list[tuple[str, float]], int]:
+    """Sort ``ids`` by last_seen desc and slice one page. Empty last_seen last."""
+    decorated = sorted(
+        ((float(seen.get(u, 0.0)), u) for u in ids),
+        key=lambda t: (t[0], t[1]),
+        reverse=True,
+    )
+    total = len(decorated)
+    limit = 40 if int(limit) <= 0 else int(limit)
+    offset = max(0, int(offset))
+    page = decorated[offset: offset + limit]
+    return [(u, ts) for ts, u in page], total
 
 #: Durable refund outbox. A refund is written here BEFORE the wallet credit or
 #: ledger post is attempted, so if that credit ever fails the refund is never
@@ -434,6 +482,7 @@ class SqliteWallets(WalletStore):
                 t="activenumbers", pk="id INTEGER PRIMARY KEY AUTOINCREMENT,"))
             self._conn.execute(_REFUND_SCHEMA.format(
                 t="refund_outbox", pk="id INTEGER PRIMARY KEY AUTOINCREMENT,"))
+            self._conn.execute(_SEEN_SCHEMA.format(t="seen_users"))
             # BEFORE the index: a legacy database gains the scope column here.
             self._migrate_orders()
             self._conn.execute(
@@ -742,30 +791,87 @@ class SqliteWallets(WalletStore):
         return _order_from_row(row) if row else None
 
     def float_stats(self, *, scope: str = "") -> dict[str, object]:
-        """Customer float: what we OWE users right now."""
+        """Customer float: what we OWE users right now.
+
+        ``users`` is everyone who has used the bot (seen + wallets + orders +
+        topups + live numbers), not merely wallet-row count -- a /start with
+        ₹0 never created a wallets row, which is why the owner panel used to
+        report 2 customers while dozens were live.
+        ``float`` is still the SUM of wallet balances.
+        """
+        users = len(self.user_ids(scope=scope))
         like = (scope + ":%") if scope else None
         with self._lock:
             if like:
                 row = self._conn.execute(
-                    "SELECT COUNT(*), COALESCE(SUM(balance_paise), 0) FROM wallets"
+                    "SELECT COALESCE(SUM(balance_paise), 0) FROM wallets"
                     " WHERE user_id LIKE ?", (like,)).fetchone()
             else:
                 row = self._conn.execute(
-                    "SELECT COUNT(*), COALESCE(SUM(balance_paise), 0) FROM wallets"
+                    "SELECT COALESCE(SUM(balance_paise), 0) FROM wallets"
                     " WHERE user_id NOT LIKE '%:%'").fetchone()
-        return {"users": int(row[0]), "float": Money(int(row[1]))}
+        return {"users": users, "float": Money(int(row[0] if row else 0))}
+
+    def touch_user(self, user_id: str, *, scope: str = "") -> None:
+        """Record that ``user_id`` just used this bot (idempotent upsert)."""
+        uid = (user_id or "").strip()
+        if not uid:
+            return
+        now = time.time()
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT INTO seen_users(scope, user_id, first_seen, last_seen) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(scope, user_id) DO UPDATE SET last_seen = excluded.last_seen",
+                (scope, uid, now, now),
+            )
 
     def user_ids(self, *, scope: str = "") -> list[str]:
-        """Every wallet user id for this scope, for admin broadcast/reporting."""
-        like = (scope + ":%") if scope else None
+        """Every customer id for this scope (seen, wallets, orders, topups, live)."""
+        ids: set[str] = set()
         with self._lock:
-            if like:
-                rows = self._conn.execute(
-                    "SELECT user_id FROM wallets WHERE user_id LIKE ?", (like,)).fetchall()
+            for (uid,) in self._conn.execute(
+                "SELECT user_id FROM seen_users WHERE scope = ?", (scope,),
+            ):
+                if uid:
+                    ids.add(str(uid))
+            if scope:
+                prefix = scope + ":"
+                for (uid,) in self._conn.execute(
+                    "SELECT user_id FROM wallets WHERE user_id LIKE ?",
+                    (prefix + "%",),
+                ):
+                    bare = _bare_wallet_uid(uid, scope)
+                    if bare:
+                        ids.add(bare)
             else:
-                rows = self._conn.execute(
-                    "SELECT user_id FROM wallets WHERE user_id NOT LIKE '%:%'").fetchall()
-        return [r[0] for r in rows]
+                for (uid,) in self._conn.execute(
+                    "SELECT user_id FROM wallets WHERE user_id NOT LIKE '%:%'"
+                ):
+                    if uid:
+                        ids.add(str(uid))
+            for table in ("orders", "topups", "activenumbers"):
+                for (uid,) in self._conn.execute(
+                    f"SELECT DISTINCT user_id FROM {table} WHERE scope = ?",
+                    (scope,),
+                ):
+                    if uid:
+                        ids.add(str(uid))
+        return sorted(ids)
+
+    def list_users(self, *, scope: str = "", limit: int = 40, offset: int = 0
+                   ) -> tuple[list[tuple[str, float]], int]:
+        """One page of ``(user_id, last_seen)`` plus the total customer count."""
+        ids = self.user_ids(scope=scope)
+        seen: dict[str, float] = {}
+        with self._lock:
+            for uid, ts in self._conn.execute(
+                "SELECT user_id, last_seen FROM seen_users WHERE scope = ?",
+                (scope,),
+            ):
+                if uid:
+                    seen[str(uid)] = float(ts or 0)
+        return _page_users(ids, seen, limit=limit, offset=offset)
 
     def balance(self, user_id: str) -> Money:
         with self._lock:
@@ -841,6 +947,8 @@ class PostgresWallets(WalletStore):
             self._tr = f"{schema}.refund_outbox"
             self._conn.execute(_REFUND_SCHEMA.format(
                 t=self._tr, pk="id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"))
+            self._ts = f"{schema}.seen_users"
+            self._conn.execute(_SEEN_SCHEMA.format(t=self._ts))
             # BEFORE the index: a legacy database gains the scope column here.
             self._migrate_orders()
             safe = schema.replace("-", "_").replace('"', "")
@@ -1139,30 +1247,77 @@ class PostgresWallets(WalletStore):
                     pass
 
     def float_stats(self, *, scope: str = "") -> dict[str, object]:
+        """Customer float: users = everyone who used the bot; float = wallet SUM."""
+        users = len(self.user_ids(scope=scope))
         like = (scope + ":%") if scope else None
         with self._lock:
             if like:
                 row = self._conn.execute(
-                    "SELECT COUNT(*), COALESCE(SUM(balance_paise), 0) FROM"
+                    "SELECT COALESCE(SUM(balance_paise), 0) FROM"
                     f" {self._t} WHERE user_id LIKE %s", (like,)).fetchone()
             else:
                 row = self._conn.execute(
-                    "SELECT COUNT(*), COALESCE(SUM(balance_paise), 0) FROM"
+                    "SELECT COALESCE(SUM(balance_paise), 0) FROM"
                     f" {self._t} WHERE user_id NOT LIKE '%:%'").fetchone()
-        return {"users": int(row[0]), "float": Money(int(row[1]))}
+        return {"users": users, "float": Money(int(row[0] if row else 0))}
+
+    def touch_user(self, user_id: str, *, scope: str = "") -> None:
+        uid = (user_id or "").strip()
+        if not uid:
+            return
+        now = time.time()
+        with self._lock:
+            self._conn.execute(
+                f"INSERT INTO {self._ts}(scope, user_id, first_seen, last_seen) "
+                "VALUES (%s, %s, %s, %s) "
+                "ON CONFLICT(scope, user_id) DO UPDATE SET last_seen = EXCLUDED.last_seen",
+                (scope, uid, now, now),
+            )
 
     def user_ids(self, *, scope: str = "") -> list[str]:
-        like = (scope + ":%") if scope else None
+        ids: set[str] = set()
         with self._lock:
-            if like:
-                rows = self._conn.execute(
-                    f"SELECT user_id FROM {self._t} WHERE user_id LIKE %s", (like,)
-                ).fetchall()
+            for (uid,) in self._conn.execute(
+                f"SELECT user_id FROM {self._ts} WHERE scope = %s", (scope,),
+            ):
+                if uid:
+                    ids.add(str(uid))
+            if scope:
+                prefix = scope + ":"
+                for (uid,) in self._conn.execute(
+                    f"SELECT user_id FROM {self._t} WHERE user_id LIKE %s",
+                    (prefix + "%",),
+                ):
+                    bare = _bare_wallet_uid(uid, scope)
+                    if bare:
+                        ids.add(bare)
             else:
-                rows = self._conn.execute(
+                for (uid,) in self._conn.execute(
                     f"SELECT user_id FROM {self._t} WHERE user_id NOT LIKE '%:%'"
-                ).fetchall()
-        return [r[0] for r in rows]
+                ):
+                    if uid:
+                        ids.add(str(uid))
+            for table in (self._to, self._tt, self._ta):
+                for (uid,) in self._conn.execute(
+                    f"SELECT DISTINCT user_id FROM {table} WHERE scope = %s",
+                    (scope,),
+                ):
+                    if uid:
+                        ids.add(str(uid))
+        return sorted(ids)
+
+    def list_users(self, *, scope: str = "", limit: int = 40, offset: int = 0
+                   ) -> tuple[list[tuple[str, float]], int]:
+        ids = self.user_ids(scope=scope)
+        seen: dict[str, float] = {}
+        with self._lock:
+            for uid, ts in self._conn.execute(
+                f"SELECT user_id, last_seen FROM {self._ts} WHERE scope = %s",
+                (scope,),
+            ):
+                if uid:
+                    seen[str(uid)] = float(ts or 0)
+        return _page_users(ids, seen, limit=limit, offset=offset)
 
     def balance(self, user_id: str) -> Money:
         with self._lock:

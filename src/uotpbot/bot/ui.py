@@ -266,6 +266,21 @@ class MenuUI:
         """The wallet store backing top-ups, or None in dict-mode (tests/dev)."""
         return getattr(self.router, "wallets", None)
 
+    def _touch_user(self, user_id: str) -> None:
+        """Remember this Telegram id used the bot, even with a ₹0 wallet.
+
+        Best-effort: a directory write must never block a tap. Tests and
+        dict-mode routers have no store and skip.
+        """
+        store = self._store
+        fn = getattr(store, "touch_user", None)
+        if not callable(fn) or not user_id:
+            return
+        try:
+            fn(user_id)
+        except Exception:  # noqa: BLE001 - directory is not the money path
+            log.debug("touch_user failed for %s", user_id, exc_info=True)
+
     @property
     def support_contact(self) -> str:
         """The support username customers see, live-editable by the owner.
@@ -858,6 +873,7 @@ class MenuUI:
         """
         body = (body or "").strip()
         low = body.lower()
+        self._touch_user(user_id)
         # Owner kill-switch: non-owners are shut out of everything (the router's
         # _authorised also gates typed commands, but give a friendly message).
         closed = self._bot_closed_reply(user_id)
@@ -1648,6 +1664,7 @@ class MenuUI:
 
     def photo(self, user_id: str, file_id: str) -> Reply:
         """A photo message arrives: payment screenshot, QR, or confusion."""
+        self._touch_user(user_id)
         closed = self._bot_closed_reply(user_id)
         if closed is not None:
             return closed
@@ -2042,6 +2059,7 @@ class MenuUI:
         a wrong guess here can never spend money, because spending requires
         the confirm step, which re-quotes the price live.
         """
+        self._touch_user(user_id)
         closed = self._bot_closed_reply(user_id)
         if closed is not None:
             return closed
@@ -2142,10 +2160,13 @@ class MenuUI:
             # command and render its reply; input actions (credit/debit/ban/
             # broadcast) start a short prompt that collects the details on the
             # next message. Owner-gated; blocked for anyone else.
-            if not self.router._is_owner(user_id) or len(parts) != 2:
+            if not self.router._is_owner(user_id) or len(parts) < 2:
                 return Reply("Owner only.", ok=False, rows=((("🏠 Menu", "m"),),))
             action = parts[1]
-            if action in {"users", "orders", "metrics", "provider", "sunkcost"}:
+            if action == "users":
+                page = _int(parts[2], 0) if len(parts) >= 3 else 0
+                return self._with_back(self.router.handle(user_id, f"/users {page}"))
+            if action in {"orders", "metrics", "provider", "sunkcost"}:
                 # Command replies render fine but carry no navigation; wrap
                 # them so the owner never gets stuck (Fix: back button everywhere).
                 return self._with_back(self.router.handle(user_id, f"/{action}"))

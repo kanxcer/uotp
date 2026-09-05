@@ -226,3 +226,102 @@ def test_orders_rich_history_fields_and_get_order(tmp_path):
     assert delivered.spent.paise == 1000
     assert store.get_order(rows[1].id, scope="", user_id="someone-else") is None
     store.close()
+
+
+def test_user_directory_unions_seen_orders_topups_and_wallets(tmp_path):
+    """All users must list everyone who used the bot, not only wallet rows.
+
+    A /start with ₹0 never wrote a wallets row, which is why the owner panel
+    used to show 2 customers while many were live.
+    """
+    store = SqliteWallets(str(tmp_path / "w.db"))
+    store.touch_user("aaa")  # /start only, ₹0
+    store.record_order(user_id="bbb", slug="telegram", amount=INR(10), success=True)
+    store.adjust("ccc", INR(50))
+    store.create_topup("ddd", INR(20))
+    ids = set(store.user_ids())
+    assert ids >= {"aaa", "bbb", "ccc", "ddd"}
+    fs = store.float_stats()
+    assert fs["users"] == len(ids)
+    assert fs["float"] == INR(50)  # only ccc holds money
+    # Empty / whitespace ids are ignored.
+    store.touch_user("")
+    store.touch_user("   ")
+    assert "" not in store.user_ids()
+    store.close()
+
+
+def test_scoped_user_ids_are_isolated_and_unprefixed(tmp_path):
+    """Sub-bot customer lists must not leak across bots, and must return the
+    bare Telegram id (not ``scope:uid``) so balance_of() prefixes once."""
+    store = SqliteWallets(str(tmp_path / "w.db"))
+    bot_a = ScopedWallets(store, "bta1")
+    bot_b = ScopedWallets(store, "btb2")
+    bot_a.touch_user("111")
+    bot_a.adjust("111", INR(10))
+    bot_b.touch_user("222")
+    assert bot_a.user_ids() == ["111"]
+    assert bot_b.user_ids() == ["222"]
+    assert store.user_ids(scope="bta1") == ["111"]
+    # Platform (empty scope) must not treat scoped wallet keys as customers.
+    assert "bta1:111" not in store.user_ids()
+    assert "111" not in store.user_ids()
+    store.close()
+
+
+def test_list_users_paginates(tmp_path):
+    store = SqliteWallets(str(tmp_path / "w.db"))
+    for i in range(45):
+        store.touch_user(f"{i:03d}")
+    page, total = store.list_users(limit=40, offset=0)
+    assert total == 45
+    assert len(page) == 40
+    page2, total2 = store.list_users(limit=40, offset=40)
+    assert total2 == 45
+    assert len(page2) == 5
+    assert {u for u, _ in page}.isdisjoint({u for u, _ in page2})
+    store.close()
+
+
+def test_start_only_user_appears_in_admin_list_and_broadcast(tmp_path):
+    """Tapping /start (no payment) must show up in All users, Total users,
+    and the broadcast audience."""
+    store = SqliteWallets(str(tmp_path / "w.db"))
+    router, _ = _router(wallets=store)
+    ui = MenuUI(router)
+    ghost = "555"
+    ui.text(ghost, "/start")
+    assert ghost in store.user_ids()
+    fs = store.float_stats()
+    assert fs["users"] >= 1
+    listed = router.handle(OWNER, "/users")
+    assert listed.ok and ghost in listed.text
+    assert "₹0.00" in listed.text
+    panel = ui.admin_panel(OWNER)
+    assert f"Total users: {fs['users']}" in panel.text
+    blast = router.handle(OWNER, "/broadcast hi there")
+    assert any(t == ghost for t, _ in blast.notify)
+    store.close()
+
+
+def test_cmd_users_paginates_past_the_old_30_cap(tmp_path):
+    store = SqliteWallets(str(tmp_path / "w.db"))
+    router, _ = _router(wallets=store)
+    ui = MenuUI(router)
+    for i in range(45):
+        store.adjust(str(10_000 + i), INR(1))
+    first = router.handle(OWNER, "/users")
+    assert first.ok
+    assert "page 1/" in first.text
+    assert "Customers (45)" in first.text
+    datas = [d for row in first.rows for _l, d in row]
+    assert "ax:users:1" in datas
+    # All 45 must be reachable; the first page is 40, not a silent [:30].
+    # Each id is wrapped in a backtick pair (`uid`).
+    assert first.text.count("`") == 80
+    second = router.handle(OWNER, "/users 1")
+    assert second.ok and "page 2/" in second.text
+    assert second.text.count("`") == 10
+    via_btn = ui.button(OWNER, "ax:users:1")
+    assert via_btn.ok and "page 2/" in via_btn.text
+    store.close()

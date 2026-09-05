@@ -33,6 +33,10 @@ log = logging.getLogger("uotpbot.commands")
 
 __all__ = ["CommandRouter", "HELP_TEXT"]
 
+#: Page size for the owner "All users" list. Telegram messages cap at 4096
+#: chars; ~40 ids with balance + last-seen stays comfortably under that.
+_USERS_PAGE = 40
+
 HELP_TEXT = """YCOTP bot
 
 /buy <service>        Buy a number and wait for the OTP
@@ -1510,26 +1514,72 @@ class CommandRouter:
         return Reply("\n".join(lines))
 
     def cmd_users(self, user_id: str, args: list[str]) -> Reply:
-        """👥 /users — active customers and balances (owner)."""
+        """👥 /users [page] — every customer who used the bot (owner).
+
+        Includes /start-only users (₹0, no wallet row) via the seen-users
+        directory, plus anyone with a historical order/top-up/wallet. Pages
+        of ``_USERS_PAGE``; never silently truncates.
+        """
         if not self._is_owner(user_id):
             return Reply("Owner only.", ok=False)
-        store = self.wallets
-        ufn = getattr(store, "user_ids", None) if store is not None else None
-        if callable(ufn):
+        page = 0
+        if args:
             try:
-                uids = list(ufn())
+                page = max(0, int(str(args[0]).strip()))
+            except ValueError:
+                page = 0
+        store = self.wallets
+        lister = getattr(store, "list_users", None) if store is not None else None
+        if callable(lister):
+            try:
+                page_rows, total = lister(
+                    limit=_USERS_PAGE, offset=page * _USERS_PAGE)
             except Exception as exc:  # noqa: BLE001
                 return Reply(f"Could not read users: {exc}", ok=False)
         else:
-            uids = list(self.balances.keys())
-        if not uids:
+            ufn = getattr(store, "user_ids", None) if store is not None else None
+            if callable(ufn):
+                try:
+                    uids = list(ufn())
+                except Exception as exc:  # noqa: BLE001
+                    return Reply(f"Could not read users: {exc}", ok=False)
+            else:
+                uids = list(self.balances.keys())
+            total = len(uids)
+            chunk = uids[page * _USERS_PAGE: (page + 1) * _USERS_PAGE]
+            page_rows = [(u, 0.0) for u in chunk]
+        if total == 0:
             return Reply("No customers yet.")
-        lines = [f"👥 Customers ({len(uids)}):"]
-        for u in uids[:30]:
+        pages = max(1, (total + _USERS_PAGE - 1) // _USERS_PAGE)
+        if page >= pages and pages:
+            page = pages - 1
+            if callable(lister):
+                try:
+                    page_rows, total = lister(
+                        limit=_USERS_PAGE, offset=page * _USERS_PAGE)
+                except Exception:  # noqa: BLE001
+                    pass
+            else:
+                page_rows = [(u, 0.0) for u in uids[
+                    page * _USERS_PAGE: (page + 1) * _USERS_PAGE]]
+        lines = [f"👥 Customers ({total}) · page {page + 1}/{pages}"]
+        for u, seen in page_rows:
             bal = self.balance_of(u)
             tag = " 👑" if self._is_owner(u) else ""
-            lines.append(f"\n`{u}` · {bal}{tag}")
-        return Reply("\n".join(lines))
+            when = ""
+            if seen:
+                when = f" · {format_ts(seen, sep=' ', time_fmt='%H:%M')}"
+            lines.append(f"\n`{u}` · {bal}{when}{tag}")
+        nav: list[tuple[str, str]] = []
+        if page > 0:
+            nav.append(("◀️ Prev", f"ax:users:{page - 1}"))
+        if (page + 1) * _USERS_PAGE < total:
+            nav.append(("Next ▶️", f"ax:users:{page + 1}"))
+        rows: list[tuple[tuple[str, str], ...]] = []
+        if nav:
+            rows.append(tuple(nav))
+        rows.append((("◀️ Owner panel", "a"),))
+        return Reply("\n".join(lines), rows=tuple(rows))
 
     def cmd_broadcast(self, user_id: str, args: list[str]) -> Reply:
         """📢 /broadcast <message> — announce to every authorised customer."""
