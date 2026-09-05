@@ -100,7 +100,10 @@ _REPLY_MENU: tuple[tuple[tuple[str, str], ...], ...] = (
     (("🛒 Buy Number", "l"), ("🧾 My Numbers", "o")),
     (("💰 Wallet", "w"), ("❓ Help", "h")),
     (("⭐ Favourites", "fav"), ("🆘 Support", "support")),
-    (("⚙️ Admin Panel", "a"),),
+    # Admin is NEVER on the persistent keyboard. Telegram caches this keyboard
+    # on the client, so a customer who once received an Admin key kept seeing
+    # it. The owner opens the panel from the inline "📊 Owner" button on the
+    # main menu (or /admin). A typed "admin panel" still routes, owner-gated.
 )
 REPLY_MENU_LABELS: dict[str, str] = {
     label: cb for row in _REPLY_MENU for label, cb in row
@@ -549,7 +552,16 @@ class MenuUI:
     def _fg_order_id(reply) -> Optional[str]:
         """The FamGateway order id carried on a reply's buttons, if any."""
         for row in getattr(reply, "rows", ()) or ():
-            for label, data in row:
+            # A lone (label, data) pair is a 1-button row; otherwise a sequence
+            # of pairs. Tolerate both so a shape quirk never drops fg_msg.
+            items = (row,) if (
+                isinstance(row, (tuple, list)) and len(row) == 2
+                and all(isinstance(v, str) for v in row)
+            ) else row
+            for item in items:
+                if not (isinstance(item, (tuple, list)) and len(item) == 2):
+                    continue
+                data = item[1]
                 if isinstance(data, str) and data.startswith("fg:"):
                     parts = data.split(":")
                     if len(parts) == 3 and parts[1] in ("pay", "check"):
@@ -1390,7 +1402,8 @@ class MenuUI:
                 name = self.catalog.get(a.slug).name if self.catalog.has(a.slug) else a.slug
             except Exception:  # noqa: BLE001 - never blank the whole screen
                 name = a.slug
-            rows.append(((f"🟢 Active · {name}", f"oact:{a.token}"),))
+            mins = self._display_minutes_left(a)
+            rows.append(((f"🟢 Active · {name} · {mins} min", f"oact:{a.token}"),))
 
         entries = self._recent_orders(user_id)
         if entries:
@@ -1549,7 +1562,11 @@ class MenuUI:
 
     def admin_panel(self, user_id: str) -> Reply:
         if not self.router._is_owner(user_id):
-            return Reply("Owner only.", ok=False, buttons=(("🏠 Menu", "m"),))
+            # Cached Telegram keyboards stick until a NEW ReplyKeyboardMarkup
+            # is sent. Returning the public main menu (persistent_menu=True)
+            # replaces the leftover "⚙️ Admin Panel" key for this customer.
+            menu = self.main_menu(user_id)
+            return replace(menu, text="Owner only.\n\n" + menu.text, ok=False)
         status = self.router.engine.status()
         pnl = status["pnl"]
         pending = self._pending_topups()

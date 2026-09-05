@@ -203,36 +203,70 @@ def test_happy_path_message_not_found_skips_edit():
 
 
 def test_payment_notifier_falls_back_to_text_when_caption_edit_fails():
-    """The notifier tries edit_message_caption for the QR photo; if that is
-    rejected (e.g. not actually a photo), it falls back to edit_message_text."""
-    import asyncio
-    from concurrent.futures import Future
-    from unittest.mock import AsyncMock, MagicMock
-    import uotpbot.bot.alerts as alerts_mod
+    """The notifier edits via the Bot HTTP API (PTB 21 has no Application.loop,
+    so webhook/sweep threads cannot await app.bot.*). Caption edit first; if
+    that is rejected, fall back to editMessageText."""
+    import json
+    from io import BytesIO
+    from unittest.mock import MagicMock, patch
+    import urllib.error
+
     app = MagicMock()
-    app.loop = asyncio.new_event_loop()
-    app.bot.edit_message_caption = AsyncMock(side_effect=Exception("cannot edit"))
-    app.bot.edit_message_text = AsyncMock()
+    app.bot.token = "123:ABC"
     notifier = PaymentNotifier()
     notifier.attach(app)
-    # The bridge schedules on the poller loop; run the coroutine inline here
-    # since this test owns a non-running loop.
-    def _run_now(coro, loop):
-        fut = Future()
-        try:
-            loop.run_until_complete(coro)
-            fut.set_result(None)
-        except Exception as exc:  # pragma: no cover
-            fut.set_exception(exc)
-        return fut
-    orig = alerts_mod.asyncio.run_coroutine_threadsafe
-    alerts_mod.asyncio.run_coroutine_threadsafe = _run_now
-    try:
+
+    calls = []
+
+    def fake_urlopen(req, timeout=15):
+        url = getattr(req, "full_url", str(req))
+        calls.append(url)
+        if "editMessageCaption" in url:
+            raise urllib.error.HTTPError(
+                url, 400, "Bad Request", hdrs=None,
+                fp=BytesIO(json.dumps({
+                    "ok": False, "description": "there is no caption",
+                }).encode()),
+            )
+
+        class _Resp:
+            def read(self):
+                return json.dumps({"ok": True, "result": True}).encode()
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+        return _Resp()
+
+    with patch("urllib.request.urlopen", fake_urlopen):
         ok = notifier.edit_order_message(222, 77, "✅ done")
-    finally:
-        alerts_mod.asyncio.run_coroutine_threadsafe = orig
-        app.loop.close()
     assert ok is True
-    # Caption edit failed -> text edit used as the fallback.
-    app.bot.edit_message_text.assert_awaited_once_with(
-        chat_id=222, message_id=77, text="✅ done")
+    assert any("editMessageCaption" in u for u in calls)
+    assert any("editMessageText" in u for u in calls)
+
+
+def test_payment_notifier_edits_without_app_loop():
+    """The production bug: PTB 21 Application has no .loop, so the old
+    run_coroutine_threadsafe path skipped the edit. HTTP must still work."""
+    import json
+    from unittest.mock import MagicMock, patch
+
+    app = MagicMock()
+    app.bot.token = "123:ABC"
+    # Deliberately NO app.loop -- this is the PTB 21 production shape.
+    if hasattr(app, "loop"):
+        del app.loop
+    notifier = PaymentNotifier()
+    notifier.attach(app)
+
+    class _Resp:
+        def read(self):
+            return json.dumps({"ok": True, "result": True}).encode()
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    with patch("urllib.request.urlopen", lambda *a, **k: _Resp()):
+        ok = notifier.edit_order_message(222, 77, "✅ Payment received!")
+    assert ok is True

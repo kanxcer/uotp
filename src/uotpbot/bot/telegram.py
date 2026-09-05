@@ -547,14 +547,19 @@ class TelegramFrontend:
         try:
             order_id = self.ui._fg_order_id(reply)
             if not order_id:
+                log.warning("QR sent but no fg:pay/check order id on the reply")
                 return
             chat_id = getattr(getattr(sent, "chat", None), "id", None)
             message_id = getattr(sent, "message_id", None)
             if chat_id is None or message_id is None:
+                log.warning("QR sent for %s but reply_photo returned no chat/message id",
+                            order_id)
                 return
             self.ui.remember_fg_message(order_id, chat_id, message_id)
+            log.info("remembered QR message %s:%s for order %s",
+                     chat_id, message_id, order_id)
         except Exception:  # noqa: BLE001 - a nicety, never break delivery
-            pass
+            log.warning("could not remember QR message location", exc_info=True)
 
     @staticmethod
     def _is_photo_message(message: Any) -> bool:
@@ -602,7 +607,20 @@ class TelegramFrontend:
 
 
 async def _post_init(app: Any) -> None:  # pragma: no cover - network call
-    """Register Telegram's built-in command menu next to the text box."""
+    """Register Telegram's built-in command menu next to the text box.
+
+    Also captures the running event loop onto the payment notifier / owner
+    alert so off-thread callers have it if they want it. (QR edits themselves
+    go through the Bot HTTP API and do not need the loop.)
+    """
+    try:
+        loop = asyncio.get_running_loop()
+        for key in ("payment_notifier", "owner_alert"):
+            obj = (getattr(app, "bot_data", None) or {}).get(key)
+            if obj is not None and hasattr(obj, "set_loop"):
+                obj.set_loop(loop)
+    except Exception:  # noqa: BLE001 - never block startup
+        log.warning("could not capture poller loop for bridges", exc_info=True)
     try:
         await app.bot.set_my_commands([
             ("start", "🏠 Open the menu"),
@@ -683,9 +701,17 @@ def run_bot(settings: Settings, router_factory: Any,
     # reach the owner through this app's event loop.
     if owner_alert is not None:
         owner_alert.attach(app)
+        try:
+            app.bot_data["owner_alert"] = owner_alert
+        except Exception:  # noqa: BLE001
+            pass
     # Phase-2: hand the payment notifier to the app so the FamGateway
     # webhook/sweep can edit a customer's QR message the moment payment lands.
     if payment_notifier is not None:
         payment_notifier.attach(app)
+        try:
+            app.bot_data["payment_notifier"] = payment_notifier
+        except Exception:  # noqa: BLE001
+            pass
     log.info("bot starting")
     _start_polling(app)

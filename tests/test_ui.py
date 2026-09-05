@@ -231,15 +231,15 @@ def test_owner_panel_shows_money_state(rig):
 
 
 def test_reply_menu_hides_admin_from_users():
-    """The persistent bottom keyboard must not show '⚙️ Admin Panel' to a
-    user; only the owner's keyboard carries it. Routing still re-checks owner."""
+    """The persistent bottom keyboard must never carry an Admin Panel key.
+    Telegram caches ReplyKeyboardMarkup on the client, so putting Admin on it
+    made every customer keep seeing it. Owner uses the inline 📊 Owner button
+    (or /admin); routing still re-checks owner."""
     from uotpbot.bot.telegram import _is_admin_label, _REPLY_MENU
-    # The owner-only key is detected by the helper.
-    assert any(_is_admin_label(lbl) for row in _REPLY_MENU for lbl, _cb in row)
-    # Public keys are never admin.
-    topub = [lbl for row in _REPLY_MENU for lbl, _cb in row
-             if not _is_admin_label(lbl)]
-    assert "⚙️ Admin Panel" not in topub
+    assert not any(_is_admin_label(lbl) for row in _REPLY_MENU for lbl, _cb in row)
+    labels = [lbl for row in _REPLY_MENU for lbl, _cb in row]
+    assert "⚙️ Admin Panel" not in labels
+    assert "🛒 Buy Number" in labels
 
 
 def test_validity_resume_naive_timestamp_is_tz_safe():
@@ -672,7 +672,12 @@ def test_record_active_never_stores_zero_validity(rig):
     router._record_active(USER, "telegram", INR(15), _Result(), "tok-t")
     active = store.active_numbers(user_id=USER)
     assert active, "a freshly-bought number must appear under My numbers"
-    assert active[0].seconds_left > 0, f"must have positive validity, got {active[0].seconds_left}"
+    left = active[0].seconds_left
+    assert left > 0, f"must have positive validity, got {left}"
+    # Provider said 0s; we still grant the full 20-minute platform lease.
+    from uotpbot.catalog import PROVIDER_VALIDITY_MINUTES
+    assert 19 * 60 <= left <= PROVIDER_VALIDITY_MINUTES * 60 + 2, \
+        f"fresh purchase must show ~20 min, not 1; got {left/60:.1f} min"
 
 
 # -- ⚡ FamGateway live order flow (stubbed client) ------------------------

@@ -1011,10 +1011,12 @@ class CommandRouter:
             # can receive MORE codes on it during its validity window (Fix #2).
             self._record_order(user_id, slug, result.order.gross_price, result,
                                keep_active=True)
+            from ..catalog import PROVIDER_VALIDITY_MINUTES
             left = self._remaining_otp_minutes(getattr(result, "_alloc", None))
-            valid = ""
-            if left is not None:
-                valid = f"\n⏳ Number valid for {self._minute_text(left)} — use it before that."
+            if left is None or left < 5:
+                left = PROVIDER_VALIDITY_MINUTES
+            left = min(int(left), PROVIDER_VALIDITY_MINUTES)
+            valid = f"\n⏳ Number valid for ~{left} min — you can receive more OTPs on it."
             reply = Reply(
                 f"✅ OTP for {self.catalog.get(slug).name}: `{result.otp}`\n"
                 f"📱 Number: {result.phone}\n\n"
@@ -1133,13 +1135,10 @@ class CommandRouter:
         # (the persistent "bought it but it never appears" bug).
         from ..catalog import PROVIDER_VALIDITY_MINUTES
         max_valid = PROVIDER_VALIDITY_MINUTES * 60
-        if alloc is not None:
-            seconds_left = min(max(alloc.seconds_left(), 0), max_valid) \
-                or PROVIDER_VALIDITY_MINUTES * 60  # non-zero floor
-            seconds_left = max(seconds_left, self.engine.config.otp_timeout_seconds)
-            valid_until = time.time() + seconds_left
-        else:
-            valid_until = time.time() + max_valid  # provider validity default
+        # Always grant the platform lease from OUR clock (20 min). Provider
+        # seconds_left can be ~1 min (clock skew) or ~100 min (misparsed
+        # allocated_at); neither is the product lease.
+        valid_until = time.time() + max_valid
         try:
             rec(user_id=user_id, slug=slug, phone=result.phone or "",
                 provider_order_id=provider_id, token=token, gross=price,
