@@ -477,12 +477,23 @@ def test_flow_offers_both_modes_with_the_fee_named_up_front():
     flow, _ = make_flow()
     flow.start("u1")
     result = flow.on_text("u1", GOOD_TOKEN)
-    assert result.buttons
-    labels = " ".join(label for label, _ in result.buttons)
+    labels = _labels(result)
     assert "38%" in labels
     assert "own" not in labels.lower() or "UOTP" in result.reply
     assert flow.pending("u1").step == Step.AWAIT_MARGIN
     assert "cannot add your own UOTP API" in result.reply
+
+
+def test_extra_percent_is_a_button_grid():
+    """Token paste is the only typed step; extra % is all buttons."""
+    flow, _ = make_flow()
+    flow.start("u1")
+    result = flow.on_text("u1", GOOD_TOKEN)
+    labels = _labels(result)
+    for pct in ("20%", "30%", "38%", "50%", "75%"):
+        assert pct in labels
+    assert "Cancel" in labels
+    assert "Reply with a number" not in result.reply
 
 
 def test_mode_button_label_follows_the_configured_fee():
@@ -491,7 +502,7 @@ def test_mode_button_label_follows_the_configured_fee():
     flow, _ = make_flow(fee=fee)
     flow.start("u1")
     result = flow.on_text("u1", GOOD_TOKEN)
-    labels = " ".join(label for label, _ in result.buttons)
+    labels = _labels(result)
     assert "38%" in labels
     assert "7%" not in labels
 
@@ -579,7 +590,7 @@ def test_cancel_mid_flow_leaves_no_state():
 def test_text_without_a_session_is_ignored_safely():
     flow, _ = make_flow()
     result = flow.on_text("nobody", "hello")
-    assert "/createbot" in result.reply
+    assert "Create" in result.reply or "create" in result.reply.lower()
 
 
 # -------------------------------------------------------- multi-bot manager
@@ -615,7 +626,8 @@ def test_manager_does_not_double_start():
                          mode=SubBotMode.PLATFORM_API, fee=DEFAULT_PLATFORM_FEE))
     mgr = MultiBotManager(reg, lambda sb: None, lambda sb, r: (lambda: time.sleep(1)))
     assert mgr.start(bot.id) is True
-    assert mgr.start(bot.id) is False
+    assert mgr.start(bot.id) is True  # already running is success, not a second thread
+    assert mgr.running() == [bot.id]
     mgr.stop_all()
 
 
@@ -968,8 +980,9 @@ def test_pasting_a_token_through_the_router_advances_the_flow():
         reply = router.handle("111", GOOD_TOKEN)
         assert "UOTP bot" not in reply.text, "help text swallowed the token paste"
         assert "Token received" in reply.text
-        assert len(reply.buttons) == 1  # 38% suggested
-        assert router.handle("111", "hello").buttons or True  # no crash on junk
+        assert "38%" in _labels(reply)
+        assert "20%" in _labels(reply)
+        assert router.handle("111", "hello").rows or True  # no crash on junk
     finally:
         ledger.close()
 
@@ -981,7 +994,8 @@ def test_full_own_api_flow_through_the_router_with_typed_choices():
         _start_create(router)
         router.handle("111", GOOD_TOKEN)
         disclosure = router.handle("111", "38")
-        assert "Read this before you confirm" in disclosure.text
+        assert "Create my bot" in _labels(disclosure)
+        assert "Read this" in disclosure.text
         assert "38%" in disclosure.text
         assert "own UOTP API" in disclosure.text
         created = router.handle("111", "yes")
@@ -1050,7 +1064,7 @@ def test_unauthorised_plain_text_cannot_advance_someone_elses_flow():
         router.handle_callback("999", CB_CONFIRM)
         assert registry.count() == 0
         # owner's flow is untouched and still completes
-        assert "Read this before you confirm" in router.handle("111", "38").text
+        assert "Create my bot" in _labels(router.handle("111", "38"))
     finally:
         ledger.close()
 
@@ -1062,6 +1076,109 @@ def test_unauthorised_user_cannot_start_a_flow_by_talking_to_another_one():
         assert not out.ok  # no pending flow -> help, and never a creation
     finally:
         ledger.close()
+
+
+def test_createbot_calls_on_bot_created_so_the_poller_starts():
+    """The live bug: clones were saved but never polled because serve wired
+    WhiteLabel.on_created, while /createbot only calls router.on_bot_created."""
+    router, registry, ledger = _wl_router()
+    try:
+        started = []
+        router.on_bot_created = lambda bot: started.append(bot.id)
+        _start_create(router)
+        router.handle("111", GOOD_TOKEN)
+        router.handle_callback("111", CB_MARGIN_SUGGESTED)
+        done = router.handle_callback("111", CB_CONFIRM)
+        assert registry.count() == 1
+        assert started == [registry.all_active()[0].id]
+        assert "starting now" in done.text.lower()
+        assert "Restart" in _labels(router.handle("111", "/mybots"))
+        assert "Delete" in _labels(router.handle("111", "/mybots"))
+    finally:
+        ledger.close()
+
+
+def test_createbot_reports_poller_start_failure_and_offers_restart():
+    router, registry, ledger = _wl_router()
+    try:
+        def boom(bot):
+            raise RuntimeError("no poller")
+        router.on_bot_created = boom
+        _start_create(router)
+        router.handle("111", GOOD_TOKEN)
+        router.handle_callback("111", CB_MARGIN_SUGGESTED)
+        done = router.handle_callback("111", CB_CONFIRM)
+        assert registry.count() == 1
+        assert not done.ok
+        assert "did not start" in done.text.lower()
+        assert "Restart" in done.text
+    finally:
+        ledger.close()
+
+
+def test_mybots_restart_and_delete_are_buttons_not_commands():
+    router, registry, ledger = _wl_router()
+    try:
+        class Mgr:
+            def __init__(self):
+                self._live: list[str] = []
+                self.calls: list[tuple] = []
+
+            def running(self):
+                return list(self._live)
+
+            def errors(self):
+                return {}
+
+            def start(self, bot_id):
+                self.calls.append(("start", bot_id))
+                self._live = [bot_id]
+                return True
+
+            def stop(self, bot_id, timeout=10.0):
+                self.calls.append(("stop", bot_id))
+                self._live = [x for x in self._live if x != bot_id]
+                return True
+
+            def restart(self, bot_id, timeout=2.0):
+                self.calls.append(("restart", bot_id))
+                self._live = [bot_id]
+                return True
+
+        mgr = Mgr()
+        router.subbot_manager = mgr
+        router.on_bot_created = lambda bot: mgr.start(bot.id)
+        _start_create(router)
+        router.handle("111", GOOD_TOKEN)
+        router.handle_callback("111", CB_MARGIN_SUGGESTED)
+        router.handle_callback("111", CB_CONFIRM)
+        bot = registry.all_active()[0]
+        listing = router.handle("111", "/mybots")
+        labs = _labels(listing)
+        assert "Restart" in labs and "Delete" in labs
+        assert "/deletebot" not in listing.text
+        rst = next(d for row in listing.rows for _l, d in row if d.startswith("cb:rst:"))
+        deleted = next(d for row in listing.rows for _l, d in row if d.startswith("cb:del:"))
+        restarted = router.handle_callback("111", rst)
+        assert ("restart", bot.id) in mgr.calls
+        assert "Restarted" in restarted.text or "live" in restarted.text.lower()
+        confirm = router.handle_callback("111", deleted)
+        assert "cannot be undone" in confirm.text.lower()
+        yes = next(d for row in confirm.rows for _l, d in row if d.startswith("cb:delok:"))
+        gone = router.handle_callback("111", yes)
+        assert ("stop", bot.id) in mgr.calls
+        assert "Deleted" in gone.text
+        assert registry.count() == 0
+    finally:
+        ledger.close()
+
+
+def test_serve_wires_on_bot_created_on_the_router_not_whitelabel():
+    import inspect
+    from uotpbot import __main__ as m
+    src = inspect.getsource(m._serve)
+    assert "main_router.on_bot_created" in src
+    assert "subbots.on_created =" not in src
 
 
 # ------------------------------------------- transport wiring (needs PTB)

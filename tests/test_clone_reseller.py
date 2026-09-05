@@ -70,7 +70,10 @@ def test_createbot_never_offers_own_api():
     flow = CreateBotFlow(SubBotRegistry(), token_verifier=lambda t, **k: (True, "x"))
     flow.start("u1")
     asked = flow.on_text("u1", GOOD_TOKEN)
-    labels = " ".join(l for l, _ in asked.buttons).lower()
+    labels = " ".join(
+        [l for l, _ in (asked.buttons or [])]
+        + [l for row in (asked.rows or []) for l, _ in row]
+    ).lower()
     assert "api" not in labels
     stale = flow.on_button("u1", CB_OWN_API)
     assert "not available" in stale.reply.lower()

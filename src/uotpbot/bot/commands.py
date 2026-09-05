@@ -17,7 +17,15 @@ import uuid
 
 from ..catalog import Catalog
 from ..cancel_tracker import CancelTracker
-from ..createbot import CB_HUB_ADD, CB_HUB_MINE, CreateBotFlow, CreateBotResult
+from ..createbot import (
+    CB_DEL_PREFIX,
+    CB_DELOK_PREFIX,
+    CB_HUB_ADD,
+    CB_HUB_MINE,
+    CB_RST_PREFIX,
+    CreateBotFlow,
+    CreateBotResult,
+)
 from ..economics import EconomicsError
 from ..engine import BotEngine
 from ..ledger import Ledger
@@ -513,8 +521,17 @@ class CommandRouter:
             return self._createbot_reply(self._createbot_flow.start(user_id))
         if data == CB_HUB_MINE:
             return self.cmd_mybots(user_id, [])
+        if data.startswith(CB_RST_PREFIX):
+            return self._restart_mybot(user_id, data[len(CB_RST_PREFIX):])
+        if data.startswith(CB_DEL_PREFIX):
+            return self._confirm_delete_mybot(user_id, data[len(CB_DEL_PREFIX):])
+        if data.startswith(CB_DELOK_PREFIX):
+            return self._delete_mybot(user_id, data[len(CB_DELOK_PREFIX):])
         if not self._createbot_flow.pending(user_id):
-            return Reply("That menu has expired. Send /createbot to start again.", ok=False)
+            return Reply(
+                "That menu has expired. Tap 🤖 Run your own bot to start again.",
+                ok=False,
+            )
         return self._createbot_reply(self._createbot_flow.on_button(user_id, data))
 
     # -- handlers --------------------------------------------------------
@@ -1327,6 +1344,8 @@ class CommandRouter:
             except Exception:  # noqa: BLE001 - never break /mybots
                 running, errors = set(), {}
         lines = []
+        rows: list[tuple[tuple[str, str], ...]] = []
+        down = False
         for b in bots:
             mode = "platform numbers" if b.mode.value == "platform_api" else "your own API"
             if b.active and b.id in running:
@@ -1335,6 +1354,7 @@ class CommandRouter:
             elif b.active:
                 token = "🔴"
                 state = "saved but NOT polling"
+                down = True
             else:
                 token = "⚪"
                 state = "stopped"
@@ -1349,42 +1369,157 @@ class CommandRouter:
                     fee = "platform numbers, no extra set"
             else:
                 fee = f"platform fee {b.fee.describe()}"
+            short = b.id[:8]
             lines.append(f"{token} `{b.id}` - {mode}, {fee}, {state}")
+            rows.append((
+                (f"🔄 Restart {short}", f"{CB_RST_PREFIX}{b.id}"),
+                (f"🗑 Delete {short}", f"{CB_DEL_PREFIX}{b.id}"),
+            ))
+        rows.append((("➕ Create / add bot", CB_HUB_ADD),))
         tip = (
-            "\n\nA bot that is saved but not polling usually means the token "
-            "isn't a real BotFather token (or lost access). Delete it with "
-            "/deletebot and /createbot again with a fresh token from "
-            "@BotFather → /newbot."
-            if any("saved but NOT polling" in l for l in lines)
-            else "\n\nManage with /stopbot and /deletebot."
+            "\n\n🔴 Saved but not polling: tap 🔄 Restart. "
+            "If it stays down, tap 🗑 Delete and create again with a fresh "
+            "@BotFather token."
+            if down
+            else "\n\nTap 🔄 Restart or 🗑 Delete on a bot."
         )
         return Reply(
             "Your bots:\n" + "\n".join(lines) + tip,
-            rows=add_row,
+            rows=tuple(rows),
         )
 
     def cmd_deletebot(self, user_id: str, args: list[str]) -> Reply:
         assert self.subbots is not None
         if not args:
-            return Reply("Usage: /deletebot <bot id>. See /mybots.", ok=False)
-        bot = self.subbots.find(args[0])
+            return self.cmd_mybots(user_id, [])
+        return self._delete_mybot(user_id, args[0])
+
+    def _owned_bot(self, user_id: str, bot_id: str):
+        if self.subbots is None or not bot_id:
+            return None
+        bot = self.subbots.find(bot_id)
         if bot is None or bot.owner_id != user_id:
-            return Reply("No bot of yours has that id.", ok=False)
+            return None
+        return bot
+
+    def _stop_poller(self, bot_id: str) -> None:
+        mgr = self.subbot_manager
+        if mgr is None:
+            return
+        stop = getattr(mgr, "stop", None)
+        if not callable(stop):
+            return
+        try:
+            try:
+                stop(bot_id, timeout=2.0)
+            except TypeError:
+                stop(bot_id)
+        except Exception:  # noqa: BLE001 - never block delete on a hung thread
+            log.exception("stop poller %s", bot_id)
+
+    def _restart_mybot(self, user_id: str, bot_id: str) -> Reply:
+        bot = self._owned_bot(user_id, bot_id)
+        if bot is None:
+            return Reply(
+                "No bot of yours has that id.",
+                ok=False,
+                rows=((("📋 My bots", CB_HUB_MINE),),),
+            )
+        mgr = self.subbot_manager
+        ok = False
+        if mgr is not None:
+            restart = getattr(mgr, "restart", None)
+            start = getattr(mgr, "start", None)
+            try:
+                if callable(restart):
+                    try:
+                        ok = bool(restart(bot.id, timeout=2.0))
+                    except TypeError:
+                        ok = bool(restart(bot.id))
+                elif callable(start):
+                    ok = bool(start(bot.id))
+            except Exception:  # noqa: BLE001
+                log.exception("restart %s", bot.id)
+                ok = False
+            try:
+                if bot.id in set(getattr(mgr, "running", lambda: [])()):
+                    ok = True
+            except Exception:  # noqa: BLE001
+                pass
+        listing = self.cmd_mybots(user_id, [])
+        if mgr is None:
+            head = (
+                f"Saved `{bot.id}`. On the live bot, Restart starts it immediately.\n\n"
+            )
+            return Reply(head + listing.text, rows=listing.rows)
+        if ok:
+            head = (
+                f"🟢 Restarted `{bot.id}` — open it and send /start.\n\n"
+            )
+        else:
+            err = ""
+            try:
+                err = (mgr.errors() or {}).get(bot.id, "")
+            except Exception:  # noqa: BLE001
+                err = ""
+            head = (
+                f"🔴 Could not start `{bot.id}`"
+                + (f" — {err}" if err else "")
+                + ".\n\n"
+            )
+        return Reply(head + listing.text, ok=ok, rows=listing.rows)
+
+    def _confirm_delete_mybot(self, user_id: str, bot_id: str) -> Reply:
+        bot = self._owned_bot(user_id, bot_id)
+        if bot is None:
+            return Reply(
+                "No bot of yours has that id.",
+                ok=False,
+                rows=((("📋 My bots", CB_HUB_MINE),),),
+            )
+        return Reply(
+            f"Delete bot `{bot.id}`? It will stop immediately. This cannot be undone.",
+            rows=(
+                (("🗑 Yes, delete", f"{CB_DELOK_PREFIX}{bot.id}"),
+                 ("✖️ Back", CB_HUB_MINE)),
+            ),
+        )
+
+    def _delete_mybot(self, user_id: str, bot_id: str) -> Reply:
+        bot = self._owned_bot(user_id, bot_id)
+        if bot is None:
+            return Reply(
+                "No bot of yours has that id.",
+                ok=False,
+                rows=((("📋 My bots", CB_HUB_MINE),),),
+            )
+        self._stop_poller(bot.id)
         self.subbots.delete(bot.id)
-        return Reply(f"Deleted bot `{bot.id}`.")
+        listing = self.cmd_mybots(user_id, [])
+        return Reply(
+            f"Deleted bot `{bot.id}`.\n\n" + listing.text,
+            rows=listing.rows,
+        )
 
     def _createbot_reply(self, result: CreateBotResult) -> Reply:
+        text = result.reply
+        ok = True
         if result.created is not None and self.on_bot_created is not None:
             try:
                 self.on_bot_created(result.created)
+                text += (
+                    "\n\n🟢 It's starting now — open the bot and send /start. "
+                    "Tap 📋 My bots to confirm it's live."
+                )
             except Exception as exc:  # the bot record exists; say so honestly
-                return Reply(
-                    f"{result.reply}\n\nNote: your bot was saved but its poller "
-                    f"did not start ({type(exc).__name__}). Use /restart to try again.",
-                    ok=False,
+                ok = False
+                text += (
+                    f"\n\n🔴 Saved but the poller did not start ({type(exc).__name__}). "
+                    "Tap 🔄 Restart on 📋 My bots."
                 )
         return Reply(
-            result.reply,
+            text,
+            ok=ok,
             buttons=tuple(result.buttons),
             rows=tuple(result.rows) if getattr(result, "rows", None) else (),
         )

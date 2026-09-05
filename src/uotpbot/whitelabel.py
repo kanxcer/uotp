@@ -519,7 +519,17 @@ class MultiBotManager:
         self._threads: dict[str, threading.Thread] = {}
         self._stop: dict[str, threading.Event] = {}
         self._errors: dict[str, str] = {}
+        self._apps: dict[str, Any] = {}
         self._lock = threading.RLock()
+
+    def bind_app(self, bot_id: str, app: Any) -> None:
+        """Remember the PTB Application so :meth:`stop` can halt ``run_polling``."""
+        with self._lock:
+            self._apps[bot_id] = app
+
+    def unbind_app(self, bot_id: str) -> None:
+        with self._lock:
+            self._apps.pop(bot_id, None)
 
     # -- lifecycle -------------------------------------------------------
     def start_all(self) -> list[str]:
@@ -527,10 +537,10 @@ class MultiBotManager:
         return [bot.id for bot in self.registry.all_active() if self.start(bot.id)]
 
     def start(self, bot_id: str) -> bool:
-        """Start one sub-bot's poller. ``False`` if it is unknown or running."""
+        """Start one sub-bot's poller. True if it is running (already or newly)."""
         with self._lock:
             if bot_id in self._threads and self._threads[bot_id].is_alive():
-                return False
+                return True
             bot = self.registry.find(bot_id)
         if bot is None or not bot.active:
             return False
@@ -555,8 +565,16 @@ class MultiBotManager:
     def stop(self, bot_id: str, timeout: float = 10.0) -> bool:
         """Signal one poller to stop and wait briefly for it."""
         with self._lock:
+            app = self._apps.pop(bot_id, None)
             stop = self._stop.pop(bot_id, None)
             thread = self._threads.pop(bot_id, None)
+        if app is not None:
+            stopper = getattr(app, "stop_running", None)
+            if callable(stopper):
+                try:
+                    stopper()
+                except Exception:  # noqa: BLE001 - join below is the fallback
+                    pass
         if stop is not None:
             stop.set()
         if thread is not None and thread.is_alive():
@@ -568,9 +586,9 @@ class MultiBotManager:
         for bot_id in list(self._threads):
             self.stop(bot_id, timeout)
 
-    def restart(self, bot_id: str) -> bool:
+    def restart(self, bot_id: str, timeout: float = 2.0) -> bool:
         """Stop and start one poller. The only automatic-retry escape hatch."""
-        self.stop(bot_id)
+        self.stop(bot_id, timeout=timeout)
         return self.start(bot_id)
 
     # -- introspection ---------------------------------------------------

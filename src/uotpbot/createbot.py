@@ -32,13 +32,16 @@ __all__ = [
     "CreateBotResult",
     "CB_HUB_MINE",
     "CB_HUB_ADD",
+    "CB_RST_PREFIX",
+    "CB_DEL_PREFIX",
+    "CB_DELOK_PREFIX",
     "clone_about",
     "clone_description",
     "apply_clone_profile",
     "platform_username_from_token",
 ]
 
-STEP_TIMEOUT_HINT = "Send /cancel to abort at any point."
+STEP_TIMEOUT_HINT = "Tap ✖️ Cancel to abort."
 
 CB_CONFIRM = "cb:createbot:confirm"
 CB_ABORT = "cb:createbot:abort"
@@ -46,6 +49,15 @@ CB_MARGIN_SUGGESTED = "cb:createbot:margin:38"
 # Landing hub (My bots / Create) — reachable without a pending session.
 CB_HUB_MINE = "cb:hub:mine"
 CB_HUB_ADD = "cb:hub:add"
+# My bots: restart / delete (bot id is hex, well under Telegram's 64-byte cap).
+CB_RST_PREFIX = "cb:rst:"
+CB_DEL_PREFIX = "cb:del:"
+CB_DELOK_PREFIX = "cb:delok:"
+# Extra-% grid. Token paste is the only typed step; these are buttons.
+CB_MARGIN_20 = "cb:createbot:margin:20"
+CB_MARGIN_30 = "cb:createbot:margin:30"
+CB_MARGIN_50 = "cb:createbot:margin:50"
+CB_MARGIN_75 = "cb:createbot:margin:75"
 # Legacy callbacks from the retired own-API / mode picker: treat as abort.
 CB_PLATFORM = "cb:createbot:platform"
 CB_OWN_API = "cb:createbot:own_api"
@@ -226,13 +238,14 @@ class CreateBotFlow:
         p.reset()
         p.fee = self._fee
         return CreateBotResult(
-            "Paste the **bot token** for the bot you want to run.\n"
-            "Get one from @BotFather: `/newbot` → name → username → token.\n\n"
-            "The token looks like `123456789:AAF...`. Keep it private; anyone "
-            "holding it controls that bot.\n\n"
-            "Your bot will sell OUR numbers. Customers pay through our UPI. "
-            "You pick an extra % on our selling price — we suggest **38%**.\n\n"
+            "Paste the **bot token** from @BotFather.\n"
+            "That's the only thing you type — everything else is a button.\n\n"
+            "Get one: @BotFather → /newbot → name → username → copy the token.\n"
+            "It looks like `123456789:AAF...`. Keep it private.\n\n"
+            "Your bot sells OUR numbers. Customers pay through our UPI. "
+            "Next you'll tap an extra % on our selling price (we suggest **38%**).\n\n"
             + STEP_TIMEOUT_HINT,
+            rows=self._cancel_rows(),
         )
 
     def cancel(self, owner_id: str) -> None:
@@ -244,7 +257,10 @@ class CreateBotFlow:
     def on_text(self, owner_id: str, text: str) -> CreateBotResult:
         p = self._pending.get(owner_id)
         if p is None:
-            return CreateBotResult("Send /createbot to start.", finished=True)
+            return CreateBotResult(
+                "Tap 🤖 Run your own bot, then ➕ Create / add bot to start.",
+                finished=True,
+            )
         text = text.strip()
         if p.step is Step.AWAIT_TOKEN:
             return self._take_token(p, text)
@@ -257,17 +273,36 @@ class CreateBotFlow:
                 self.cancel(owner_id)
                 return CreateBotResult("Cancelled. Nothing was created.", finished=True)
             return CreateBotResult(
-                "Reply `yes` to accept these terms and create the bot, or `no` to "
-                "cancel.\n\n" + self._terms_summary(p)
+                "Tap ✅ Create my bot to accept, or ✖️ Cancel.\n\n"
+                + self._terms_summary(p),
+                rows=self._confirm_rows(),
             )
         return CreateBotResult(
-            "Send the extra % you want to charge (e.g. 38), or tap the button.",
-            buttons=self._margin_buttons(),
+            "Tap a percentage below (we suggest 38%).",
+            rows=self._margin_rows(),
         )
 
     @staticmethod
+    def _margin_rows() -> list[tuple[tuple[str, str], ...]]:
+        return [
+            (("20%", CB_MARGIN_20), ("30%", CB_MARGIN_30)),
+            (("38% · suggested", CB_MARGIN_SUGGESTED),),
+            (("50%", CB_MARGIN_50), ("75%", CB_MARGIN_75)),
+            (("✖️ Cancel", CB_ABORT),),
+        ]
+
+    @staticmethod
+    def _confirm_rows() -> list[tuple[tuple[str, str], ...]]:
+        return [(("✅ Create my bot", CB_CONFIRM), ("✖️ Cancel", CB_ABORT))]
+
+    @staticmethod
+    def _cancel_rows() -> list[tuple[tuple[str, str], ...]]:
+        return [(("✖️ Cancel", CB_ABORT),)]
+
+    @staticmethod
     def _margin_buttons() -> list[tuple[str, str]]:
-        return [("Use 38% (suggested)", CB_MARGIN_SUGGESTED)]
+        # Kept for older tests that inspect `.buttons`; the live UI uses rows.
+        return [("38% · suggested", CB_MARGIN_SUGGESTED)]
 
     def _take_token(self, p: PendingCreation, token: str) -> CreateBotResult:
         if not validate_bot_token(token):
@@ -275,12 +310,14 @@ class CreateBotFlow:
                 "That does not look like a Telegram bot token.\n"
                 "It should be a numeric ID, a colon, then ~35 characters, "
                 "like `123456789:AAF...`.\n\n"
-                "Paste the full token again, or send /cancel."
+                "Paste the full token again, or tap ✖️ Cancel.",
+                rows=self._cancel_rows(),
             )
         if self._registry.find_by_token(token):
             return CreateBotResult(
-                "That bot token is already registered. Use /mybots to see it, "
-                "or /deletebot to remove it first."
+                "That bot token is already registered. Tap 📋 My bots to see it, "
+                "or delete it from there first.",
+                rows=[(("📋 My bots", CB_HUB_MINE), ("✖️ Cancel", CB_ABORT))],
             )
         p.bot_token = token
         p.step = Step.AWAIT_MARGIN
@@ -289,23 +326,22 @@ class CreateBotFlow:
         example = clone_price(sample, DEFAULT_RESELLER_RATE)
         return CreateBotResult(
             "Token received.\n\n"
-            "**What extra % do you want to charge on top of our selling price?**\n\n"
+            "**Tap the extra % you want on top of our selling price.**\n\n"
             "Suggested: **38%**\n"
             f"Example: if a service is {sample} here, at 38% your customers "
             f"pay {example}.\n\n"
             "You keep 95% of that extra; we keep 5% as the platform fee. "
             "Numbers always come from us — you cannot add your own UOTP API.\n\n"
-            "Reply with a number (e.g. `38` or `38%`), or tap the button.",
-            buttons=self._margin_buttons(),
+            "Tap a percentage below.",
+            rows=self._margin_rows(),
         )
 
     def _take_margin(self, p: PendingCreation, text: str) -> CreateBotResult:
         rate = parse_percent(text)
         if rate is None:
             return CreateBotResult(
-                "That doesn't look like a percentage. Send a number between "
-                "1 and 200 (we suggest 38), e.g. `38` or `38%`.",
-                buttons=self._margin_buttons(),
+                "Tap a percentage below (we suggest 38%).",
+                rows=self._margin_rows(),
             )
         return self._accept_margin(p, rate)
 
@@ -319,24 +355,29 @@ class CreateBotFlow:
         )
         p.step = Step.AWAIT_CONFIRM
         return CreateBotResult(
-            "**Read this before you confirm.**\n\n" + p.bot.fee_disclosure(),
-            buttons=[("I accept, create my bot", CB_CONFIRM), ("Cancel", CB_ABORT)],
+            "**Read this, then tap ✅ Create my bot.**\n\n" + p.bot.fee_disclosure(),
+            rows=self._confirm_rows(),
         )
 
     def on_button(self, owner_id: str, data: str) -> CreateBotResult:
         p = self._pending.get(owner_id)
         if p is None:
-            return CreateBotResult("Send /createbot to start.", finished=True)
+            return CreateBotResult(
+                "That menu expired. Tap 🤖 Run your own bot, then ➕ Create / add bot.",
+                finished=True,
+            )
         if data == CB_MARGIN_SUGGESTED or data.startswith("cb:createbot:margin:"):
             if p.step not in (Step.AWAIT_MARGIN, Step.AWAIT_TOKEN):
                 if p.step is Step.AWAIT_CONFIRM:
                     return CreateBotResult(
                         "Already have your extra %. Confirm or cancel below.",
-                        buttons=[("I accept, create my bot", CB_CONFIRM),
-                                 ("Cancel", CB_ABORT)],
+                        rows=self._confirm_rows(),
                     )
             if p.step is Step.AWAIT_TOKEN or not p.bot_token:
-                return CreateBotResult("Paste your bot token first.")
+                return CreateBotResult(
+                    "Paste your bot token first.",
+                    rows=self._cancel_rows(),
+                )
             suffix = data.rsplit(":", 1)[-1]
             rate = parse_percent(suffix) or DEFAULT_RESELLER_RATE
             return self._accept_margin(p, rate)
@@ -348,16 +389,23 @@ class CreateBotFlow:
             if data == CB_OWN_API:
                 return CreateBotResult(
                     "Your own UOTP API is not available on clone bots. "
-                    "Send /createbot to start again — you'll pick an extra % "
+                    "Tap ➕ Create / add bot to start again — you'll pick an extra % "
                     "on our selling price instead.",
                     finished=True,
+                    rows=[(("➕ Create / add bot", CB_HUB_ADD),)],
                 )
             return CreateBotResult("Cancelled. Nothing was created.", finished=True)
-        return CreateBotResult("Unknown action; send /cancel and try again.")
+        return CreateBotResult(
+            "Unknown action. Tap ✖️ Cancel and start again.",
+            rows=self._cancel_rows(),
+        )
 
     def _confirm(self, p: PendingCreation) -> CreateBotResult:
         if p.bot is None:
-            return CreateBotResult("Nothing to confirm; send /createbot to start.")
+            return CreateBotResult(
+                "Nothing to confirm. Tap ➕ Create / add bot to start.",
+                rows=[(("➕ Create / add bot", CB_HUB_ADD),)],
+            )
         ok, info = self._verify_token(p.bot.bot_token)
         if not ok:
             return CreateBotResult(
@@ -365,9 +413,10 @@ class CreateBotFlow:
                 "never reply.\n\n"
                 f"Reason: {info}\n\n"
                 "Create a fresh bot with @BotFather → /newbot, copy the token "
-                "exactly (a numeric ID, a colon, then ~35 chars), and /createbot "
-                "again. Nothing was created or charged.",
+                "exactly (a numeric ID, a colon, then ~35 chars), and tap "
+                "➕ Create / add bot again. Nothing was created or charged.",
                 finished=True,
+                rows=[(("➕ Create / add bot", CB_HUB_ADD),)],
             )
         try:
             self._registry.add(p.bot)
@@ -385,11 +434,12 @@ class CreateBotFlow:
             f"Extra on our prices: {extra_pct}%\n"
             f"You keep 95% of that extra; we keep 5%.\n"
             "Customers pay through our UPI. Withdraw from your admin panel.\n\n"
-            "It runs the same shop as this bot. Send it /start.\n"
-            "Manage it with /mybots and /deletebot."
+            "It runs the same shop as this bot. Open it and send /start.\n"
+            "Manage it from 📋 My bots (restart or delete)."
             + note,
             created=bot,
             finished=True,
+            rows=[(("📋 My bots", CB_HUB_MINE), ("➕ Create / add bot", CB_HUB_ADD))],
         )
 
     def _stamp_profile(self, bot_token: str) -> str:

@@ -379,6 +379,19 @@ def _serve(settings: Settings) -> int:
     poller = _make_poller(settings, router_factory, owner_alert=owner_alert,
                           payment_notifier=payment_notifier)
     if subbots is not None:
+        # MUST land on the router (not WhiteLabel.on_created). /createbot
+        # calls CommandRouter.on_bot_created; the previous assignment never
+        # ran, so new clones were saved but never polled until a redeploy.
+        def _on_created(bot) -> None:
+            if bot.id in subbots.manager.running():
+                return
+            if not subbots.manager.start(bot.id):
+                err = subbots.manager.errors().get(bot.id, "poller did not start")
+                log.error("could not start sub-bot %s: %s", bot.id, err)
+                raise RuntimeError(err)
+            log.info("sub-bot %s poller started", bot.id)
+
+        main_router.on_bot_created = _on_created
         started = subbots.manager.start_all()
         log.info("white-label: %d sub-bot(s) registered, started %d",
                  subbots.registry.count(), len(started))
@@ -391,13 +404,6 @@ def _serve(settings: Settings) -> int:
                 "sub-bot pollers are not running: %s", subbots.manager.errors()
             )
         log.info("white-label: %d of %d sub-bot poller(s) alive", len(live), len(started))
-        # Wire /createbot to the manager so a newly created bot goes live
-        # without a redeploy.
-        def _on_created(bot) -> None:
-            if not subbots.manager.start(bot.id):
-                log.error("could not start sub-bot %s: %s", bot.id,
-                          subbots.manager.errors().get(bot.id, "unknown"))
-        subbots.on_created = _on_created
 
     server = HealthServer(
         engine, ledger,
@@ -522,7 +528,7 @@ def _provider_for(bot, settings: Settings):
     return UotpProvider(settings.uotp)
 
 
-def _run_subbot(bot, router, settings: Settings) -> None:
+def _run_subbot(bot, router, settings: Settings, manager=None) -> None:
     """Long-poll one sub-bot. Raises if the transport is unavailable."""
     from .bot.telegram import HAS_TELEGRAM, TelegramFrontend
 
@@ -530,6 +536,7 @@ def _run_subbot(bot, router, settings: Settings) -> None:
         raise RuntimeError("python-telegram-bot is not installed")
     from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filters
 
+    log.info("sub-bot %s starting poller", getattr(bot, "id", "?"))
     # Sub-bots get the same button UI; their router has subbots=None, so the
     # nested "Run your own bot" entry hides itself automatically.
     frontend = TelegramFrontend(
@@ -545,9 +552,20 @@ def _run_subbot(bot, router, settings: Settings) -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, frontend.on_message))
     app.add_handler(MessageHandler(filters.COMMAND, frontend.on_message))
     app.add_handler(MessageHandler(filters.PHOTO, frontend.on_photo))  # payments/QR
-    # stop_signals=(): same reason as bot.telegram -- we run in a background
-    # thread, and PTB's default signal handlers only work in the main thread.
-    app.run_polling(stop_signals=())
+    if manager is not None:
+        bind = getattr(manager, "bind_app", None)
+        if callable(bind):
+            bind(bot.id, app)
+    try:
+        # stop_signals=(): same reason as bot.telegram -- we run in a background
+        # thread, and PTB's default signal handlers only work in the main thread.
+        # stop() on the manager calls Application.stop_running() to unblock this.
+        app.run_polling(stop_signals=())
+    finally:
+        if manager is not None:
+            unbind = getattr(manager, "unbind_app", None)
+            if callable(unbind):
+                unbind(bot.id)
 
 
 def _check(settings: Settings) -> int:
