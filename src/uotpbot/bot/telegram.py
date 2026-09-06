@@ -389,7 +389,7 @@ class TelegramFrontend:
         fwd = _forwarded_channel_ref(message)
         if fwd:
             wizard = (getattr(self.ui, "_wizard", None) or {}).get(user_id) or {}
-            if wizard.get("flow") == "admin" and wizard.get("action") == "fs":
+            if wizard.get("flow") == "admin" and wizard.get("action") in {"fs", "uc"}:
                 reply = await _run_offloop(self.ui.text, user_id, fwd)
                 await self._deliver_reply(message, reply)
                 return
@@ -816,7 +816,8 @@ def _start_polling(app: Any) -> None:
 
 
 def run_bot(settings: Settings, router_factory: Any,
-            *, owner_alert: Any = None, payment_notifier: Any = None) -> None:  # pragma: no cover
+            *, owner_alert: Any = None, payment_notifier: Any = None,
+            updates_poster: Any = None) -> None:  # pragma: no cover
     """Start long-polling. Blocking; meant for a real deployment."""
     app = build_from_settings(settings, router_factory)
     # Phase-1: hand the alert bridge to the wallet monitor thread so it can
@@ -833,6 +834,12 @@ def run_bot(settings: Settings, router_factory: Any,
         payment_notifier.attach(app)
         try:
             app.bot_data["payment_notifier"] = payment_notifier
+        except Exception:  # noqa: BLE001
+            pass
+    if updates_poster is not None:
+        updates_poster.attach(app)
+        try:
+            app.bot_data["updates_poster"] = updates_poster
         except Exception:  # noqa: BLE001
             pass
     log.info("bot starting")

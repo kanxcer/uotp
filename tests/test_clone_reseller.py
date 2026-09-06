@@ -172,6 +172,8 @@ def test_clone_admin_hides_platform_tools():
         assert not blocked3.ok
         blocked4 = ui.button("clone-owner", "a:on")
         assert not blocked4.ok
+        blocked5 = ui.button("clone-owner", "a:uc")
+        assert not blocked5.ok
     finally:
         ledger.close()
 

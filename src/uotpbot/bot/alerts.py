@@ -233,3 +233,116 @@ def pay_message(store, notifier, order_id: str, money) -> None:
             notifier.edit_order_message(chat_id, int(msg_id), text)
     except Exception as exc:  # noqa: BLE001 - the credit already happened
         log.warning("could not edit QR message for %s: %s", order_id, exc)
+
+
+def _bot_tag(bot: str) -> str:
+    name = (bot or "").strip().lstrip("@")
+    return f"\n\n🤖 @{name}" if name else ""
+
+
+def deposit_update(amount, *, method: str = "FamPay Automatic", bot: str = "") -> str:
+    return (
+        "🚀 **New Deposit Success**\n\n"
+        f"**Amount:** {amount}\n"
+        f"**Payment Method:** {method}\n\n"
+        f"Thanks For Deposit.{_bot_tag(bot)}"
+    )
+
+
+def purchase_update(service: str, amount, *, bot: str = "") -> str:
+    return (
+        "🛒 **Number Purchase Successful**\n\n"
+        f"**Service:** {service}\n"
+        f"**Amount:** {amount}\n\n"
+        f"Thank you for using our service! ❤️{_bot_tag(bot)}"
+    )
+
+
+def withdraw_update(amount, *, bot: str = "") -> str:
+    return (
+        "💰**Withdrawal Successful**\n\n"
+        f"💰**Amount:** {amount}\n"
+        "🏦**Status:** Withdrawal Successful\n\n"
+        f"Thank you for using our service! ❤️{_bot_tag(bot)}"
+    )
+
+
+class ChannelPoster:
+    """Best-effort posts to the owner-configured public updates channel.
+
+    Reads ``updates_channel`` from the platform wallet kv store. Never raises
+    into a credit/purchase path: a Telegram blip must not roll back money.
+    """
+
+    def __init__(
+        self,
+        store=None,
+        *,
+        bot_token: str = "",
+        bot_username: str = "",
+        send_fn=None,
+    ) -> None:
+        self._store = store
+        self._token = bot_token or ""
+        self.bot_username = (bot_username or "").lstrip("@")
+        self._app = None
+        self._send_fn = send_fn
+
+    def attach(self, app) -> None:
+        self._app = app
+        if not self._token:
+            self._token = getattr(getattr(app, "bot", None), "token", "") or self._token
+
+    def chat_id(self) -> str:
+        store = self._store
+        get = getattr(store, "kv_get", None) if store is not None else None
+        if not callable(get):
+            return ""
+        try:
+            raw = get("updates_channel") or ""
+            if not raw:
+                return ""
+            import json
+            data = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(data, dict):
+                return str(data.get("chat") or "").strip()
+            return str(raw).strip()
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def post(self, text: str) -> bool:
+        chat = self.chat_id()
+        body = (text or "").strip()
+        if not chat or not body:
+            return False
+        payload = {
+            "chat_id": chat,
+            "text": body[:4096],
+            "disable_web_page_preview": True,
+            "parse_mode": "Markdown",
+        }
+        try:
+            if self._send_fn is not None:
+                ok, err = self._send_fn(payload)
+            else:
+                token = self._token or getattr(
+                    getattr(self._app, "bot", None), "token", "") or ""
+                if not token:
+                    log.info("updates channel: no bot token, skip")
+                    return False
+                ok, err = _telegram_http(
+                    self._app, "sendMessage", payload, token=token)
+                if not ok and "parse" in str(err).lower():
+                    payload = dict(payload)
+                    payload.pop("parse_mode", None)
+                    ok, err = _telegram_http(
+                        self._app, "sendMessage", payload, token=token)
+            if ok:
+                log.info("updates channel posted: %s", body.splitlines()[0])
+                return True
+            log.warning("updates channel post failed: %s", err)
+            return False
+        except Exception as exc:  # noqa: BLE001
+            log.warning("updates channel post failed: %s", exc)
+            return False
+

@@ -80,7 +80,7 @@ def _build(settings: Settings):
 
 
 def _make_poller(settings: Settings, router_factory, *, owner_alert=None,
-                 payment_notifier=None):
+                 payment_notifier=None, updates_poster=None):
     """Return a callable that runs the Telegram poller, or None."""
     if not settings.has_telegram:
         log.warning(
@@ -97,10 +97,12 @@ def _make_poller(settings: Settings, router_factory, *, owner_alert=None,
         )
         return None
     return lambda: run_bot(settings, router_factory, owner_alert=owner_alert,
-                           payment_notifier=payment_notifier)
+                           payment_notifier=payment_notifier,
+                           updates_poster=updates_poster)
 
 
-def _credit_fg_wallet(store, uid: str, order_id: str, amount_dec, *, notifier=None) -> bool:
+def _credit_fg_wallet(store, uid: str, order_id: str, amount_dec, *, notifier=None,
+                      updates=None) -> bool:
     """Atomically credit ``amount_dec`` rupees to ``uid`` and mark the order
     credited. Returns True on success. Idempotent: callers check the
     ``fg_credited:<order>`` marker first; the marker is (re)set here so two
@@ -129,6 +131,14 @@ def _credit_fg_wallet(store, uid: str, order_id: str, amount_dec, *, notifier=No
     # Edit the QR message the customer was looking at so they SEE the credit
     # instantly, without tapping anything.
     _notify_paid(store, order_id, money, notifier)
+    if updates is not None:
+        try:
+            from .bot.alerts import deposit_update
+            updates.post(deposit_update(
+                money, method="FamPay Automatic",
+                bot=getattr(updates, "bot_username", "") or ""))
+        except Exception:  # noqa: BLE001
+            log.debug("updates channel deposit post failed", exc_info=True)
     return True
 
 
@@ -155,7 +165,8 @@ def _live_fg_key(store, env_key: str) -> str:
     return env_key
 
 
-def _famgateway_sweep(store, key: str, base_url: str, *, notifier: object = None) -> None:
+def _famgateway_sweep(store, key: str, base_url: str, *, notifier: object = None,
+                      updates: object = None) -> None:
     """Verify every open (uncredited) order once and credit any that is paid.
 
     Safety net for the case where a payment webhook is dropped, missed, or the
@@ -198,12 +209,14 @@ def _famgateway_sweep(store, key: str, base_url: str, *, notifier: object = None
                 amt = Decimal(amt_s)
             except Exception:  # noqa: BLE001
                 continue
-            _credit_fg_wallet(store, uid, order_id, amt, notifier=notifier)
+            _credit_fg_wallet(store, uid, order_id, amt, notifier=notifier,
+                              updates=updates)
 
 
 def _start_fg_sweeper(settings: Settings, wallets, stop: threading.Event,
                       *, interval: float = 60.0,
-                      notifier: object = None) -> Optional[threading.Thread]:
+                      notifier: object = None,
+                      updates: object = None) -> Optional[threading.Thread]:
     """Start the background FamGateway sweep thread, or return None.
 
     Returns None when there is no live API key (nothing to poll) or the
@@ -218,7 +231,8 @@ def _start_fg_sweeper(settings: Settings, wallets, stop: threading.Event,
             key = _live_fg_key(wallets, getattr(settings, "famgateway_api_key", ""))
             if key:
                 try:
-                    _famgateway_sweep(wallets, key, base_url, notifier=notifier)
+                    _famgateway_sweep(wallets, key, base_url, notifier=notifier,
+                                      updates=updates)
                 except Exception as exc:  # noqa: BLE001 - never kill the thread
                     log.warning("FamGateway sweep failed: %s", exc)
             if interval <= 0:
@@ -231,7 +245,8 @@ def _start_fg_sweeper(settings: Settings, wallets, stop: threading.Event,
     return thread
 
 
-def _famgateway_webhook(settings: Settings, wallets, *, notifier: object = None):
+def _famgateway_webhook(settings: Settings, wallets, *, notifier: object = None,
+                        updates: object = None):
     """Build the FamGateway webhook handler.
 
     Always registered, so ``POST /webhooks/famgateway`` exists even when the
@@ -302,7 +317,8 @@ def _famgateway_webhook(settings: Settings, wallets, *, notifier: object = None)
             amt_dec = Decimal(amt_s)
         except Exception:  # noqa: BLE001
             return 200, {"status": "bad_amount"}
-        if not _credit_fg_wallet(store, uid, order_id, amt_dec, notifier=notifier):
+        if not _credit_fg_wallet(store, uid, order_id, amt_dec, notifier=notifier,
+                                 updates=updates):
             return 200, {"status": "credit_error"}
         return 200, {"status": "credited"}
 
@@ -330,15 +346,20 @@ def _serve(settings: Settings) -> int:
     from .store import make_wallets
 
     wallets = make_wallets(settings)
-    subbots = _make_whitelabel(settings, catalog, ledger, pricer, wallets)
+    from .bot.alerts import ChannelPoster, PaymentNotifier
+    updates_poster = ChannelPoster(
+        wallets, bot_token=getattr(settings, "telegram_token", "") or "",
+    )
+    subbots = _make_whitelabel(settings, catalog, ledger, pricer, wallets,
+                              updates_poster=updates_poster)
     platform_username = platform_username_from_token(settings.telegram_token)
     if platform_username:
         log.info("platform bot @%s", platform_username)
+    updates_poster.bot_username = platform_username
 
     # Bridge that edits a customer's QR message to a success note when a payment
     # is confirmed. Must exist BEFORE the router so every credit path (webhook,
     # sweep AND the customer's own Check status tap) can reach it.
-    from .bot.alerts import PaymentNotifier
     payment_notifier = PaymentNotifier()
 
     # One persistent router for the platform bot (sub-bots each get their own
@@ -360,6 +381,7 @@ def _serve(settings: Settings) -> int:
         payment_notifier=payment_notifier,
         platform_bot_username=platform_username,
     )
+    main_router.updates_poster = updates_poster
 
     def router_factory() -> CommandRouter:
         return main_router
@@ -377,7 +399,8 @@ def _serve(settings: Settings) -> int:
     wallet_monitor.start()
 
     poller = _make_poller(settings, router_factory, owner_alert=owner_alert,
-                          payment_notifier=payment_notifier)
+                          payment_notifier=payment_notifier,
+                          updates_poster=updates_poster)
     if subbots is not None:
         # MUST land on the router (not WhiteLabel.on_created). /createbot
         # calls CommandRouter.on_bot_created; the previous assignment never
@@ -413,7 +436,8 @@ def _serve(settings: Settings) -> int:
         subsystem_stats=main_router.phase1_snapshot,
         metrics_token=settings.metrics_token,
         famgateway_webhook=_famgateway_webhook(settings, wallets,
-                                               notifier=payment_notifier),
+                                               notifier=payment_notifier,
+                                               updates=updates_poster),
     )
     # Background FamGateway sweeper: verify open orders and credit any that are
     # paid, so a dropped/missed webhook never loses a payment. Daemon thread;
@@ -423,6 +447,7 @@ def _serve(settings: Settings) -> int:
         settings, wallets, sweep_stop,
         interval=max(0.0, settings.fg_sweep_seconds),
         notifier=payment_notifier,
+        updates=updates_poster,
     )
     try:
         server.serve_forever()
@@ -451,7 +476,8 @@ class WhiteLabel:
     on_created: Optional[Callable[[object], None]] = None
 
 
-def _make_whitelabel(settings: Settings, catalog, ledger, pricer, wallets) -> Optional[WhiteLabel]:
+def _make_whitelabel(settings: Settings, catalog, ledger, pricer, wallets,
+                     updates_poster=None) -> Optional[WhiteLabel]:
     """Build the sub-bot registry and manager, or None when disabled."""
     if not settings.whitelabel_enabled:
         return None
@@ -521,6 +547,7 @@ def _make_whitelabel(settings: Settings, catalog, ledger, pricer, wallets) -> Op
             platform_bot_username=platform_username,
         )
         router.on_bot_created = _on_created
+        router.updates_poster = updates_poster
         return router
 
     from .createbot import platform_username_from_token

@@ -295,19 +295,21 @@ def _bare_wallet_uid(stored: str, scope: str) -> str:
     return uid
 
 
-def _page_users(ids: list[str], seen: dict[str, float], *,
+def _page_users(ids: list[str], seen: dict[str, float],
+                balances: dict[str, int] | None = None, *,
                 limit: int, offset: int) -> tuple[list[tuple[str, float]], int]:
-    """Sort ``ids`` by last_seen desc and slice one page. Empty last_seen last."""
+    """Sort ``ids`` by wallet balance desc (then last_seen), slice one page."""
+    bals = balances or {}
     decorated = sorted(
-        ((float(seen.get(u, 0.0)), u) for u in ids),
-        key=lambda t: (t[0], t[1]),
+        ((int(bals.get(u, 0)), float(seen.get(u, 0.0)), str(u)) for u in ids),
+        key=lambda t: (t[0], t[1], t[2]),
         reverse=True,
     )
     total = len(decorated)
     limit = 40 if int(limit) <= 0 else int(limit)
     offset = max(0, int(offset))
     page = decorated[offset: offset + limit]
-    return [(u, ts) for ts, u in page], total
+    return [(u, ts) for _bal, ts, u in page], total
 
 #: Durable refund outbox. A refund is written here BEFORE the wallet credit or
 #: ledger post is attempted, so if that credit ever fails the refund is never
@@ -861,9 +863,14 @@ class SqliteWallets(WalletStore):
 
     def list_users(self, *, scope: str = "", limit: int = 40, offset: int = 0
                    ) -> tuple[list[tuple[str, float]], int]:
-        """One page of ``(user_id, last_seen)`` plus the total customer count."""
+        """One page of ``(user_id, last_seen)`` plus the total customer count.
+
+        Ordered highest wallet balance first so All users shows big spenders
+        on top.
+        """
         ids = self.user_ids(scope=scope)
         seen: dict[str, float] = {}
+        bals: dict[str, int] = {}
         with self._lock:
             for uid, ts in self._conn.execute(
                 "SELECT user_id, last_seen FROM seen_users WHERE scope = ?",
@@ -871,7 +878,23 @@ class SqliteWallets(WalletStore):
             ):
                 if uid:
                     seen[str(uid)] = float(ts or 0)
-        return _page_users(ids, seen, limit=limit, offset=offset)
+            if scope:
+                prefix = scope + ":"
+                for uid, paise in self._conn.execute(
+                    "SELECT user_id, balance_paise FROM wallets WHERE user_id LIKE ?",
+                    (prefix + "%",),
+                ):
+                    bare = _bare_wallet_uid(uid, scope)
+                    if bare:
+                        bals[bare] = int(paise or 0)
+            else:
+                for uid, paise in self._conn.execute(
+                    "SELECT user_id, balance_paise FROM wallets "
+                    "WHERE user_id NOT LIKE '%:%'"
+                ):
+                    if uid:
+                        bals[str(uid)] = int(paise or 0)
+        return _page_users(ids, seen, bals, limit=limit, offset=offset)
 
     def balance(self, user_id: str) -> Money:
         with self._lock:
@@ -1310,6 +1333,7 @@ class PostgresWallets(WalletStore):
                    ) -> tuple[list[tuple[str, float]], int]:
         ids = self.user_ids(scope=scope)
         seen: dict[str, float] = {}
+        bals: dict[str, int] = {}
         with self._lock:
             for uid, ts in self._conn.execute(
                 f"SELECT user_id, last_seen FROM {self._ts} WHERE scope = %s",
@@ -1317,7 +1341,24 @@ class PostgresWallets(WalletStore):
             ):
                 if uid:
                     seen[str(uid)] = float(ts or 0)
-        return _page_users(ids, seen, limit=limit, offset=offset)
+            if scope:
+                prefix = scope + ":"
+                for uid, paise in self._conn.execute(
+                    f"SELECT user_id, balance_paise FROM {self._t} "
+                    "WHERE user_id LIKE %s",
+                    (prefix + "%",),
+                ):
+                    bare = _bare_wallet_uid(uid, scope)
+                    if bare:
+                        bals[bare] = int(paise or 0)
+            else:
+                for uid, paise in self._conn.execute(
+                    f"SELECT user_id, balance_paise FROM {self._t} "
+                    "WHERE user_id NOT LIKE '%:%'"
+                ):
+                    if uid:
+                        bals[str(uid)] = int(paise or 0)
+        return _page_users(ids, seen, bals, limit=limit, offset=offset)
 
     def balance(self, user_id: str) -> Money:
         with self._lock:

@@ -206,6 +206,9 @@ class MenuUI:
         self._force_sub_memory: dict[str, str] = {
             "chat": "", "title": "", "username": "", "link": "",
         }
+        self._updates_memory: dict[str, str] = {
+            "chat": "", "title": "", "username": "", "link": "",
+        }
         #: Injected by the Telegram transport: (chat_id, user_id) -> member
         #: status string (creator/administrator/member/restricted/left/kicked/error).
         self.chat_member_fn: Optional[Callable[[str, str], str]] = None
@@ -801,6 +804,172 @@ class MenuUI:
             rows=((("📢 Force sub", "a:fs"),), (("📊 Admin Panel", "a"),)),
         )
 
+    def updates_channel_config(self) -> Optional[dict[str, str]]:
+        """The live updates channel, or None when posting is off."""
+        data = dict(self._updates_memory)
+        store = self._feature_store()
+        if store is not None:
+            try:
+                raw = store.kv_get("updates_channel") or ""
+                if raw:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict):
+                        data.update({k: str(parsed.get(k) or "") for k in
+                                     ("chat", "title", "username", "link")})
+            except Exception:  # noqa: BLE001
+                pass
+        chat = (data.get("chat") or "").strip()
+        if not chat:
+            return None
+        return data
+
+    def _set_updates_channel(self, cfg: Optional[dict[str, str]]) -> None:
+        if self._is_clone:
+            return
+        payload = {"chat": "", "title": "", "username": "", "link": ""}
+        if cfg and (cfg.get("chat") or "").strip():
+            payload = {k: str(cfg.get(k) or "").strip() for k in payload}
+        self._updates_memory = payload
+        store = self._feature_store()
+        if store is not None:
+            try:
+                store.kv_set("updates_channel", json.dumps(payload))
+            except Exception:  # noqa: BLE001
+                pass
+        poster = getattr(self.router, "updates_poster", None)
+        if poster is not None:
+            poster._store = store or getattr(poster, "_store", None)
+
+    def updates_channel_label(self) -> str:
+        cfg = self.updates_channel_config()
+        if not cfg:
+            return "off"
+        handle = cfg.get("username") or ""
+        if handle:
+            return "ON · @" + handle.lstrip("@")
+        title = cfg.get("title") or cfg.get("chat") or ""
+        return f"ON · {title}" if title else "ON"
+
+    def updates_channel_admin(self, user_id: str) -> Reply:
+        """Owner screen: public updates channel for deposits / sales / payouts."""
+        if not self.router._is_owner(user_id) or self._is_clone:
+            return Reply("Owner only.", ok=False, rows=((("🏠 Menu", "m"),),))
+        cfg = self.updates_channel_config()
+        if cfg:
+            handle = (cfg.get("username") or "").lstrip("@")
+            shown = f"@{handle}" if handle else (cfg.get("title") or cfg.get("chat"))
+            text = (
+                "📣 Updates channel — ON\n\n"
+                f"Channel: {shown}\n"
+                f"Chat id: `{cfg.get('chat')}`\n\n"
+                "Successful deposits, completed number purchases, and paid "
+                "clone withdrawals are posted here for subscribers.\n"
+                "This bot must stay an administrator so it can post."
+            )
+            rows = (
+                (("✏️ Change channel", "ax:uc"), ("🔴 Turn off", "a:ucoff")),
+                (("◀️ Owner panel", "a"),),
+            )
+        else:
+            text = (
+                "📣 Updates channel — OFF\n\n"
+                "When ON, this bot posts to a channel you choose whenever:\n"
+                "• a deposit is credited\n"
+                "• a number purchase completes (OTP delivered)\n"
+                "• a clone withdrawal is marked paid\n\n"
+                "1. Add THIS bot as an administrator in the channel "
+                "(Post messages permission).\n"
+                "2. Tap ✏️ Set channel and send @username, or forward a post "
+                "from the channel."
+            )
+            rows = (
+                (("✏️ Set channel", "ax:uc"),),
+                (("◀️ Owner panel", "a"),),
+            )
+        return Reply(text, rows=rows)
+
+    def _apply_updates_channel_input(self, user_id: str, body: str) -> Reply:
+        if self._is_clone:
+            return Reply("Owner only.", ok=False, rows=((("🏠 Menu", "m"),),))
+        ident = self._parse_channel(body)
+        if ident is None:
+            return Reply(
+                "That doesn't look like a channel.\n\n"
+                "Send `@username` (public) or the numeric id (`-100…`), "
+                "or forward a post from the channel.\n"
+                "Send `off` to disable.",
+                ok=False, rows=((("✖️ Cancel", "a"),),),
+            )
+        if ident == "":
+            self._set_updates_channel(None)
+            self._wizard.pop(user_id, None)
+            return Reply(
+                "✅ Updates channel is OFF. No more public posts.",
+                rows=((("📊 Admin Panel", "a"),),),
+            )
+        title = ident
+        username = ident[1:] if ident.startswith("@") else ""
+        link = f"https://t.me/{username}" if username else ""
+        chat = ident
+        info_fn = self.chat_info_fn
+        if callable(info_fn):
+            try:
+                info = info_fn(ident) or {}
+            except Exception as exc:  # noqa: BLE001
+                log.warning("updates-channel getChat failed: %s", exc)
+                info = {"ok": False, "error": str(exc)}
+            if not info.get("ok"):
+                err = info.get("error") or "couldn't reach that chat"
+                return Reply(
+                    f"⚠️ Couldn't use that channel ({err}).\n\n"
+                    "Add THIS bot as an administrator (with Post messages), "
+                    "then send @username or forward a post from it again.",
+                    ok=False, rows=((("✖️ Cancel", "a"),),),
+                )
+            if not info.get("bot_is_admin"):
+                return Reply(
+                    "⚠️ I can see the channel but I'm not an admin there.\n\n"
+                    "Make this bot an administrator with permission to post, "
+                    "then send the channel again.",
+                    ok=False, rows=((("✖️ Cancel", "a"),),),
+                )
+            chat = str(info.get("id") or chat)
+            title = str(info.get("title") or title)
+            username = str(info.get("username") or username)
+            link = str(info.get("invite_link") or link)
+        self._set_updates_channel({
+            "chat": chat, "title": title, "username": username, "link": link,
+        })
+        self._wizard.pop(user_id, None)
+        shown = f"@{username}" if username else title
+        return Reply(
+            f"✅ Updates channel is ON.\n\n"
+            f"Deposits, completed purchases and paid withdrawals will post "
+            f"to {shown}.",
+            rows=((("📣 Updates channel", "a:uc"),), (("📊 Admin Panel", "a"),)),
+        )
+
+    def _post_update(self, text: str) -> None:
+        poster = getattr(self.router, "updates_poster", None)
+        post = getattr(poster, "post", None) if poster is not None else None
+        if callable(post):
+            try:
+                post(text)
+                return
+            except Exception:  # noqa: BLE001
+                log.debug("updates post failed", exc_info=True)
+        # Tests / no poster: still a no-op unless a channel is configured
+        # and we can build a one-shot poster from the store.
+        store = self._feature_store()
+        if store is None:
+            return
+        try:
+            from .alerts import ChannelPoster
+            ChannelPoster(store, bot_username=getattr(
+                self.router, "platform_bot_username", "")).post(text)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _store_for_kv(self):
         store = self._store
         if store is not None and callable(getattr(store, "kv_get", None)) \
@@ -1382,6 +1551,15 @@ class MenuUI:
                    "so membership can be checked.\n\n"
                    "Send `off` to disable.\n"
                    f"(current: {self.force_sub_label()})"),
+            "uc": ("📣 UPDATES CHANNEL",
+                   "Send the channel where successful deposits, purchases "
+                   "and withdrawals are posted:\n"
+                   "• `@username` for a public channel\n"
+                   "• or forward a post from the channel (best for private)\n"
+                   "• or the numeric id `-100…`\n\n"
+                   "Add THIS bot as an administrator with Post messages.\n\n"
+                   "Send `off` to disable.\n"
+                   f"(current: {self.updates_channel_label()})"),
         }[action]
         self._wizard[user_id] = {"flow": "admin", "action": action, "step": "input"}
         return Reply(f"{prompt[0]}\n\n{prompt[1]}\n\nTap ✖️ Cancel to abort.",
@@ -1467,6 +1645,8 @@ class MenuUI:
                 )
             if action == "fs":
                 return self._apply_force_sub_input(user_id, body)
+            if action == "uc":
+                return self._apply_updates_channel_input(user_id, body)
             if action == "withdraw":
                 return self._apply_withdraw(user_id, body)
             self._wizard.pop(user_id, None)
@@ -1688,6 +1868,13 @@ class MenuUI:
             # Edit the QR message the customer was looking at to a success note
             # so they SEE the credit instantly (same as the webhook/sweep path).
             self._edit_paid_message(store, order_id, money)
+            try:
+                from .alerts import deposit_update
+                self._post_update(deposit_update(
+                    money, method="FamPay Automatic",
+                    bot=getattr(self.router, "platform_bot_username", "")))
+            except Exception:  # noqa: BLE001
+                pass
             return Reply(
                 f"✅ Payment received! {money} added to your balance\n"
                 f"({self.router.balance_of(uid)} now).\n\n"
@@ -2025,12 +2212,13 @@ class MenuUI:
             f"🛠 Maintenance: {'🟢 ON — buying paused for customers' if self.maintenance_on() else '⚪ off'}\n"
             f"🔓 Users may use bot: {'on' if self.bot_enabled() else 'off'}\n"
             f"📢 Force sub: {self.force_sub_label()}\n"
+            f"📣 Updates channel: {self.updates_channel_label()}\n"
             f"{cbt_line}\n\n"
             "Full P&L: /report · Health: /status",
             rows=(
                 ((f"👥 All users ({users})", "ax:users"), ("🚫 Ban/Unban", "ax:ban")),
                 (("🔓 Users may use bot", "a:on"), ("🤖 Clone-bot on/off", "a:cb")),
-                (("📢 Force sub", "a:fs"),),
+                (("📢 Force sub", "a:fs"), ("📣 Updates channel", "a:uc")),
                 ((f"🧾 Top-ups ({len(pending)} pending)", "a:t"), ("📊 Metrics", "ax:metrics")),
                 payouts_row,
                 (("📦 Orders & per-order profit", "a:o"),),
@@ -2383,6 +2571,12 @@ class MenuUI:
         if paid:
             note = f"✅ Marked paid — {amt} to `{data.get('upi')}`."
             ping = f"🎉 Payout of {amt} sent to `{data.get('upi')}`."
+            try:
+                from .alerts import withdraw_update
+                self._post_update(withdraw_update(
+                    amt, bot=getattr(self.router, "platform_bot_username", "")))
+            except Exception:  # noqa: BLE001
+                pass
         else:
             note = f"❌ Declined — {amt} returned to the clone owner's earnings."
             ping = f"⚠️ Payout of {amt} was declined. The amount is back in your earnings."
@@ -2475,6 +2669,13 @@ class MenuUI:
             return Reply(f"#{topup_id} was already processed.", ok=False)
         if approve:
             self.router.credit(topup.user_id, topup.amount)
+            try:
+                from .alerts import deposit_update
+                self._post_update(deposit_update(
+                    topup.amount, method="UPI (manual)",
+                    bot=getattr(self.router, "platform_bot_username", "")))
+            except Exception:  # noqa: BLE001
+                pass
             fresh = self.topups_screen(user_id)
             return Reply(
                 f"✅ #{topup_id} approved — {topup.amount} credited to "
@@ -2611,6 +2812,16 @@ class MenuUI:
                 return self.clones_screen(user_id, 0)
             if parts[1] == "fs":
                 return self.force_sub_admin(user_id)
+            if parts[1] == "uc":
+                return self.updates_channel_admin(user_id)
+            if parts[1] == "ucoff":
+                if not self.router._is_owner(user_id) or self._is_clone:
+                    return Reply("Owner only.", ok=False, rows=((("🏠 Menu", "m"),),))
+                self._set_updates_channel(None)
+                return Reply(
+                    "✅ Updates channel is OFF. No more public posts.",
+                    rows=((("📣 Updates channel", "a:uc"),), (("◀️ Owner panel", "a"),)),
+                )
             if parts[1] == "fsoff":
                 if not self.router._is_owner(user_id):
                     return Reply("Owner only.", ok=False, rows=((("🏠 Menu", "m"),),))
@@ -2655,6 +2866,8 @@ class MenuUI:
                 return self._admin_input_prompt(user_id, "fg")
             if action == "fs":
                 return self._admin_input_prompt(user_id, "fs")
+            if action == "uc":
+                return self._admin_input_prompt(user_id, "uc")
             if action == "withdraw":
                 return self.withdraw_prompt(user_id)
             return self._badtap()
@@ -2842,10 +3055,11 @@ class MenuUI:
         """True for platform-only admin tools that clone owners must not use."""
         if kind in {"ap", "ad", "apw", "adw"}:
             return True
-        if kind == "a" and len(parts) >= 2 and parts[1] in {"t", "qr", "cb", "wd", "on", "cl", "cld", "clr"}:
+        if kind == "a" and len(parts) >= 2 and parts[1] in {"t", "qr", "cb", "wd", "on", "cl", "cld", "clr", "uc", "ucoff"}:
             return True
         if kind == "ax" and len(parts) >= 2 and parts[1] in {
             "credit", "debit", "fg", "upi", "sunkcost", "provider", "metrics",
+            "uc",
         }:
             return True
         return False

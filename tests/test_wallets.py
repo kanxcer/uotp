@@ -325,3 +325,30 @@ def test_cmd_users_paginates_past_the_old_30_cap(tmp_path):
     via_btn = ui.button(OWNER, "ax:users:1")
     assert via_btn.ok and "page 2/" in via_btn.text
     store.close()
+
+
+def test_list_users_highest_balance_first(tmp_path):
+    store = SqliteWallets(str(tmp_path / "w.db"))
+    store.touch_user("low")
+    store.touch_user("mid")
+    store.touch_user("high")
+    store.adjust("low", INR(10))
+    store.adjust("mid", INR(50))
+    store.adjust("high", INR(200))
+    page, total = store.list_users(limit=10, offset=0)
+    assert total == 3
+    assert [u for u, _ in page] == ["high", "mid", "low"]
+    store.close()
+
+
+def test_cmd_users_highest_balance_first(tmp_path):
+    store = SqliteWallets(str(tmp_path / "w.db"))
+    router, _ = _router(wallets=store)
+    store.adjust("aaa", INR(10))
+    store.adjust("zzz", INR(90))
+    store.adjust("mmm", INR(40))
+    listed = router.handle(OWNER, "/users")
+    assert listed.ok
+    assert listed.text.index("`zzz`") < listed.text.index("`mmm`") < listed.text.index("`aaa`")
+    store.close()
+

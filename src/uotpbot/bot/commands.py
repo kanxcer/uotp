@@ -169,6 +169,8 @@ class CommandRouter:
         #: path (Check status / I've paid tap) uses it so the QR is updated no
         #: matter which path credited the order.
         self.payment_notifier = payment_notifier
+        #: Optional public updates channel (deposits / purchases / payouts).
+        self.updates_poster = None
         #: Clone (white-label) bot: sells our numbers at an extra %; no own API.
         from decimal import Decimal as _Dec
         self.is_clone = bool(is_clone)
@@ -266,6 +268,19 @@ class CommandRouter:
             return self.wallets.adjust(user_id, amount)
         self.balances[user_id] = self.balance_of(user_id) + amount
         return self.balances[user_id]
+
+    def _announce_update(self, text: str) -> None:
+        poster = getattr(self, "updates_poster", None)
+        post = getattr(poster, "post", None) if poster is not None else None
+        if not callable(post) or not text:
+            return
+        try:
+            post(text)
+        except Exception:  # noqa: BLE001 - never roll back money for a channel post
+            log.debug("updates channel post failed", exc_info=True)
+
+    def _bot_handle(self) -> str:
+        return (getattr(self, "platform_bot_username", "") or "").lstrip("@")
 
     def _debit(self, user_id: str, amount: Money) -> Money:
         """Take funds off a customer wallet for a purchase."""
@@ -631,8 +646,15 @@ class CommandRouter:
                                     server=server or None)
         self._record_order(user_id, slug, price, result)
         if result.success:
+            name = self.catalog.get(slug).name
+            try:
+                from .alerts import purchase_update
+                self._announce_update(
+                    purchase_update(name, price, bot=self._bot_handle()))
+            except Exception:  # noqa: BLE001
+                pass
             return Reply(
-                f"✅ OTP for {self.catalog.get(slug).name}: {result.otp}\n"
+                f"✅ OTP for {name}: {result.otp}\n"
                 f"📱 Number: {result.phone}\n\n"
                 f"Charged {price} · Balance {self.balance_of(user_id)}"
             )
@@ -1072,6 +1094,14 @@ class CommandRouter:
             # can receive MORE codes on it during its validity window (Fix #2).
             self._record_order(user_id, slug, result.order.gross_price, result,
                                keep_active=True)
+            try:
+                from .alerts import purchase_update
+                name = self.catalog.get(slug).name if self.catalog.has(slug) else slug
+                self._announce_update(
+                    purchase_update(name, result.order.gross_price,
+                                    bot=self._bot_handle()))
+            except Exception:  # noqa: BLE001
+                pass
             from ..catalog import PROVIDER_VALIDITY_MINUTES
             left = self._remaining_otp_minutes(getattr(result, "_alloc", None))
             if left is None or left < 5:
@@ -1773,6 +1803,11 @@ class CommandRouter:
             else:
                 uids = list(self.balances.keys())
             total = len(uids)
+            uids = sorted(
+                uids,
+                key=lambda u: (self.balance_of(u).paise, str(u)),
+                reverse=True,
+            )
             chunk = uids[page * _USERS_PAGE: (page + 1) * _USERS_PAGE]
             page_rows = [(u, 0.0) for u in chunk]
         if total == 0:
