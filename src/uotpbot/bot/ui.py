@@ -2154,8 +2154,6 @@ class MenuUI:
             return self._clone_admin_panel(user_id)
         status = self.router.engine.status()
         pnl = status["pnl"]
-        pending = self._pending_topups()
-        qr_state = "set ✅" if self._qr_file_id() else "not set ❌"
         fg_state = (
             "ON ✅ (auto-credited)"
             if self.fg_enabled else
@@ -2163,9 +2161,7 @@ class MenuUI:
         )
         fs = self._float_stats()
         users = int(fs["users"]) if fs and fs.get("users") is not None else 0
-        float_line = ""
-        if fs:
-            float_line = f" · float held: {fs['float']}"
+        float_held = fs["float"] if fs and fs.get("float") is not None else Money.zero()
         cbt = self.createbot_enabled()
         cbt_line = (
             f"🤖 Clone-bot ({'on' if cbt else 'off'})"
@@ -2203,11 +2199,10 @@ class MenuUI:
             f"📒 Ledger wallet:    {status['ledger_wallet']}\n"
             f"💹 Revenue: {pnl['revenue']} · Costs: {pnl['cogs']}\n"
             f"📈 Net profit: {pnl['net_profit']}\n"
-            f"👥 Total users: {users}{float_line}\n"
-            f"💳 Payments waiting: {len(pending)}\n"
+            f"👥 Total users: {users}\n"
+            f"💰 Customer float held: {float_held}\n"
             f"💸 Clone payouts waiting: {n_wd}\n"
             f"{clones_line}"
-            f"🖼 Payment QR: {qr_state}\n"
             f"📒 Top-up mode: {fg_state}\n"
             f"🛠 Maintenance: {'🟢 ON — buying paused for customers' if self.maintenance_on() else '⚪ off'}\n"
             f"🔓 Users may use bot: {'on' if self.bot_enabled() else 'off'}\n"
@@ -2219,12 +2214,12 @@ class MenuUI:
                 ((f"👥 All users ({users})", "ax:users"), ("🚫 Ban/Unban", "ax:ban")),
                 (("🔓 Users may use bot", "a:on"), ("🤖 Clone-bot on/off", "a:cb")),
                 (("📢 Force sub", "a:fs"), ("📣 Updates channel", "a:uc")),
-                ((f"🧾 Top-ups ({len(pending)} pending)", "a:t"), ("📊 Metrics", "ax:metrics")),
+                (("📊 Metrics", "ax:metrics"),),
                 payouts_row,
                 (("📦 Orders & per-order profit", "a:o"),),
                 (("💳 Add balance", "ax:credit"), ("↩️ Deduct", "ax:debit")),
-                (("📢 Broadcast", "ax:broadcast"), ("👥 Customers", "ax:users")),
-                (("🛠 Toggle maintenance", "a:mm"), ("🖼 Payment QR", "a:qr")),
+                (("📢 Broadcast", "ax:broadcast"),),
+                (("🛠 Toggle maintenance", "a:mm"),),
                 (("🕳 Sunk cost", "ax:sunkcost"), ("🏦 Provider", "ax:provider")),
                 (("🆘 Support username", "ax:support"), ("💳 FamGateway", "ax:fg")),
                 (("🏠 Menu", "m"),),

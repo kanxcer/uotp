@@ -881,7 +881,11 @@ def test_admin_panel_shows_total_users(rig):
     ui, router, _provider, _ledger = rig
     panel = ui.admin_panel(OWNER)
     assert "Total users:" in panel.text
+    assert "Customer float held:" in panel.text
     # The dedicated 'All users' button (label) is present and opens the user list.
     labels = [lbl for lbl, _d in all_buttons(panel)]
     assert any(lbl.startswith("👥 All users") for lbl in labels)
     assert "ax:users" in datas(panel)
+    assert not any("Customers" == lbl or lbl.startswith("👥 Customers") for lbl in labels)
+    assert "a:t" not in datas(panel)
+    assert "a:qr" not in datas(panel)

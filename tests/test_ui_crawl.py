@@ -91,7 +91,7 @@ def test_owner_crawl_reaches_admin_screens():
     ui, _, _ = make_rig()
     replies = walk(ui, OWNER)
     datas = {d for d, _ in replies}
-    for expected in ("a", "a:t", "a:o", "a:qr"):
+    for expected in ("a", "a:o", "ax:metrics"):
         assert expected in datas
 
 

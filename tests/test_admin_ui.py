@@ -46,7 +46,10 @@ def test_admin_panel_has_money_and_broadcast_buttons(rig):
     assert any("Add balance" in lbl for lbl in labels)
     assert any("Deduct" in lbl for lbl in labels)
     assert any("Broadcast" in lbl for lbl in labels)
-    assert any("Customers" in lbl for lbl in labels)
+    assert any(lbl.startswith("👥 All users") for lbl in labels)
+    assert not any(lbl == "👥 Customers" or lbl.startswith("👥 Customers") for lbl in labels)
+    assert not any("Top-ups" in lbl for lbl in labels)
+    assert not any("Payment QR" in lbl for lbl in labels)
     assert any("Ban" in lbl for lbl in labels)
 
 
