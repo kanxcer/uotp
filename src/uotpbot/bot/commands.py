@@ -136,6 +136,7 @@ class CommandRouter:
         platform_owner_id: str = "",
         margin_fee_rate=None,
         clone_bot_token: str = "",
+        platform_bot_token: str = "",
         platform_bot_username: str = "",
         bot_profile_applier=None,
     ) -> None:
@@ -180,6 +181,9 @@ class CommandRouter:
         self.platform_owner_id = platform_owner_id or ""
         self.margin_fee_rate = _Dec(margin_fee_rate if margin_fee_rate is not None else "0.05")
         self.clone_bot_token = clone_bot_token or ""
+        #: Platform (YC OTP) bot token. Clone payout *requests* must ping
+        #: the platform owner on this bot, not on the clone.
+        self.platform_bot_token = platform_bot_token or ""
         #: The live MultiBotManager that runs one poller thread per sub-bot.
         #: Exposes ``running()`` / ``errors()`` so /mybots can report whether a
         #: white-label bot is ACTUALLY polling (a saved bot can still be dead if

@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Callable, Optional
@@ -156,9 +157,7 @@ class SmmShop:
                 wallets.adjust(user_id, Money(-sell.paise))
         except Exception as exc:  # noqa: BLE001
             raise SmmUserError("Could not debit your wallet. Try again.") from exc
-        extra_json = ""
-        if clone_owner:
-            extra_json = json.dumps({"clone_owner": clone_owner, "extra_rate": str(extra)})
+        extra_json = self._order_extra(svc, clone_owner, extra)
         try:
             pid = self.provider.add_order(svc.service_id, link, quantity)
         except SmmAmbiguous as exc:
@@ -234,6 +233,31 @@ class SmmShop:
             order_id=str(getattr(row, "id", "") or oid or ""),
         )
         return row
+
+    @staticmethod
+    def _order_extra(svc: SmmService, clone_owner: str, extra_rate) -> str:
+        data: dict = {}
+        if clone_owner:
+            data["clone_owner"] = clone_owner
+            data["extra_rate"] = str(extra_rate)
+        days = int(getattr(svc, "refill_days", 0) or 0)
+        if days > 0:
+            data["refill_days"] = days
+        return json.dumps(data) if data else ""
+
+    @staticmethod
+    def _stamp_completed(order: SmmOrderRow) -> Optional[str]:
+        """Persist delivery time so the refill window does not reset on later updates."""
+        try:
+            data = json.loads(order.extra or "") if order.extra else {}
+            if not isinstance(data, dict):
+                data = {}
+        except Exception:  # noqa: BLE001
+            data = {}
+        if data.get("completed_ts"):
+            return None
+        data["completed_ts"] = time.time()
+        return json.dumps(data)
 
     def _store_get(self, oid: int) -> SmmOrderRow:
         smm = self._smm()
@@ -395,14 +419,19 @@ class SmmShop:
                 earnings_paid = True
         smm = getattr(platform, "_smm", None) or self._smm()
         if smm is not None:
-            smm.update(
-                order.id,
+            extra = None
+            if new_status in {"completed", "partial"}:
+                extra = self._stamp_completed(order)
+            kw: dict = dict(
                 status=new_status,
                 remains=int(st.remains),
                 start_count=int(st.start_count),
                 refunded=new_refunded,
                 earnings_paid=earnings_paid,
             )
+            if extra:
+                kw["extra"] = extra
+            smm.update(order.id, **kw)
             fresh = smm.get(order.id)
             if fresh is not None:
                 return fresh
@@ -493,10 +522,19 @@ class SmmShop:
         return f"📣 Social boost update: {name} is now {order.status}."
 
     def request_refill(self, order: SmmOrderRow) -> str:
-        if not order.refillable:
-            raise SmmUserError("This service has no refill.")
-        if order.status not in {"completed", "partial"}:
-            raise SmmUserError("Refill is only available after delivery.")
+        open_fn = getattr(order, "refill_open", None)
+        if callable(open_fn):
+            if not open_fn():
+                if not order.refillable:
+                    raise SmmUserError("This service has no refill.")
+                if order.status not in {"completed", "partial"}:
+                    raise SmmUserError("Refill is only available after delivery.")
+                raise SmmUserError("The refill window for this order has ended.")
+        else:
+            if not order.refillable:
+                raise SmmUserError("This service has no refill.")
+            if order.status not in {"completed", "partial"}:
+                raise SmmUserError("Refill is only available after delivery.")
         try:
             rid = self.provider.refill(order.provider_order_id)
         except SmmError as exc:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -78,6 +79,43 @@ class SmmOrderRow:
     def net(self) -> Money:
         left = self.charge.paise - self.refunded.paise
         return Money(left if left > 0 else 0)
+
+    def extra_map(self) -> dict[str, Any]:
+        if not self.extra:
+            return {}
+        try:
+            data = json.loads(self.extra)
+        except Exception:  # noqa: BLE001
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    @property
+    def refill_days(self) -> int:
+        try:
+            return max(0, int(self.extra_map().get("refill_days") or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def refill_open(self, now: Optional[float] = None) -> bool:
+        """True while the supplier refill window is still open."""
+        if not self.refillable:
+            return False
+        if self.status not in {"completed", "partial"}:
+            return False
+        days = self.refill_days
+        if days <= 0:
+            return True
+        data = self.extra_map()
+        try:
+            start = float(data.get("completed_ts") or 0)
+        except (TypeError, ValueError):
+            start = 0.0
+        if start <= 0:
+            start = float(self.updated_ts or self.ts or 0)
+        if start <= 0:
+            return True
+        now_ts = time.time() if now is None else now
+        return now_ts <= start + days * 86400.0
 
 
 def _row(r) -> SmmOrderRow:

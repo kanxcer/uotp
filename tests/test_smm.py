@@ -72,6 +72,23 @@ def test_parse_skips_non_default_and_zero_rate():
     assert svc.min_qty == 100
 
 
+def test_parse_refill_days_from_name_and_fields():
+    named = parse_service(_svc_row(
+        name="Instagram Followers 60 Days ♻️", refill=False))
+    assert named is not None
+    assert named.refill is True
+    assert named.refill_days == 60
+    numeric = parse_service(_svc_row(refill="60"))
+    assert numeric is not None and numeric.refill is True
+    assert numeric.refill_days == 60
+    flagged = parse_service(_svc_row(refill=True, refill_days=30))
+    assert flagged is not None and flagged.refill is True
+    assert flagged.refill_days == 30
+    off = parse_service(_svc_row(refill=False, name="TikTok Views"))
+    assert off is not None and off.refill is False
+    assert off.refill_days == 0
+
+
 def test_platform_detect_never_uses_bare_x():
     assert detect_platform("Max views pack") == "other"
     assert detect_platform("Next-gen likes") == "other"
@@ -540,4 +557,45 @@ def test_provider_usd_short_refuses_before_debit(tmp_path):
         shop.place(USER, svc, 1000, "https://tiktok.com/@x")
     assert store.balance(USER).paise == before.paise
     assert mock.add_calls == []
+    store.close()
+
+
+def test_refill_button_on_history_for_supplier_window(tmp_path):
+    store = SqliteWallets(str(tmp_path / "w.db"))
+    store.adjust(USER, INR(500))
+    mock = MockSmmProvider([_svc_row(
+        refill=True, name="IG Followers 60 Days ♻️",
+    )], balance=Decimal("10"))
+    cat = SmmCatalog(mock, usd_inr=Decimal("95"), markup=Decimal("0.45"),
+                     min_charge=Money(100))
+    cat.refresh()
+    shop = SmmShop(mock, cat, store)
+    svc = cat.get("1261")
+    assert svc is not None and svc.refill and svc.refill_days == 60
+    row = shop.place(USER, svc, 1000, "https://instagram.com/x")
+    mock.complete("1", remains=0, partial=False)
+    shop.poll_open()
+    updated = store.get_smm_order(row.id, user_id=USER)
+    assert updated.status == "completed"
+    assert updated.refill_open()
+    extra = json.loads(updated.extra or "{}")
+    assert extra.get("refill_days") == 60
+    assert extra.get("completed_ts")
+    ui, _ = _otp_ui(wallets=store, smm_shop=shop)
+    ui.button(OWNER, "a:smm")
+    hist = ui.button(USER, "sm:o")
+    blob = " ".join(l for r in hist.rows for l, _ in r)
+    assert "🔁 Refill" in blob
+    detail = ui.button(USER, f"sm:od:{row.id}")
+    dblob = " ".join(l for r in detail.rows for l, _ in r)
+    assert "🔁 Refill" in dblob
+    extra["completed_ts"] = extra["completed_ts"] - 61 * 86400
+    store.update_smm_order(row.id, extra=json.dumps(extra))
+    stale = store.get_smm_order(row.id, user_id=USER)
+    assert not stale.refill_open()
+    hist2 = ui.button(USER, "sm:o")
+    blob2 = " ".join(l for r in hist2.rows for l, _ in r)
+    assert "🔁 Refill" not in blob2
+    with pytest.raises(SmmUserError, match="window"):
+        shop.request_refill(stale)
     store.close()

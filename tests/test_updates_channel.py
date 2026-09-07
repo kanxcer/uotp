@@ -8,6 +8,7 @@ from uotpbot.bot.alerts import (
     ChannelPoster,
     boost_update,
     deposit_update,
+    md_to_telegram_html,
     purchase_update,
     withdraw_update,
 )
@@ -116,6 +117,18 @@ def test_poster_is_silent_when_channel_is_off():
     assert sent == []
 
 
+def test_md_to_telegram_html_bold_and_code():
+    html = md_to_telegram_html(
+        "📅 **Order Delivered**\n\n**Link:** hidden\n**Order ID:** `99`")
+    assert "<b>Order Delivered</b>" in html
+    assert "<b>Link:</b> hidden" in html
+    assert "<code>99</code>" in html
+    assert "**" not in html
+    w = md_to_telegram_html(withdraw_update(INR(12), bot="YCOTP_Bot"))
+    assert "<b>Withdrawal Successful</b>" in w
+    assert "**" not in w
+
+
 def test_poster_sends_when_channel_is_configured():
     store = SqliteWallets(":memory:")
     store.kv_set("updates_channel",
@@ -126,6 +139,9 @@ def test_poster_sends_when_channel_is_configured():
     assert poster.post(deposit_update(INR(101), bot="YCOTP_Bot")) is True
     assert len(sent) == 1
     assert sent[0]["chat_id"] == "-10099"
+    assert sent[0]["parse_mode"] == "HTML"
+    assert "<b>New Deposit Success</b>" in sent[0]["text"]
+    assert "**" not in sent[0]["text"]
     assert "101" in sent[0]["text"]
     assert USER not in sent[0]["text"]
 

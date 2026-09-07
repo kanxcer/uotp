@@ -107,6 +107,7 @@ def _clone_rig():
         clone_bot_id="clone1", platform_wallets=store,
         platform_owner_id="platform-owner", margin_fee_rate=Decimal("0.05"),
         clone_bot_token="123:AAFclonexxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        platform_bot_token="123:AAFplatformxxxxxxxxxxxxxxxxxxxxxxx",
     )
     ui = MenuUI(router, famgateway_api_key="fg-key-xxxxxx")
     return router, ui, store, provider, ledger, pricer
@@ -356,6 +357,86 @@ def test_main_admin_lists_every_clone_with_owner_and_stats():
         clone_panel = clone_ui.admin_panel("ownerA")
         datas = {d for row in (clone_panel.rows or ()) for _l, d in row}
         assert "a:cl" not in datas
+    finally:
+        ledger.close()
+
+
+def test_clone_withdraw_request_pings_platform_bot_not_clone():
+    """Payout request must land on YC OTP (platform token), not the clone chat."""
+    router, ui, store, _, ledger, _ = _clone_rig()
+    sent = []
+    ui.direct_send_fn = lambda t, c, x: sent.append((t, c, x)) or True
+    try:
+        credit_earnings(store, "clone-owner", INR(100))
+        ui.button("clone-owner", "ax:withdraw")
+        reply = ui.text("clone-owner", "50 name@okaxis")
+        assert reply.ok
+        assert not reply.notify
+        assert sent, "platform owner must be pinged via the main bot token"
+        tok, chat, text = sent[0]
+        assert tok == router.platform_bot_token
+        assert chat == "platform-owner"
+        assert "Clone payout request" in text
+        assert "50" in text
+        pending = pending_withdrawals(store)
+        assert len(pending) == 1
+        assert pending[0].get("bot_id") == "clone1"
+    finally:
+        ledger.close()
+
+
+def test_settle_payout_pings_clone_owner_on_clone_bot():
+    """Mark paid/decline must notify the clone owner on their clone, not YC OTP."""
+    catalog = Catalog({
+        "blinkit": ServiceCost(
+            "blinkit", "Blinkit", "food", INR(10),
+            Decimal("0.94"), Decimal("0.04"), Decimal("0.95"),
+        ),
+    }, (WalletPack("Pro", INR(1000), INR(1150)),))
+    ledger = Ledger()
+    pricer = Pricer(catalog)
+    provider = MockProvider({"blinkit": INR(10)}, balance=INR(5000), seed=3)
+    engine = BotEngine(catalog, provider, ledger, pricer)
+    store = SqliteWallets(":memory:")
+    registry = SubBotRegistry()
+    clone = SubBot(
+        owner_id="clone-owner", bot_token=GOOD_TOKEN,
+        mode=SubBotMode.PLATFORM_API, fee=DEFAULT_PLATFORM_FEE,
+        reseller_rate=Decimal("0.38"),
+    )
+    registry.add(clone)
+    router = CommandRouter(
+        engine, catalog, pricer, ledger, owner_id="platform-owner",
+        wallets=store, subbots=registry, platform_fee=DEFAULT_PLATFORM_FEE,
+        platform_bot_token="123:AAFplatformxxxxxxxxxxxxxxxxxxxxxxx",
+    )
+    ui = MenuUI(router)
+    sent = []
+    ui.direct_send_fn = lambda t, c, x: sent.append((t, c, x)) or True
+    try:
+        credit_earnings(store, "clone-owner", INR(80))
+        wd = request_withdraw(
+            store, "clone-owner", INR(40), "me@okaxis", bot_id=clone.id)
+        paid = ui.settle_payout("platform-owner", wd, paid=True)
+        assert paid.ok
+        assert not paid.notify
+        assert sent
+        tok, chat, text = sent[0]
+        assert tok == GOOD_TOKEN
+        assert chat == "clone-owner"
+        assert "Payout" in text or "sent" in text.lower()
+        sent.clear()
+        credit_earnings(store, "clone-owner", INR(20))
+        wd2 = request_withdraw(
+            store, "clone-owner", INR(10), "me@okaxis", bot_id=clone.id)
+        declined = ui.settle_payout("platform-owner", wd2, paid=False)
+        assert declined.ok
+        assert not declined.notify
+        assert sent
+        tok, chat, text = sent[0]
+        assert tok == GOOD_TOKEN
+        assert chat == "clone-owner"
+        assert "declined" in text.lower()
     finally:
         ledger.close()
 

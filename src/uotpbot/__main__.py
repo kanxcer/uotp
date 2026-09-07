@@ -383,6 +383,7 @@ def _serve(settings: Settings) -> int:
             window_seconds=settings.rate_limit_window,
         ),
         payment_notifier=payment_notifier,
+        platform_bot_token=settings.telegram_token,
         platform_bot_username=platform_username,
     )
     main_router.updates_poster = updates_poster
@@ -656,6 +657,7 @@ def _make_whitelabel(settings: Settings, catalog, ledger, pricer, wallets,
             platform_owner_id=settings.owner_id,
             margin_fee_rate=fee_rate,
             clone_bot_token=bot.bot_token,
+            platform_bot_token=settings.telegram_token,
             subbots=registry,
             subbot_manager=mgr,
             platform_fee=_platform_fee(settings),

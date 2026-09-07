@@ -12,9 +12,59 @@ its own state in memory so the loss of a single message is never fatal.
 from __future__ import annotations
 
 import asyncio
+import html as html_lib
 import logging
+import re
 
 log = logging.getLogger("uotpbot.alert")
+
+#: Templates still use legacy ``**bold**`` / `` `code` ``. Telegram's
+#: ``parse_mode: Markdown`` only treats a *single* asterisk as bold, so
+#: ``**Order Delivered**`` fails to parse, the send is retried without
+#: parse_mode, and subscribers see the asterisks. Convert at send time.
+_MD_BITS = re.compile(r"\*\*(.+?)\*\*|`([^`]+)`", re.DOTALL)
+
+
+def md_to_telegram_html(text: str) -> str:
+    """Legacy ``**bold**`` / backtick-code → Telegram HTML. Escapes the rest."""
+    text = text or ""
+    out: list[str] = []
+    pos = 0
+    for m in _MD_BITS.finditer(text):
+        out.append(html_lib.escape(text[pos:m.start()], quote=False))
+        if m.group(1) is not None:
+            out.append("<b>" + html_lib.escape(m.group(1), quote=False) + "</b>")
+        else:
+            out.append("<code>" + html_lib.escape(m.group(2), quote=False) + "</code>")
+        pos = m.end()
+    out.append(html_lib.escape(text[pos:], quote=False))
+    return "".join(out)
+
+
+def send_telegram_text(token: str, chat_id, text: str) -> bool:
+    """Fire-and-forget ``sendMessage`` with an explicit bot token.
+
+    Used when the current poller's token is the *wrong* bot (clone payout
+    request must land on the platform bot; paid/declined must land on the
+    clone). Never raises.
+    """
+    if not token or chat_id in (None, ""):
+        return False
+    body = (text or "").strip()
+    if not body:
+        return False
+    try:
+        cid: object = int(str(chat_id))
+    except (TypeError, ValueError):
+        cid = chat_id
+    ok, err = _telegram_http(
+        None, "sendMessage",
+        {"chat_id": cid, "text": body[:4096]},
+        token=token,
+    )
+    if not ok:
+        log.warning("direct telegram send to %s failed: %s", chat_id, err)
+    return ok
 
 
 def _telegram_http(app, method: str, payload: dict, *,
@@ -340,11 +390,12 @@ class ChannelPoster:
         body = (text or "").strip()
         if not chat or not body:
             return False
+        html_body = md_to_telegram_html(body)
         payload = {
             "chat_id": chat,
-            "text": body[:4096],
+            "text": html_body[:4096],
             "disable_web_page_preview": True,
-            "parse_mode": "Markdown",
+            "parse_mode": "HTML",
         }
         try:
             if self._send_fn is not None:
@@ -358,8 +409,14 @@ class ChannelPoster:
                 ok, err = _telegram_http(
                     self._app, "sendMessage", payload, token=token)
                 if not ok and "parse" in str(err).lower():
-                    payload = dict(payload)
-                    payload.pop("parse_mode", None)
+                    # Last resort: plain text with markers stripped so
+                    # asterisks never leak into the channel.
+                    plain = re.sub(r"<[^>]+>", "", html_body)
+                    payload = {
+                        "chat_id": chat,
+                        "text": plain[:4096],
+                        "disable_web_page_preview": True,
+                    }
                     ok, err = _telegram_http(
                         self._app, "sendMessage", payload, token=token)
             if ok:

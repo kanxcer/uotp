@@ -462,10 +462,14 @@ def my_boosts(ui, user_id: str) -> Reply:
     rows: list[tuple[tuple[str, str], ...]] = []
     for o in rows_data:
         tag = _STATUS.get(o.status, o.status)
-        rows.append(((
+        pair: list[tuple[str, str]] = [(
             f"{tag} · {_trunc(o.service_name, 16)} · {o.charge}",
             f"sm:od:{o.id}",
-        ),))
+        )]
+        open_fn = getattr(o, "refill_open", None)
+        if callable(open_fn) and open_fn():
+            pair.append(("🔁 Refill", f"sm:rf:{o.id}"))
+        rows.append(tuple(pair))
     rows.append((("📣 New boost", "sm"), ("🏠 Menu", "m")))
     return Reply("🧾 Your social boosts:", rows=tuple(rows))
 
@@ -508,10 +512,17 @@ def order_detail(ui, user_id: str, oid_s: str) -> Reply:
     ]
     if row.refunded.paise > 0:
         lines.append(f"↩️ Refunded {row.refunded}")
+    days = int(getattr(row, "refill_days", 0) or 0)
+    if days:
+        lines.append(f"🔁 Refill window: {days} days")
     if row.link:
         lines.append(f"\n🔗 {row.link}")
     actions: list[tuple[str, str]] = []
-    if row.refillable and row.status in {"completed", "partial"}:
+    open_fn = getattr(row, "refill_open", None)
+    if callable(open_fn) and open_fn():
+        actions.append(("🔁 Refill", f"sm:rf:{row.id}"))
+    elif (not callable(open_fn) and row.refillable
+          and row.status in {"completed", "partial"}):
         actions.append(("🔁 Refill", f"sm:rf:{row.id}"))
     if row.cancelable and row.status in OPEN_STATUSES:
         actions.append(("♻️ Cancel", f"sm:cx:{row.id}"))

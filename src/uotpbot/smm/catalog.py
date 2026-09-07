@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -111,6 +112,7 @@ class SmmService:
     min_qty: int
     max_qty: int
     refill: bool = False
+    refill_days: int = 0
     cancel: bool = False
     platform: str = "other"
     type: str = "Default"
@@ -124,6 +126,66 @@ class SmmService:
     @property
     def cat_key(self) -> str:
         return cat_id(self.category)
+
+
+_DAYS_RE = re.compile(r"(\d+)\s*days?", re.IGNORECASE)
+
+
+def _days_from(value: object) -> int:
+    """Best-effort refill window in days. 0 = unknown / not a window."""
+    if value is None or isinstance(value, bool):
+        return 0
+    if isinstance(value, (int, float)):
+        n = int(value)
+        return n if n > 1 else 0
+    s = str(value).strip()
+    if s.isdigit():
+        n = int(s)
+        return n if n > 1 else 0
+    m = _DAYS_RE.search(s)
+    return int(m.group(1)) if m else 0
+
+
+def _refill_from_row(row: dict, name: str) -> tuple[bool, int]:
+    """``(refillable, days)``. days=0 means refillable with no known window."""
+    refillable = False
+    days = 0
+    raw = row.get("refill")
+    if isinstance(raw, bool):
+        refillable = raw
+    elif isinstance(raw, (int, float)):
+        n = int(raw)
+        if n > 1:
+            refillable, days = True, n
+        else:
+            refillable = bool(n)
+    else:
+        s = str(raw or "").strip().lower()
+        if s in {"1", "true", "yes", "on"}:
+            refillable = True
+        elif s in {"0", "false", "no", "off", ""}:
+            refillable = False
+        else:
+            d = _days_from(raw)
+            if d:
+                refillable, days = True, d
+            elif "refill" in s:
+                refillable = True
+    for key in ("refill_days", "refilldays", "refill_type", "refillType"):
+        d = _days_from(row.get(key))
+        if d:
+            days = d
+            refillable = True
+    d = _days_from(name)
+    if d:
+        days = days or d
+        refillable = True
+    hay = f"{name} {row.get('category') or ''}"
+    if not refillable and (
+        "refill" in hay.lower() or "♻️" in hay or "♻" in hay
+    ):
+        refillable = True
+    return refillable, days
 
 
 def parse_service(row: object) -> Optional[SmmService]:
@@ -143,6 +205,7 @@ def parse_service(row: object) -> Optional[SmmService]:
         return None
     min_qty = max(1, _as_int(row.get("min"), 1))
     max_qty = max(min_qty, _as_int(row.get("max"), min_qty))
+    refill, refill_days = _refill_from_row(row, name)
     return SmmService(
         service_id=sid,
         name=name,
@@ -150,7 +213,8 @@ def parse_service(row: object) -> Optional[SmmService]:
         rate_usd=rate,
         min_qty=min_qty,
         max_qty=max_qty,
-        refill=_as_bool(row.get("refill")),
+        refill=refill,
+        refill_days=refill_days,
         cancel=_as_bool(row.get("cancel")),
         platform=detect_platform(name, category),
         type=kind,

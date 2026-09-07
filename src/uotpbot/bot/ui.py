@@ -1034,6 +1034,49 @@ class MenuUI:
     def _is_clone(self) -> bool:
         return bool(getattr(self.router, "is_clone", False))
 
+    def _ping_telegram(self, token: str, chat_id: str, text: str) -> bool:
+        """Send ``text`` with an explicit bot token (cross-bot payout pings)."""
+        if not token or not chat_id or not text:
+            return False
+        fn = getattr(self, "direct_send_fn", None)
+        if callable(fn):
+            try:
+                return bool(fn(token, str(chat_id), text))
+            except Exception:  # noqa: BLE001
+                log.warning("direct_send_fn failed", exc_info=True)
+                return False
+        try:
+            from .alerts import send_telegram_text
+            return send_telegram_text(token, chat_id, text)
+        except Exception:  # noqa: BLE001
+            log.warning("telegram ping failed", exc_info=True)
+            return False
+
+    def _clone_token_for_payout(self, data: dict) -> str:
+        """Token of the clone that opened this payout (so settle pings there)."""
+        registry = getattr(self.router, "subbots", None)
+        bot_id = str((data or {}).get("bot_id") or "")
+        if registry is not None:
+            if bot_id:
+                try:
+                    bot = registry.find(bot_id)
+                except Exception:  # noqa: BLE001
+                    bot = None
+                tok = getattr(bot, "bot_token", "") if bot is not None else ""
+                if tok:
+                    return tok
+            owner = str((data or {}).get("owner_id") or "")
+            if owner:
+                try:
+                    bots = list(registry.for_owner(owner) or [])
+                except Exception:  # noqa: BLE001
+                    bots = []
+                for b in bots:
+                    tok = getattr(b, "bot_token", "") or ""
+                    if tok:
+                        return tok
+        return getattr(self.router, "clone_bot_token", "") or ""
+
     def _fg_store(self):
         """Unscoped store for FamGateway order mappings.
 
@@ -2689,22 +2732,27 @@ class MenuUI:
                              ok=False, rows=((("✖️ Cancel", "a"),),))
         upi = tokens[1]
         try:
-            wd_id = request_withdraw(store, user_id, amount, upi)
+            wd_id = request_withdraw(
+                store, user_id, amount, upi,
+                bot_id=getattr(self.router, "clone_bot_id", "") or "",
+            )
         except ValueError as exc:
             return Reply(str(exc), ok=False, rows=((("✖️ Cancel", "a"),),))
         self._wizard.pop(user_id, None)
         plat = getattr(self.router, "platform_owner_id", "") or ""
-        notify = (
-            ((plat,
-              f"💸 Clone payout request #{wd_id}: {amount} to `{upi}` "
-              f"from clone owner `{user_id}`."),)
-            if plat else ()
-        )
+        plat_tok = getattr(self.router, "platform_bot_token", "") or ""
+        if plat:
+            ping = (
+                f"💸 Clone payout request #{wd_id}: {amount} to `{upi}` "
+                f"from clone owner `{user_id}`."
+            )
+            if not self._ping_telegram(plat_tok, plat, ping):
+                log.warning(
+                    "clone payout request ping to platform owner %s failed", plat)
         return Reply(
             f"✅ Payout requested: {amount} to `{upi}`.\n"
             f"Request id `{wd_id}`. We'll settle it and ping you.",
             rows=((("◀️ Clone panel", "a"),),),
-            notify=notify,
         )
 
     def payouts_screen(self, user_id: str) -> Reply:
@@ -2756,11 +2804,14 @@ class MenuUI:
         else:
             note = f"❌ Declined — {amt} returned to the clone owner's earnings."
             ping = f"⚠️ Payout of {amt} was declined. The amount is back in your earnings."
+        if owner:
+            token = self._clone_token_for_payout(data)
+            if not self._ping_telegram(token, owner, ping):
+                log.warning("clone payout settle ping to %s failed", owner)
         fresh = self.payouts_screen(user_id)
         return Reply(
             f"{note}\n\n{fresh.text}",
             rows=fresh.rows,
-            notify=((owner, ping),) if owner else (),
         )
 
     def _float_stats(self):

@@ -161,7 +161,8 @@ def debit_earnings(store, owner_id: str, amount: Money) -> Money:
     return new
 
 
-def request_withdraw(store, owner_id: str, amount: Money, upi: str) -> str:
+def request_withdraw(store, owner_id: str, amount: Money, upi: str,
+                     *, bot_id: str = "") -> str:
     """Freeze ``amount`` from earnings and open a pending payout request."""
     upi = (upi or "").strip()
     if not upi or "@" not in upi:
@@ -176,6 +177,7 @@ def request_withdraw(store, owner_id: str, amount: Money, upi: str) -> str:
         "upi": upi,
         "status": "pending",
         "ts": time.time(),
+        "bot_id": bot_id or "",
     }
     set_(_WD.format(wd_id), json.dumps(payload))
     return wd_id
