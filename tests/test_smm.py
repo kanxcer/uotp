@@ -293,6 +293,46 @@ def test_ui_hides_smm_without_shop():
     assert "isn't on this bot" in tap.text
 
 
+def test_ui_hides_smm_when_shop_wired_but_off(tmp_path):
+    store = SqliteWallets(str(tmp_path / "w.db"))
+    mock = MockSmmProvider([_svc_row()], balance=Decimal("10"))
+    cat = SmmCatalog(mock, usd_inr=Decimal("95"), markup=Decimal("0.45"))
+    cat.refresh()
+    shop = SmmShop(mock, cat, store)
+    ui, _ = _otp_ui(wallets=store, smm_shop=shop)
+    menu = ui.main_menu(USER)
+    labels = [lbl for row in menu.rows for lbl, _ in row]
+    assert "📣 Social boost" not in labels
+    tap = ui.button(USER, "sm")
+    assert "switched off" in tap.text
+    store.close()
+
+
+def test_admin_toggle_smm_shows_and_hides(tmp_path):
+    store = SqliteWallets(str(tmp_path / "w.db"))
+    mock = MockSmmProvider([_svc_row()], balance=Decimal("10"))
+    cat = SmmCatalog(mock, usd_inr=Decimal("95"), markup=Decimal("0.45"))
+    cat.refresh()
+    shop = SmmShop(mock, cat, store)
+    ui, _ = _otp_ui(wallets=store, smm_shop=shop)
+    panel = ui.admin_panel(OWNER)
+    assert "Social boost: off" in panel.text
+    assert any(d == "a:smm" for row in panel.rows for _, d in row)
+    r = ui.button(OWNER, "a:smm")
+    assert "**ON**" in r.text
+    assert ui.smm_enabled() is True
+    menu = ui.main_menu(USER)
+    labels = [lbl for row in menu.rows for lbl, _ in row]
+    assert "📣 Social boost" in labels
+    r2 = ui.button(OWNER, "a:smm")
+    assert "**OFF**" in r2.text
+    labels2 = [lbl for row in ui.main_menu(USER).rows for lbl, _ in row]
+    assert "📣 Social boost" not in labels2
+    # customer cannot flip it
+    assert "Owner only" in ui.button(USER, "a:smm").text
+    store.close()
+
+
 def test_ui_shows_smm_when_shop_wired(tmp_path):
     store = SqliteWallets(str(tmp_path / "w.db"))
     store.adjust(USER, INR(500))
@@ -301,6 +341,7 @@ def test_ui_shows_smm_when_shop_wired(tmp_path):
     cat.refresh()
     shop = SmmShop(mock, cat, store)
     ui, router = _otp_ui(wallets=store, smm_shop=shop)
+    ui.button(OWNER, "a:smm")  # owner must turn it on
     menu = ui.main_menu(USER)
     labels = [lbl for row in menu.rows for lbl, _ in row]
     assert "📣 Social boost" in labels

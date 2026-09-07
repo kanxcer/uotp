@@ -190,6 +190,9 @@ class MenuUI:
         #: feature for users"); the owner re-enables it live from the admin
         #: panel, which persists the choice so a redeploy keeps it.
         self._createbot_memory = False    # allow users to clone this bot
+        #: Social boost is OFF by default even when SMM_API_KEY is set. The
+        #: owner flips it from the admin panel; persists in kv across deploys.
+        self._smm_memory = False
         #: user_id -> [(timestamp, slug, ok, one-line summary)].
         #: Session-scoped by design; say that on the screen.
         self._history: dict[str, list[tuple[float, str, bool, str]]] = {}
@@ -526,6 +529,41 @@ class MenuUI:
             except Exception:  # noqa: BLE001 - memory still reflects the flip
                 pass
         self._createbot_memory = new
+        return new
+
+    def smm_enabled(self) -> bool:
+        """True while customers may see 📣 Social boost.
+
+        Needs a wired shop (``SMM_API_KEY``). Default OFF; the owner flips
+        it from the admin panel. Master switch lives on the platform store
+        so clones follow the main bot. Clones never write this flag.
+        """
+        if getattr(self.router, "smm_shop", None) is None:
+            return False
+        store = self._feature_store()
+        if store is not None:
+            try:
+                v = store.kv_get("feature_smm")
+                if v in ("1", "0"):
+                    return v == "1"
+            except Exception:  # noqa: BLE001 - fall back to memory
+                pass
+        return self._smm_memory
+
+    def _toggle_smm(self) -> bool:
+        """Flip Social boost; returns the new state. Main owner only."""
+        if self._is_clone:
+            return self.smm_enabled()
+        if getattr(self.router, "smm_shop", None) is None:
+            return False
+        new = not self.smm_enabled()
+        store = self._store_for_kv()
+        if store is not None:
+            try:
+                store.kv_set("feature_smm", "1" if new else "0")
+            except Exception:  # noqa: BLE001 - memory still reflects the flip
+                pass
+        self._smm_memory = new
         return new
 
     def _bot_closed_reply(self, user_id: str) -> Optional[Reply]:
@@ -1175,7 +1213,7 @@ class MenuUI:
         rows = [
             (("🛒 Buy a number", "l"),),
         ]
-        if getattr(self.router, "smm_shop", None) is not None:
+        if self.smm_enabled():
             rows.append((("📣 Social boost", "sm"),))
         rows += [
             ((f"💰 Balance: {balance}", "w"), ("🧾 My numbers", "o")),
@@ -2206,6 +2244,10 @@ class MenuUI:
             usd = getattr(smm_shop, "last_usd", None)
             if usd is not None:
                 smm_usd = f"📣 Social boost USD: ${usd}\n"
+        if smm_shop is not None:
+            smm_line = f"📣 Social boost: {'on' if self.smm_enabled() else 'off'}"
+        else:
+            smm_line = "📣 Social boost: not configured"
         return Reply(
             "📊 Owner panel\n\n"
             f"🏦 Provider wallet: {status['provider_wallet']}\n"
@@ -2222,11 +2264,13 @@ class MenuUI:
             f"🔓 Users may use bot: {'on' if self.bot_enabled() else 'off'}\n"
             f"📢 Force sub: {self.force_sub_label()}\n"
             f"📣 Updates channel: {self.updates_channel_label()}\n"
-            f"{cbt_line}\n\n"
+            f"{cbt_line}\n"
+            f"{smm_line}\n\n"
             "Full P&L: /report · Health: /status",
             rows=(
                 ((f"👥 All users ({users})", "ax:users"), ("🚫 Ban/Unban", "ax:ban")),
                 (("🔓 Users may use bot", "a:on"), ("🤖 Clone-bot on/off", "a:cb")),
+                *(( (("📣 Social boost on/off", "a:smm"),), ) if smm_shop is not None else ()),
                 (("📢 Force sub", "a:fs"), ("📣 Updates channel", "a:uc")),
                 (("📊 Metrics", "ax:metrics"),),
                 payouts_row,
@@ -2801,6 +2845,23 @@ class MenuUI:
                     "until you re-enable it. Owner access is unaffected."
                 )
                 return Reply(text, rows=((("◀️ Owner panel", "a"),),))
+            if parts[1] == "smm":
+                if not self.router._is_owner(user_id) or self._is_clone:
+                    return Reply("Owner only.", ok=False, rows=((("🏠 Menu", "m"),),))
+                if getattr(self.router, "smm_shop", None) is None:
+                    return Reply(
+                        "Social boost isn't configured on this deployment.",
+                        ok=False, rows=((("◀️ Owner panel", "a"),),),
+                    )
+                on = self._toggle_smm()
+                text = (
+                    "✅ Social boost is **ON** — customers see 📣 Social boost "
+                    "on the menu."
+                    if on else
+                    "📣 Social boost is **OFF** — hidden from the menu. "
+                    "Open orders still settle. Turn it back on here to sell again."
+                )
+                return Reply(text, rows=((("◀️ Owner panel", "a"),),))
             if parts[1] == "cb":
                 # 🤖 Allow users to clone the bot ('Run your own bot'). Owner-gated.
                 if not self.router._is_owner(user_id):
@@ -3067,7 +3128,7 @@ class MenuUI:
         """True for platform-only admin tools that clone owners must not use."""
         if kind in {"ap", "ad", "apw", "adw"}:
             return True
-        if kind == "a" and len(parts) >= 2 and parts[1] in {"t", "qr", "cb", "wd", "on", "cl", "cld", "clr", "uc", "ucoff"}:
+        if kind == "a" and len(parts) >= 2 and parts[1] in {"t", "qr", "cb", "wd", "on", "cl", "cld", "clr", "uc", "ucoff", "smm"}:
             return True
         if kind == "ax" and len(parts) >= 2 and parts[1] in {
             "credit", "debit", "fg", "upi", "sunkcost", "provider", "metrics",

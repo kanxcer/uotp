@@ -61,6 +61,17 @@ def handle(ui, user_id: str, parts: list[str]) -> Reply:
             "Social boost isn't on this bot.",
             ok=False, rows=((("🏠 Menu", "m"),),),
         )
+    kind = parts[1] if len(parts) > 1 else "home"
+    enabled = True
+    fn = getattr(ui, "smm_enabled", None)
+    if callable(fn):
+        enabled = bool(fn())
+    # Existing receipts still open when the shop is off; new buys do not.
+    if not enabled and kind not in {"o", "od", "rf", "cx"}:
+        return Reply(
+            "📣 Social boost is switched off by the owner.",
+            ok=False, rows=((("🏠 Menu", "m"),),),
+        )
     try:
         shop.catalog.ensure()
     except SmmError:
@@ -68,7 +79,6 @@ def handle(ui, user_id: str, parts: list[str]) -> Reply:
             "📣 Social boost is warming up. Try again in a moment.",
             ok=False, rows=((("🏠 Menu", "m"),),),
         )
-    kind = parts[1] if len(parts) > 1 else "home"
     if kind in {"home", ""}:
         return home(ui, user_id)
     if kind == "p":
@@ -99,6 +109,13 @@ def handle(ui, user_id: str, parts: list[str]) -> Reply:
 
 
 def handle_text(ui, user_id: str, body: str) -> Reply:
+    fn = getattr(ui, "smm_enabled", None)
+    if callable(fn) and not fn():
+        ui._wizard.pop(user_id, None)
+        return Reply(
+            "📣 Social boost is switched off by the owner.",
+            ok=False, rows=((("🏠 Menu", "m"),),),
+        )
     wizard = (ui._wizard or {}).get(user_id) or {}
     if wizard.get("flow") != "smm":
         return home(ui, user_id)
