@@ -423,6 +423,23 @@ class CommandRouter:
         return max(0.0, eligible - time.time())
 
     @staticmethod
+    def _topup_rows() -> tuple[tuple[tuple[str, str], ...], ...]:
+        """Inline keyboard when a buy is blocked on a short wallet."""
+        return (
+            (("➕ Add money", "t"),),
+            (("💰 Balance", "w"), ("🏠 Menu", "m")),
+        )
+
+    def _shortfall_reply(self, price: Money, balance: Money) -> Reply:
+        short = price - balance
+        return Reply(
+            f"That costs {price}; your balance is {balance}. "
+            f"Top up at least {short} more (💰 Balance → ➕ Add money).",
+            ok=False,
+            rows=self._topup_rows(),
+        )
+
+    @staticmethod
     def _retryable(reason: str) -> bool:
         """Whether a failed buy is worth a one-tap retry.
 
@@ -641,12 +658,7 @@ class CommandRouter:
         price, _ = self.engine.quote(slug, server=server or None)
         balance = self.balance_of(user_id)
         if balance.paise < price.paise:
-            short = price - balance
-            return Reply(
-                f"That costs {price}; your balance is {balance}. "
-                f"Top up at least {short} more (💰 Balance → ➕ Add money).",
-                ok=False,
-            )
+            return self._shortfall_reply(price, balance)
 
         # Debit first: if the purchase then fails, the refund path restores it.
         # (Exactly ONE rate-limit slot per buy — the check+record above already
@@ -734,12 +746,7 @@ class CommandRouter:
         price, _ = self.engine.quote(slug, server=server or None)
         balance = self.balance_of(user_id)
         if balance.paise < price.paise:
-            short = price - balance
-            return Reply(
-                f"That costs {price}; your balance is {balance}. "
-                f"Top up at least {short} more (💰 Balance → ➕ Add money).",
-                ok=False,
-            )
+            return self._shortfall_reply(price, balance)
 
         name = self.catalog.get(slug).name if self.catalog.has(slug) else slug
         self._debit(user_id, price, kind="purchase", note=name)

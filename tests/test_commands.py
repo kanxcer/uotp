@@ -109,6 +109,9 @@ def test_buy_without_funds_is_refused(rig):
     reply = router.handle(USER, "/buy telegram")
     assert not reply.ok
     assert "Top up" in reply.text
+    labels = [lbl for row in reply.rows for lbl, _ in row]
+    assert "➕ Add money" in labels
+    assert not any("Another" in lbl for lbl in labels)
 
 
 def test_buy_needs_an_argument(rig):

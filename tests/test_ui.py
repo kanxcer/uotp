@@ -191,6 +191,11 @@ def test_insufficient_balance_never_reaches_the_provider(rig):
     assert not final.ok
     assert "Top up" in final.text
     assert provider.get_balance().credit.paise == INR(5000).paise
+    # Ask them to add money — never 🔁 Another, they cannot buy again yet.
+    assert "t" in datas(final)
+    labels = [lbl for row in final.rows for lbl, _ in row]
+    assert "➕ Add money" in labels
+    assert not any("Another" in lbl for lbl in labels)
 
 
 # -- history & wallet --------------------------------------------------------

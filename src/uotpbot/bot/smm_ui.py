@@ -11,7 +11,7 @@ from decimal import Decimal
 from ..money import Money
 from ..smm.catalog import platform_label
 from ..smm.provider import OPEN_STATUSES, SmmError, SmmUserError
-from .commands import Reply
+from .commands import CommandRouter, Reply
 
 __all__ = ["handle", "handle_text"]
 
@@ -412,8 +412,11 @@ def begin_buy(ui, user_id: str, sid: str, qty: int) -> Reply:
                 wallets=ui.router.wallets,
             )
         except SmmUserError as exc:
+            msg = str(exc)
+            if "Top up" in msg:
+                return Reply(msg, ok=False, rows=CommandRouter._topup_rows())
             return Reply(
-                str(exc),
+                msg,
                 ok=False,
                 rows=((("💰 Wallet", "w"), ("📣 Social boost", "sm")),
                       (("🏠 Menu", "m"),)),

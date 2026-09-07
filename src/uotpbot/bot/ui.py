@@ -3233,6 +3233,10 @@ class MenuUI:
         del entries[self._history_size:]
 
     def _outcome(self, slug: str, reply: Reply, server: str = "") -> Reply:
+        # A short wallet is not a failed buy: send them to ➕ Add money,
+        # never 🔁 Another (they cannot buy again until they top up).
+        if "Top up" in (reply.text or ""):
+            return replace(reply, rows=CommandRouter._topup_rows())
         # A refunded no-stock / operator failure gets a one-tap 🔄 Retry that
         # re-runs the same money path without the per-user buy throttle.
         if CommandRouter._retryable(reply.text):
