@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from .money import Money
+from .smm.persist import SmmOrderRow, SmmStore
 
 __all__ = [
     "WalletStore", "SqliteWallets", "PostgresWallets", "ScopedWallets",
@@ -190,6 +191,26 @@ class ScopedWallets(WalletStore):
 
     def list_users(self, *, limit: int = 40, offset: int = 0):
         return self._inner.list_users(scope=self._scope, limit=limit, offset=offset)
+
+    def create_smm_order(self, **kw):
+        kw["scope"] = self._scope
+        return self._inner.create_smm_order(**kw)
+
+    def get_smm_order(self, oid, **kw):
+        kw["scope"] = self._scope
+        return self._inner.get_smm_order(oid, **kw)
+
+    def user_smm_orders(self, user_id, **kw):
+        kw["scope"] = self._scope
+        return self._inner.user_smm_orders(user_id, **kw)
+
+    def update_smm_order(self, oid, **kw):
+        row = self.get_smm_order(oid, user_id=kw.get("user_id", ""))
+        if row is None:
+            return False
+        return self._inner.update_smm_order(oid, **{
+            k: v for k, v in kw.items() if k != "user_id"
+        })
 
 
 _SCHEMA = """
@@ -485,6 +506,8 @@ class SqliteWallets(WalletStore):
             self._conn.execute(_REFUND_SCHEMA.format(
                 t="refund_outbox", pk="id INTEGER PRIMARY KEY AUTOINCREMENT,"))
             self._conn.execute(_SEEN_SCHEMA.format(t="seen_users"))
+            self._smm = SmmStore(self._conn, self._lock, "smm_orders", pg=False)
+            self._smm.ensure()
             # BEFORE the index: a legacy database gains the scope column here.
             self._migrate_orders()
             self._conn.execute(
@@ -928,6 +951,25 @@ class SqliteWallets(WalletStore):
             )
         return new
 
+    def create_smm_order(self, **kw) -> int:
+        return self._smm.create(**kw)
+
+    def get_smm_order(self, oid: int, *, scope: Optional[str] = None,
+                      user_id: str = "") -> Optional[SmmOrderRow]:
+        if scope is None:
+            scope = ""
+        return self._smm.get(oid, scope=scope, user_id=user_id)
+
+    def user_smm_orders(self, user_id: str, *, scope: str = "",
+                        limit: int = 20) -> list[SmmOrderRow]:
+        return self._smm.list_user(user_id, scope=scope, limit=limit)
+
+    def open_smm_orders(self, *, limit: int = 200) -> list[SmmOrderRow]:
+        return self._smm.list_open(limit=limit)
+
+    def update_smm_order(self, oid: int, **kw) -> bool:
+        return self._smm.update(oid, **kw)
+
     def close(self) -> None:
         self._conn.close()
 
@@ -972,6 +1014,9 @@ class PostgresWallets(WalletStore):
                 t=self._tr, pk="id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"))
             self._ts = f"{schema}.seen_users"
             self._conn.execute(_SEEN_SCHEMA.format(t=self._ts))
+            self._smm = SmmStore(
+                self._conn, self._lock, f"{schema}.smm_orders", pg=True)
+            self._smm.ensure()
             # BEFORE the index: a legacy database gains the scope column here.
             self._migrate_orders()
             safe = schema.replace("-", "_").replace('"', "")
@@ -1409,6 +1454,25 @@ class PostgresWallets(WalletStore):
         if new.is_negative:
             raise WalletError(f"balance cannot go negative for {user_id}")
         return new
+
+    def create_smm_order(self, **kw) -> int:
+        return self._smm.create(**kw)
+
+    def get_smm_order(self, oid: int, *, scope: Optional[str] = None,
+                      user_id: str = "") -> Optional[SmmOrderRow]:
+        if scope is None:
+            scope = ""
+        return self._smm.get(oid, scope=scope, user_id=user_id)
+
+    def user_smm_orders(self, user_id: str, *, scope: str = "",
+                        limit: int = 20) -> list[SmmOrderRow]:
+        return self._smm.list_user(user_id, scope=scope, limit=limit)
+
+    def open_smm_orders(self, *, limit: int = 200) -> list[SmmOrderRow]:
+        return self._smm.list_open(limit=limit)
+
+    def update_smm_order(self, oid: int, **kw) -> bool:
+        return self._smm.update(oid, **kw)
 
     def close(self) -> None:
         self._conn.close()

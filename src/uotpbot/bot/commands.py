@@ -231,6 +231,9 @@ class CommandRouter:
         self._cancel_tracker = CancelTracker()
         #: Durable, retried customer refunds (outbox). No refund is ever lost.
         self.refunds = DurableRefund(self)
+        #: Optional social-boost shop. None unless SMM_API_KEY is set; the UI
+        #: hides 📣 Social boost when this is None. Wired from ``__main__``.
+        self.smm_shop = None
 
     # -- helpers ---------------------------------------------------------
     def start_refund_worker(self) -> None:

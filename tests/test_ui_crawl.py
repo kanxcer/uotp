@@ -85,6 +85,9 @@ def test_crawl_from_main_menu_presses_everything_safely():
     datas = {d for d, _ in replies}
     assert "l" in datas and any(d.startswith("s:") for d in datas)
     assert "w" in datas and "o" in datas and "h" in datas
+    # OTP-only crawl: Social boost is hidden unless SMM_API_KEY wired a shop.
+    assert "sm" not in datas
+    assert not any(d.startswith("sm:") for d in datas)
 
 
 def test_owner_crawl_reaches_admin_screens():

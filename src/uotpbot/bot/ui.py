@@ -1127,6 +1127,9 @@ class MenuUI:
         if flow is not None and flow.pending(user_id) and not body.startswith("/"):
             return self.router.handle(user_id, body)
         wizard = self._wizard.get(user_id)
+        if wizard and wizard.get("flow") == "smm" and not body.startswith("/"):
+            from .smm_ui import handle_text as _smm_text
+            return _smm_text(self, user_id, body)
         if wizard and not body.startswith("/"):
             return self._wizard_text(user_id, body)
         if body.startswith("/"):
@@ -1171,6 +1174,10 @@ class MenuUI:
         fav_slug = self.favourites(user_id)
         rows = [
             (("🛒 Buy a number", "l"),),
+        ]
+        if getattr(self.router, "smm_shop", None) is not None:
+            rows.append((("📣 Social boost", "sm"),))
+        rows += [
             ((f"💰 Balance: {balance}", "w"), ("🧾 My numbers", "o")),
             ((f"⭐ Favourites ({len(fav_slug)})", "fav"), ("❓ How it works", "h")),
             (("🆘 Support", "support"),),
@@ -2193,9 +2200,16 @@ class MenuUI:
                 (f"💸 Clone payouts ({n_wd})", "a:wd"),
                 (f"🤖 Clone bots ({n_clones})", "a:cl"),
             )
+        smm_usd = ""
+        smm_shop = getattr(self.router, "smm_shop", None)
+        if smm_shop is not None:
+            usd = getattr(smm_shop, "last_usd", None)
+            if usd is not None:
+                smm_usd = f"📣 Social boost USD: ${usd}\n"
         return Reply(
             "📊 Owner panel\n\n"
             f"🏦 Provider wallet: {status['provider_wallet']}\n"
+            f"{smm_usd}"
             f"📒 Ledger wallet:    {status['ledger_wallet']}\n"
             f"💹 Revenue: {pnl['revenue']} · Costs: {pnl['cogs']}\n"
             f"📈 Net profit: {pnl['net_profit']}\n"
@@ -2733,8 +2747,11 @@ class MenuUI:
             )
         # Navigating away silently cancels any half-done top-up wizard; the
         # payment itself only exists once the screenshot lands, so nothing is lost.
-        if kind not in {"t", "ap", "ad", "fg"} and user_id in self._wizard:
+        if kind not in {"t", "ap", "ad", "fg", "sm"} and user_id in self._wizard:
             self._wizard.pop(user_id, None)
+        if kind == "sm":
+            from .smm_ui import handle as _smm_handle
+            return _smm_handle(self, user_id, parts)
         if kind == "m":
             return self.main_menu(user_id)
         if kind == "t":

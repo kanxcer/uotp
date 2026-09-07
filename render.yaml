@@ -44,6 +44,16 @@ services:
         value: uotp
       - key: UOTP_API_KEY
         sync: false          # set once; never commit a key
+      # Social-boost panel. Empty = shop hidden. Set in the dashboard; never
+      # put the live key in this file.
+      - key: SMM_API_KEY
+        sync: false
+      - key: SMM_API_URL
+        value: https://caspersmm.com/api/v2
+      - key: SMM_USD_INR
+        value: "95"
+      - key: SMM_MARKUP_RATE
+        value: "0.45"
       - key: UOTP_BASE_URL
         value: https://uotp.store/api/stubs/handler_api.php
       # Verified live 2026-09-02: country 0 passes validation, operator must

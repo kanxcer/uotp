@@ -13,7 +13,8 @@ from uotpbot.money import INR
 def clean_env(monkeypatch):
     """Isolate each test from the ambient environment and from each other."""
     for key in list(os.environ):
-        if key.startswith(("UOTP_", "FEE_", "ENGINE_", "TELEGRAM_", "LEDGER_", "PRICES_")):
+        if key.startswith(("UOTP_", "FEE_", "ENGINE_", "TELEGRAM_", "LEDGER_",
+                           "PRICES_", "SMM_")):
             monkeypatch.delenv(key, raising=False)
 
 
@@ -36,6 +37,9 @@ def test_defaults_are_sane(monkeypatch):
     assert s.engine.retry_cap == 3
     assert s.engine.default_country == "22"  # uotp.store handler_api: India
     assert not s.has_telegram
+    assert s.smm_api_key == ""
+    assert s.smm_usd_inr == Decimal("95")
+    assert s.smm_markup_rate == Decimal("0.45")
 
 
 def test_overrides_apply(monkeypatch):
@@ -137,6 +141,25 @@ def test_prices_params_and_service_map(monkeypatch):
     assert s.uotp.prices_country == "182"
     assert s.uotp.prices_operator == "jiotel"
     assert s.uotp.service_map == {"whatsapp": "wa", "telegram": "tg", "google": "go"}
+
+
+def test_smm_settings_are_optional_and_isolated(monkeypatch):
+    monkeypatch.setenv("UOTP_API_KEY", "k")
+    s = from_environment(env_file="/nonexistent/.env")
+    assert s.smm_api_key == ""
+    assert "caspersmm.com" in s.smm_api_url
+    monkeypatch.setenv("SMM_API_KEY", "panel-key")
+    monkeypatch.setenv("SMM_USD_INR", "94.5")
+    monkeypatch.setenv("SMM_MARKUP_RATE", "0.45")
+    s2 = from_environment(env_file="/nonexistent/.env")
+    assert s2.smm_api_key == "panel-key"
+    assert s2.smm_usd_inr == Decimal("94.5")
+    # OTP pricing is untouched.
+    assert s2.pricing_markup_rate == Decimal("0.45")
+    monkeypatch.delenv("SMM_MARKUP_RATE", raising=False)
+    monkeypatch.setenv("PRICING_MARKUP_RATE", "0.45")
+    s3 = from_environment(env_file="/nonexistent/.env")
+    assert s3.smm_markup_rate == s3.pricing_markup_rate == Decimal("0.45")
 
 
 def test_empty_service_map_parses_to_empty(monkeypatch):

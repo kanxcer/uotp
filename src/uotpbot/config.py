@@ -184,6 +184,19 @@ class Settings:
     #: a long random string to enable it; then requests need
     #: ``Authorization: Bearer <token>`` or ``?token=<token>``.
     metrics_token: str = ""
+    #: Social-boost panel key. Empty = the shop is hidden (OTP-only). Never
+    #: commit a live key; env-only.
+    smm_api_key: str = ""
+    smm_api_url: str = "https://caspersmm.com/api/v2"
+    #: INR per 1 USD for quoting. Default ~95; live mid-market was ~94.5.
+    smm_usd_inr: Decimal = Decimal("95")
+    #: Markup on USD×FX cost. Defaults to ``PRICING_MARKUP_RATE`` so Social
+    #: boost keeps the same 45% as OTP numbers unless SMM_MARKUP_RATE is set.
+    smm_markup_rate: Decimal = Decimal("0.45")
+    #: Floor customer charge in paise (₹1).
+    smm_min_charge_paise: int = 100
+    smm_cache_seconds: float = 1800.0
+    smm_poll_seconds: float = 45.0
 
     @property
     def has_telegram(self) -> bool:
@@ -270,6 +283,7 @@ def from_environment(env_file: Optional[Path | str] = None) -> Settings:
             "tokens and provider keys are stored encrypted; or set "
             "WHITELABEL_ENABLED=false to disable white-label."
         )
+    pricing_markup_rate = _decimal("PRICING_MARKUP_RATE", "0.45")
     return Settings(
         uotp=uotp,
         fees=fees,
@@ -288,7 +302,7 @@ def from_environment(env_file: Optional[Path | str] = None) -> Settings:
         platform_fee_rate=_fee_rate(_get("PLATFORM_FEE_RATE", "0.05")),
         pricing_target_margin=_fraction("PRICING_TARGET_MARGIN", "0.35"),
         pricing_strategy=_get("PRICING_STRATEGY", "exact_markup"),
-        pricing_markup_rate=_decimal("PRICING_MARKUP_RATE", "0.45"),
+        pricing_markup_rate=pricing_markup_rate,
         support_contact=_get("SUPPORT_CONTACT", ""),
         #: FamGateway API key for automated UPI top-ups. When set, the Add
         #: Money screen creates a live FamGateway order (QR + exact amount)
@@ -303,6 +317,13 @@ def from_environment(env_file: Optional[Path | str] = None) -> Settings:
         rate_limit_window=_int("RATE_LIMIT_WINDOW", 30),
         wallet_monitor_seconds=_int("WALLET_MONITOR_SECONDS", 120),
         metrics_token=_get("METRICS_TOKEN", ""),
+        smm_api_key=_get("SMM_API_KEY", ""),
+        smm_api_url=_get("SMM_API_URL", "https://caspersmm.com/api/v2"),
+        smm_usd_inr=_decimal("SMM_USD_INR", "95"),
+        smm_markup_rate=_decimal("SMM_MARKUP_RATE", str(pricing_markup_rate)),
+        smm_min_charge_paise=_int("SMM_MIN_CHARGE_PAISE", 100),
+        smm_cache_seconds=float(_get("SMM_CACHE_SECONDS", "1800")),
+        smm_poll_seconds=float(_get("SMM_POLL_SECONDS", "45")),
     )
 
 

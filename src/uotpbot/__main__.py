@@ -350,8 +350,9 @@ def _serve(settings: Settings) -> int:
     updates_poster = ChannelPoster(
         wallets, bot_token=getattr(settings, "telegram_token", "") or "",
     )
+    smm_box: list = []
     subbots = _make_whitelabel(settings, catalog, ledger, pricer, wallets,
-                              updates_poster=updates_poster)
+                              updates_poster=updates_poster, smm_box=smm_box)
     platform_username = platform_username_from_token(settings.telegram_token)
     if platform_username:
         log.info("platform bot @%s", platform_username)
@@ -392,6 +393,14 @@ def _serve(settings: Settings) -> int:
     from .wallet_monitor import WalletMonitor
 
     owner_alert = OwnerAlert(settings.owner_id)
+
+    smm_shop, smm_stop = _try_smm_shop(
+        settings, wallets, owner_alert=owner_alert.send,
+        registry=subbots.registry if subbots else None,
+    )
+    if smm_shop is not None:
+        main_router.smm_shop = smm_shop
+        smm_box.append(smm_shop)
     wallet_monitor = WalletMonitor(
         provider, notify_owner=owner_alert.send,
         check_interval=float(settings.wallet_monitor_seconds),
@@ -453,11 +462,98 @@ def _serve(settings: Settings) -> int:
         server.serve_forever()
     finally:
         sweep_stop.set()
+        if smm_stop is not None:
+            smm_stop.set()
         wallet_monitor.stop()
     if subbots is not None:
         subbots.manager.stop_all()
         subbots.registry.close()
     return 0
+
+
+def _try_smm_shop(settings: Settings, wallets, *, owner_alert=None,
+                  registry=None):
+    """Build the social-boost shop if SMM_API_KEY is set. Never fails boot."""
+    from decimal import Decimal
+
+    from .money import Money
+
+    key = (getattr(settings, "smm_api_key", "") or "").strip()
+    if not key:
+        return None, None
+    try:
+        from .smm.catalog import SmmCatalog
+        from .smm.panel import PanelV2Client
+        from .smm.shop import SmmShop
+        from .bot.alerts import _telegram_http
+    except Exception:
+        log.exception("smm imports failed; shop disabled")
+        return None, None
+
+    url = getattr(settings, "smm_api_url", "") or "https://caspersmm.com/api/v2"
+    try:
+        client = PanelV2Client(key, url)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("smm panel client not started: %s", exc)
+        return None, None
+
+    last_usd = None
+    try:
+        last_usd, currency = client.get_balance()
+        log.info("smm panel wallet %s %s", last_usd, currency)
+    except Exception as exc:  # noqa: BLE001 - do not fail boot
+        log.warning("smm balance probe failed (shop still on): %s", exc)
+
+    catalog = SmmCatalog(
+        client,
+        usd_inr=Decimal(str(getattr(settings, "smm_usd_inr", "95") or "95")),
+        markup=Decimal(str(
+            getattr(settings, "smm_markup_rate", None)
+            or getattr(settings, "pricing_markup_rate", "0.45")
+            or "0.45"
+        )),
+        min_charge=Money(int(getattr(settings, "smm_min_charge_paise", 100) or 100)),
+        cache_seconds=float(getattr(settings, "smm_cache_seconds", 1800) or 1800),
+    )
+    try:
+        catalog.refresh()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("smm catalogue refresh failed (will retry on tap): %s", exc)
+
+    def notify(scope: str, user_id: str, text: str) -> None:
+        token = getattr(settings, "telegram_token", "") or ""
+        if scope and registry is not None:
+            try:
+                bot = registry.find(scope)
+                if bot is not None and getattr(bot, "bot_token", ""):
+                    token = bot.bot_token
+            except Exception:  # noqa: BLE001
+                pass
+        if not token or not user_id:
+            log.info("smm notify (no token) to %s: %s", user_id, text.splitlines()[0])
+            return
+        ok, err = _telegram_http(
+            None, "sendMessage",
+            {"chat_id": int(user_id), "text": text},
+            token=token,
+        )
+        if not ok:
+            log.warning("smm notify failed for %s: %s", user_id, err)
+
+    shop = SmmShop(
+        client, catalog, wallets,
+        notify=notify,
+        alert=owner_alert,
+        margin_fee_rate=Decimal(str(getattr(settings, "platform_fee_rate", "0.05") or "0.05")),
+    )
+    shop.last_usd = last_usd
+    stop = threading.Event()
+    interval = float(getattr(settings, "smm_poll_seconds", 45) or 45)
+    try:
+        shop.start_poller(stop, interval=interval)
+    except Exception:
+        log.exception("smm poller failed to start")
+    return shop, stop
 
 
 def _platform_fee(settings: Settings):
@@ -477,7 +573,7 @@ class WhiteLabel:
 
 
 def _make_whitelabel(settings: Settings, catalog, ledger, pricer, wallets,
-                     updates_poster=None) -> Optional[WhiteLabel]:
+                     updates_poster=None, smm_box=None) -> Optional[WhiteLabel]:
     """Build the sub-bot registry and manager, or None when disabled."""
     if not settings.whitelabel_enabled:
         return None
@@ -548,6 +644,8 @@ def _make_whitelabel(settings: Settings, catalog, ledger, pricer, wallets,
         )
         router.on_bot_created = _on_created
         router.updates_poster = updates_poster
+        if smm_box:
+            router.smm_shop = smm_box[0]
         return router
 
     from .createbot import platform_username_from_token
