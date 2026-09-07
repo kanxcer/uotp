@@ -51,6 +51,36 @@ def test_sqlite_wallets_survive_reopen(tmp_path):
     reopened.close()
 
 
+def test_adjust_writes_a_wallet_tx_ledger(tmp_path):
+    store = SqliteWallets(str(tmp_path / "w.db"))
+    store.adjust(USER, INR(50), kind="deposit", note="FamPay")
+    store.adjust(USER, Money(-1000), kind="purchase", note="Telegram")
+    rows, total = store.list_wallet_tx(USER)
+    assert total == 2
+    assert rows[0].kind == "purchase" and rows[0].delta.paise == -1000
+    assert rows[0].note == "Telegram"
+    assert rows[0].balance_after.paise == INR(40).paise
+    assert rows[1].kind == "deposit" and rows[1].delta.paise == INR(50).paise
+    # Overdraft must not leave a ledger row.
+    with pytest.raises(WalletError):
+        store.adjust(USER, Money(-1_000_000), kind="debit")
+    rows2, total2 = store.list_wallet_tx(USER)
+    assert total2 == 2
+    store.close()
+
+
+def test_scoped_wallet_tx_is_isolated(tmp_path):
+    store = SqliteWallets(str(tmp_path / "w.db"))
+    bot_a = ScopedWallets(store, "bta1")
+    bot_b = ScopedWallets(store, "btb2")
+    bot_a.adjust(USER, INR(50), kind="deposit", note="FamPay")
+    rows_a, n_a = bot_a.list_wallet_tx(USER)
+    rows_b, n_b = bot_b.list_wallet_tx(USER)
+    assert n_a == 1 and rows_a[0].kind == "deposit"
+    assert n_b == 0
+    store.close()
+
+
 def test_adjust_is_read_modify_write_and_never_negative(tmp_path):
     store = SqliteWallets(str(tmp_path / "w.db"))
     store.adjust(USER, INR(50))

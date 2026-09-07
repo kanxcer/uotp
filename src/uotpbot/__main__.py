@@ -120,7 +120,10 @@ def _credit_fg_wallet(store, uid: str, order_id: str, amount_dec, *, notifier=No
             except Exception:  # noqa: BLE001
                 scope = ""
         wallet_uid = f"{scope}:{uid}" if scope else f"{uid}"
-        store.adjust(wallet_uid, money)
+        try:
+            store.adjust(wallet_uid, money, kind="deposit", note="FamPay")
+        except TypeError:
+            store.adjust(wallet_uid, money)
         set_ = getattr(store, "kv_set", None)
         if callable(set_):
             set_(f"fg_credited:{order_id}", "1")
@@ -397,6 +400,7 @@ def _serve(settings: Settings) -> int:
     smm_shop, smm_stop = _try_smm_shop(
         settings, wallets, owner_alert=owner_alert.send,
         registry=subbots.registry if subbots else None,
+        updates_poster=updates_poster,
     )
     if smm_shop is not None:
         main_router.smm_shop = smm_shop
@@ -540,10 +544,24 @@ def _try_smm_shop(settings: Settings, wallets, *, owner_alert=None,
         if not ok:
             log.warning("smm notify failed for %s: %s", user_id, err)
 
+    def announce(service, amount, *, delivered=False):
+        if updates_poster is None:
+            return
+        try:
+            from .bot.alerts import boost_update
+            updates_poster.post(boost_update(
+                service, amount,
+                bot=getattr(updates_poster, "bot_username", "") or "",
+                delivered=delivered,
+            ))
+        except Exception:  # noqa: BLE001 - never roll back money for a channel post
+            log.debug("smm updates channel post failed", exc_info=True)
+
     shop = SmmShop(
         client, catalog, wallets,
         notify=notify,
         alert=owner_alert,
+        announce=announce,
         margin_fee_rate=Decimal(str(getattr(settings, "platform_fee_rate", "0.05") or "0.05")),
     )
     shop.last_usd = last_usd

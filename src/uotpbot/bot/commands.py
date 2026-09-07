@@ -263,12 +263,16 @@ class CommandRouter:
             return self.wallets.balance(user_id)
         return self.balances.get(user_id, Money.zero())
 
-    def credit(self, user_id: str, amount: Money) -> Money:
+    def credit(self, user_id: str, amount: Money, *, kind: str = "credit",
+               note: str = "") -> Money:
         """Add funds to a customer wallet (called after a payment confirms)."""
         if amount.is_negative or amount.is_zero:
             raise ValueError("credit amount must be positive")
         if self.wallets is not None:
-            return self.wallets.adjust(user_id, amount)
+            try:
+                return self.wallets.adjust(user_id, amount, kind=kind, note=note)
+            except TypeError:
+                return self.wallets.adjust(user_id, amount)
         self.balances[user_id] = self.balance_of(user_id) + amount
         return self.balances[user_id]
 
@@ -285,12 +289,17 @@ class CommandRouter:
     def _bot_handle(self) -> str:
         return (getattr(self, "platform_bot_username", "") or "").lstrip("@")
 
-    def _debit(self, user_id: str, amount: Money) -> Money:
+    def _debit(self, user_id: str, amount: Money, *, kind: str = "purchase",
+               note: str = "") -> Money:
         """Take funds off a customer wallet for a purchase."""
         if amount.is_negative or amount.is_zero:
             raise ValueError("debit amount must be positive")
         if self.wallets is not None:
-            return self.wallets.adjust(user_id, Money(-amount.paise))
+            try:
+                return self.wallets.adjust(
+                    user_id, Money(-amount.paise), kind=kind, note=note)
+            except TypeError:
+                return self.wallets.adjust(user_id, Money(-amount.paise))
         self.balances[user_id] = self.balance_of(user_id) - amount
         return self.balances[user_id]
 
@@ -644,7 +653,8 @@ class CommandRouter:
         # spent it. Recording again here halved the effective limit for typed
         # /buy while button buys used one slot, so identical behaviour hit two
         # different throttles.)
-        self._debit(user_id, price)
+        name = self.catalog.get(slug).name if self.catalog.has(slug) else slug
+        self._debit(user_id, price, kind="purchase", note=name)
         result = self.engine.fulfil(user_id, slug, gross_price=price,
                                     server=server or None)
         self._record_order(user_id, slug, price, result)
@@ -663,7 +673,7 @@ class CommandRouter:
             )
         # Failed: put the money back so the customer is never out of pocket.
         if result.refunded.paise > 0:
-            self.credit(user_id, result.refunded)
+            self.credit(user_id, result.refunded, kind="refund", note=name)
         reason = getattr(result, "message", "") or ""
         detail = f"\n\nWhy: {reason}" if reason else ""
         rows = ()
@@ -731,7 +741,8 @@ class CommandRouter:
                 ok=False,
             )
 
-        self._debit(user_id, price)
+        name = self.catalog.get(slug).name if self.catalog.has(slug) else slug
+        self._debit(user_id, price, kind="purchase", note=name)
         result = self.engine.allocate_number(user_id, slug, gross_price=price,
                                              server=server or None)
         if not result.success and result.order.state.value == "awaiting_otp" \
@@ -745,7 +756,7 @@ class CommandRouter:
         self._record_order(user_id, slug, price, result)
         # Allocation failed (already refunded by the engine's _fail).
         if result.refunded.paise > 0:
-            self.credit(user_id, result.refunded)
+            self.credit(user_id, result.refunded, kind="refund", note=name)
         reason = getattr(result, "message", "") or ""
         detail = f"\n\nWhy: {reason}" if reason else ""
         return Reply(
@@ -1679,7 +1690,7 @@ class CommandRouter:
         if amount.is_negative or amount.is_zero:
             return Reply("Amount must be positive.", ok=False)
         try:
-            new = self.credit(target, amount)
+            new = self.credit(target, amount, kind="admin", note="owner credit")
         except Exception as exc:  # noqa: BLE001
             return Reply(f"Could not credit: {exc}", ok=False)
         return Reply(
@@ -1707,7 +1718,7 @@ class CommandRouter:
         if amount.is_negative or amount.is_zero:
             return Reply("Amount must be positive.", ok=False)
         try:
-            new = self._debit(target, amount)
+            new = self._debit(target, amount, kind="admin", note="owner debit")
         except Exception as exc:  # noqa: BLE001
             return Reply(f"Could not debit: {exc}", ok=False)
         return Reply(f"↩️ Debited {amount} from `{target}` (balance now {new}).")

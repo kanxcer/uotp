@@ -258,6 +258,23 @@ def purchase_update(service: str, amount, *, bot: str = "") -> str:
     )
 
 
+def boost_update(service: str, amount, *, bot: str = "", delivered: bool = False) -> str:
+    """Public updates-channel copy for a social-boost sale. Never includes the customer."""
+    if delivered:
+        return (
+            "📣 **Social Boost Delivered**\n\n"
+            f"**Service:** {service}\n"
+            f"**Amount:** {amount}\n\n"
+            f"Thank you for using our service! ❤️{_bot_tag(bot)}"
+        )
+    return (
+        "📣 **Social Boost Order**\n\n"
+        f"**Service:** {service}\n"
+        f"**Amount:** {amount}\n\n"
+        f"Order received.{_bot_tag(bot)}"
+    )
+
+
 def withdraw_update(amount, *, bot: str = "") -> str:
     return (
         "💰**Withdrawal Successful**\n\n"

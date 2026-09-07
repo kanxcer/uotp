@@ -900,8 +900,9 @@ class MenuUI:
                 "📣 Updates channel — ON\n\n"
                 f"Channel: {shown}\n"
                 f"Chat id: `{cfg.get('chat')}`\n\n"
-                "Successful deposits, completed number purchases, and paid "
-                "clone withdrawals are posted here for subscribers.\n"
+                "Successful deposits, completed number purchases, social "
+                "boost orders, and paid clone withdrawals are posted here "
+                "for subscribers.\n"
                 "This bot must stay an administrator so it can post."
             )
             rows = (
@@ -914,6 +915,7 @@ class MenuUI:
                 "When ON, this bot posts to a channel you choose whenever:\n"
                 "• a deposit is credited\n"
                 "• a number purchase completes (OTP delivered)\n"
+                "• a social boost is bought or delivered\n"
                 "• a clone withdrawal is marked paid\n\n"
                 "1. Add THIS bot as an administrator in the channel "
                 "(Post messages permission).\n"
@@ -982,8 +984,8 @@ class MenuUI:
         shown = f"@{username}" if username else title
         return Reply(
             f"✅ Updates channel is ON.\n\n"
-            f"Deposits, completed purchases and paid withdrawals will post "
-            f"to {shown}.",
+            f"Deposits, purchases, social boosts and paid withdrawals will "
+            f"post to {shown}.",
             rows=((("📣 Updates channel", "a:uc"),), (("📊 Admin Panel", "a"),)),
         )
 
@@ -1416,17 +1418,42 @@ class MenuUI:
             ),
         )
 
-    def wallet_history(self, user_id: str) -> Reply:
-        """🧾 Transaction history: every top-up, purchase and refund for this
-        customer, plus any LIVE purchased number, newest first. IST timestamps.
+    _TX_PAGE = 8
+    _TX_KIND = {
+        "deposit": "Credits",
+        "credit": "Credits",
+        "admin": "Owner adjust",
+        "purchase": "Number",
+        "refund": "Refund",
+        "boost": "Social boost",
+        "boost_refund": "Boost refund",
+        "debit": "Debit",
+    }
+
+    @staticmethod
+    def _signed_money(delta) -> str:
+        paise = int(getattr(delta, "paise", delta) or 0)
+        from ..money import Money as _M
+        if paise > 0:
+            return f"+{_M(paise)}"
+        if paise < 0:
+            return f"−{_M(-paise)}"
+        return str(_M(0))
+
+    def wallet_history(self, user_id: str, page: int = 0) -> Reply:
+        """🧾 Transaction history: signed ledger of every credit and debit.
+
+        Prefers the wallet_tx log (deposits, owner adjust, number buy/refund,
+        social boost / refund). If that log is empty (pre-ledger balances),
+        reconstructs from top-ups, OTP orders and social-boost orders.
+        Pending screenshot top-ups always show. IST timestamps. Paginated.
         """
         balance = self.router.balance_of(user_id)
         store = self._store
+        page = max(0, int(page or 0))
         lines = [f"🧾 *Transaction history*\n\n💰 Balance: {balance}\n"]
         rows: list[tuple[tuple[str, str], ...]] = []
 
-        # LIVE purchased numbers are the most important "transaction" while they
-        # are sitting in the user's pocket -- surface them at the top.
         live = self._active_numbers(user_id)
         if live:
             lines.append("📱 Active purchase:")
@@ -1443,49 +1470,142 @@ class MenuUI:
                              ("♻️ Cancel", f"cx:{a.token}")))
             lines.append("")
 
-        # Top-ups (approved / pending / declined), newest first.
-        entries: list[tuple[float, str, str]] = []
+        txs: list = []
+        total = 0
+        lister = getattr(store, "list_wallet_tx", None)
+        if callable(lister):
+            try:
+                txs, total = lister(
+                    user_id, limit=self._TX_PAGE, offset=page * self._TX_PAGE)
+            except Exception:  # noqa: BLE001 - display only
+                txs, total = [], 0
+
+        if total:
+            for tx in txs:
+                kind = self._TX_KIND.get(tx.kind, (tx.kind or "Move").title())
+                note = f" · {tx.note}" if tx.note else ""
+                emoji = "🟢" if tx.delta.paise >= 0 else "🔴"
+                lines.append(
+                    f"{emoji} {self._signed_money(tx.delta)}  {kind}{note}\n"
+                    f"     {format_ts(tx.ts)} · bal {tx.balance_after}"
+                )
+            pages = max(1, (int(total) + self._TX_PAGE - 1) // self._TX_PAGE)
+            nav: list[tuple[str, str]] = []
+            if page > 0:
+                nav.append(("◀️ Prev", f"tx:{page - 1}"))
+            nav.append((f"{page + 1}/{pages}", "nop"))
+            if page < pages - 1:
+                nav.append(("Next ▶️", f"tx:{page + 1}"))
+            if pages > 1:
+                rows.append(tuple(nav))
+        else:
+            entries = self._reconstruct_history(user_id)
+            if entries:
+                lines.append("📜 Everything:")
+                start = page * self._TX_PAGE
+                window = entries[start: start + self._TX_PAGE]
+                for _ts, block in window:
+                    lines.append(block)
+                pages = max(1, (len(entries) + self._TX_PAGE - 1) // self._TX_PAGE)
+                nav = []
+                if page > 0:
+                    nav.append(("◀️ Prev", f"tx:{page - 1}"))
+                if pages > 1:
+                    nav.append((f"{page + 1}/{pages}", "nop"))
+                if page < pages - 1:
+                    nav.append(("Next ▶️", f"tx:{page + 1}"))
+                if nav:
+                    rows.append(tuple(nav))
+            else:
+                lines.append("No transactions yet. Add money, buy a number or "
+                             "a social boost to see them here.")
+
+        pending_bits = self._pending_topup_lines(user_id)
+        if pending_bits:
+            lines.append("")
+            lines.append("⏳ Open top-ups:")
+            lines.extend(pending_bits)
+
+        if live:
+            rows.append((("🧾 My numbers", "o"),))
+        rows.append((("➕ Add money", "t"), ("🛒 Buy a number", "l"), ("🏠 Menu", "m")))
+        return Reply("\n".join(lines), rows=tuple(rows))
+
+    def _pending_topup_lines(self, user_id: str) -> list[str]:
+        store = self._store
+        get_tups = getattr(store, "user_topups", None)
+        out: list[str] = []
+        if not callable(get_tups):
+            return out
+        try:
+            for t in list(get_tups(user_id)):
+                if t.status not in ("pending", "declined"):
+                    continue
+                badge = "⏳ Pending" if t.status == "pending" else "🔴 Declined"
+                out.append(
+                    f"  {badge} {t.amount} · top-up #{t.id}\n"
+                    f"      {format_ts(t.created_ts)}"
+                )
+        except Exception:  # noqa: BLE001
+            return []
+        return out
+
+    def _reconstruct_history(self, user_id: str) -> list[tuple[float, str]]:
+        """Fallback ledger from top-ups / OTP orders / social boosts."""
+        store = self._store
+        entries: list[tuple[float, str]] = []
         get_tups = getattr(store, "user_topups", None)
         if callable(get_tups):
             try:
                 for t in list(get_tups(user_id)):
                     badge = {"approved": "🟢 Credits", "pending": "⏳ Pending",
                              "declined": "🔴 Declined"}.get(t.status, "•")
-                    entries.append((t.created_ts, f"{badge} {t.amount}",
-                                    f"top-up #{t.id}"))
-            except Exception:  # noqa: BLE001 - display only
+                    signed = self._signed_money(t.amount) if t.status == "approved" \
+                        else str(t.amount)
+                    entries.append((
+                        float(t.created_ts or 0),
+                        f"  {badge} {signed} · top-up #{t.id}\n"
+                        f"      {format_ts(t.created_ts)}",
+                    ))
+            except Exception:  # noqa: BLE001
                 pass
-
-        # Orders (purchases / refunds / cancels), newest first.
-        recent = self._recent_orders(user_id)
-        for o in recent:
-            if hasattr(o, "success"):
-                try:
-                    name = self.catalog.get(o.slug).name if self.catalog.has(o.slug) else o.slug
-                except Exception:  # noqa: BLE001
-                    name = o.slug
-                status = o.status or ("delivered" if o.success else "refunded")
-                label = {"delivered": "🟢 Bought & delivered",
-                         "refunded": "🔵 Refunded",
-                         "cancelled": "🔵 Cancelled — refunded",
-                         "failed": "⚪ Failed — refunded"}.get(status, "•")
-                net = Money(o.gross.paise - o.refunded.paise)
-                entries.append((o.ts, f"{label} {o.gross}", f"{name} · net {net}"))
-
+        for o in self._recent_orders(user_id):
+            if not hasattr(o, "success"):
+                continue
+            try:
+                name = self.catalog.get(o.slug).name if self.catalog.has(o.slug) else o.slug
+            except Exception:  # noqa: BLE001
+                name = o.slug
+            status = o.status or ("delivered" if o.success else "refunded")
+            debit = self._signed_money(Money(-o.gross.paise))
+            block = (f"  🔴 {debit}  Number · {name}\n"
+                     f"      {format_ts(o.ts)}")
+            if status != "delivered" and o.refunded.paise > 0:
+                label = {"refunded": "Refund", "cancelled": "Refund",
+                         "failed": "Refund"}.get(status, "Refund")
+                block += (f"\n  🟢 {self._signed_money(o.refunded)}  {label} · {name}\n"
+                          f"      {format_ts(o.ts)}")
+            entries.append((float(o.ts or 0), block))
+        smm_fn = getattr(store, "user_smm_orders", None)
+        if callable(smm_fn):
+            try:
+                for o in list(smm_fn(user_id, limit=40)):
+                    name = o.service_name or f"#{o.service_id}"
+                    ts = float(getattr(o, "ts", 0) or 0)
+                    debit = self._signed_money(Money(-o.charge.paise))
+                    block = (f"  🔴 {debit}  Social boost · {name}\n"
+                             f"      {format_ts(ts)}")
+                    if o.refunded.paise > 0:
+                        uts = float(getattr(o, "updated_ts", 0) or ts)
+                        block += (
+                            f"\n  🟢 {self._signed_money(o.refunded)}  Boost refund · {name}\n"
+                            f"      {format_ts(uts)}"
+                        )
+                    entries.append((ts, block))
+            except Exception:  # noqa: BLE001
+                pass
         entries.sort(key=lambda e: -e[0])
-        if entries:
-            lines.append("📜 Everything:")
-            for ts, amt, note in entries:
-                lines.append(f"  {amt} · {note}")
-                lines.append(f"      {format_ts(ts)}")
-        else:
-            lines.append("No transactions yet. Add money or buy a number to "
-                         "see them here.")
-
-        if live:
-            rows.append((("🧾 My numbers", "o"),))
-        rows.append((("➕ Add money", "t"), ("🛒 Buy a number", "l"), ("🏠 Menu", "m")))
-        return Reply("\n".join(lines), rows=tuple(rows))
+        return entries
 
     # -- top-ups ----------------------------------------------------------
     # Flow: 💰 → ➕ Add money → pay by UPI → ✅ I've paid → amount →
@@ -1906,7 +2026,10 @@ class MenuUI:
                     ok=True, rows=((("💰 Balance", "w"), (("🏠 Menu", "m"),)),),
                 )
             money = Money(int(amount * Decimal(100)))
-            self.router.credit(uid, money)
+            try:
+                self.router.credit(uid, money, kind="deposit", note="FamPay")
+            except TypeError:
+                self.router.credit(uid, money)
             if callable(set_):
                 set_(key, "1")
             self._fg_orders.pop(order_id, None)
@@ -2972,7 +3095,8 @@ class MenuUI:
         if kind == "w":
             return self.wallet_card(user_id)
         if kind == "tx":
-            return self.wallet_history(user_id)
+            page = _int(parts[1], 0) if len(parts) >= 2 else 0
+            return self.wallet_history(user_id, page=page)
         if kind == "o":
             return self.history_card(user_id)
         if kind == "oact" and len(parts) == 2:

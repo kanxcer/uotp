@@ -74,6 +74,7 @@ class SmmShop:
         extra_rate: Decimal = Decimal("0"),
         notify: Optional[NotifyFn] = None,
         alert: Optional[AlertFn] = None,
+        announce: Optional[Callable[..., None]] = None,
         margin_fee_rate: Decimal = Decimal("0.05"),
     ) -> None:
         self.provider = provider
@@ -82,6 +83,7 @@ class SmmShop:
         self.extra_rate = Decimal(extra_rate or 0)
         self.notify = notify
         self.alert = alert
+        self.announce = announce
         self.margin_fee_rate = Decimal(margin_fee_rate or 0)
         self.last_usd: Optional[Decimal] = None
         self._lock = threading.Lock()
@@ -147,7 +149,11 @@ class SmmShop:
                 "Try a smaller quantity or another option."
             )
         try:
-            wallets.adjust(user_id, Money(-sell.paise))
+            try:
+                wallets.adjust(
+                    user_id, Money(-sell.paise), kind="boost", note=svc.name)
+            except TypeError:
+                wallets.adjust(user_id, Money(-sell.paise))
         except Exception as exc:  # noqa: BLE001
             raise SmmUserError("Could not debit your wallet. Try again.") from exc
         extra_json = ""
@@ -223,6 +229,7 @@ class SmmShop:
         if row is None:
             # Scope-less fallback (tests / unscoped store).
             row = self._store_get(oid)
+        self._announce_boost(svc.name, sell, delivered=False)
         return row
 
     def _store_get(self, oid: int) -> SmmOrderRow:
@@ -233,13 +240,33 @@ class SmmShop:
         return row
 
     @staticmethod
-    def _refund_wallet(wallets, user_id: str, amount: Money) -> None:
+    def _refund_wallet(wallets, user_id: str, amount: Money, *, note: str = "") -> None:
         if amount.is_zero:
             return
         try:
-            wallets.adjust(user_id, amount)
+            try:
+                wallets.adjust(
+                    user_id, amount, kind="boost_refund", note=note)
+            except TypeError:
+                wallets.adjust(user_id, amount)
         except Exception:  # noqa: BLE001
             log.exception("smm refund-after-fail could not credit %s %s", user_id, amount)
+
+    def _announce_boost(self, service: str, amount: Money, *,
+                        delivered: bool = False) -> None:
+        """Public updates-channel post. Never includes the customer, OTP, or link."""
+        fn = self.announce
+        if not callable(fn):
+            return
+        try:
+            fn(service, amount, delivered=delivered)
+        except TypeError:
+            try:
+                fn(service, amount)
+            except Exception:  # noqa: BLE001
+                log.debug("smm updates announce failed", exc_info=True)
+        except Exception:  # noqa: BLE001
+            log.debug("smm updates announce failed", exc_info=True)
 
     def _ping_owner(self, text: str) -> None:
         if self.alert is None:
@@ -316,6 +343,10 @@ class SmmShop:
                     user_id=updated.user_id,
                     text=self._customer_update(updated),
                 ))
+                if updated.status == "completed":
+                    self._announce_boost(
+                        updated.service_name or f"#{updated.service_id}",
+                        updated.charge, delivered=True)
         return notices
 
     def _apply(self, order: SmmOrderRow, st: SmmStatus, *, wallets) -> SmmOrderRow:
@@ -334,7 +365,14 @@ class SmmShop:
             # ``scope:uid`` for clones, bare uid otherwise.
             wallet_uid = f"{order.scope}:{order.user_id}" if order.scope else order.user_id
             try:
-                platform.adjust(wallet_uid, refund_delta)
+                try:
+                    platform.adjust(
+                        wallet_uid, refund_delta,
+                        kind="boost_refund",
+                        note=order.service_name or f"#{order.service_id}",
+                    )
+                except TypeError:
+                    platform.adjust(wallet_uid, refund_delta)
             except Exception:  # noqa: BLE001
                 log.exception("smm partial refund credit failed for %s", order.id)
                 # Don't mark refunded; next poll retries.

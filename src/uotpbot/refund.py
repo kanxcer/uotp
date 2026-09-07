@@ -74,7 +74,10 @@ def refund_once(router, user_id: str, amount: Money, order_token: str,
         return True
     # 4. Wallet: give the customer their money back.
     try:
-        router.credit(user_id, amount)
+        try:
+            router.credit(user_id, amount, kind="refund", note=reason or "refund")
+        except TypeError:
+            router.credit(user_id, amount)
     except Exception as exc:  # noqa: BLE001 - retryable
         log.warning("refund wallet credit failed user=%s amount=%s: %s",
                     user_id, amount, exc)

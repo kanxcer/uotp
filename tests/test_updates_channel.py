@@ -6,6 +6,7 @@ from decimal import Decimal
 
 from uotpbot.bot.alerts import (
     ChannelPoster,
+    boost_update,
     deposit_update,
     purchase_update,
     withdraw_update,
@@ -57,6 +58,14 @@ def test_copy_matches_the_asked_templates():
     assert "Withdrawal Successful" in w
     assert "₹12" in w
     assert "@YCOTP_Bot" in w
+    b = boost_update("TikTok Views", INR("15.00"), bot="YCOTP_Bot")
+    assert "Social Boost Order" in b
+    assert "TikTok Views" in b
+    assert USER not in b
+    assert "http" not in b.lower()
+    d = boost_update("TikTok Views", INR("15.00"), bot="YCOTP_Bot", delivered=True)
+    assert "Social Boost Delivered" in d
+    assert USER not in d
 
 
 def test_admin_panel_has_updates_channel_and_owner_can_set_it():

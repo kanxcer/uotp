@@ -28,7 +28,7 @@ from .smm.persist import SmmOrderRow, SmmStore
 
 __all__ = [
     "WalletStore", "SqliteWallets", "PostgresWallets", "ScopedWallets",
-    "WalletError", "Topup", "OrderRow", "ActiveNumber",
+    "WalletError", "Topup", "OrderRow", "ActiveNumber", "WalletTx",
 ]
 
 
@@ -85,8 +85,12 @@ class ScopedWallets(WalletStore):
     def set_balance(self, user_id: str, amount: Money) -> None:
         self._inner.set_balance(self._key(user_id), amount)
 
-    def adjust(self, user_id: str, delta: Money) -> Money:
-        return self._inner.adjust(self._key(user_id), delta)
+    def adjust(self, user_id: str, delta: Money, **kw) -> Money:
+        return self._inner.adjust(self._key(user_id), delta, **kw)
+
+    def list_wallet_tx(self, user_id: str, **kw):
+        kw.setdefault("scope", self._scope)
+        return self._inner.list_wallet_tx(user_id, **kw)
 
     # Delegated with the explicit scope column/prefix --------------------
     def create_topup(self, user_id, amount, *, note="", photo_file_id=""):
@@ -290,6 +294,25 @@ CREATE TABLE IF NOT EXISTS {t} (
 )
 """
 
+#: Append-only customer wallet ledger. Every ``adjust`` writes one row so
+#: Transaction history can show deposits, purchases, refunds and boosts —
+#: not only OTP orders / screenshot top-ups.
+_TX_SCHEMA = """
+CREATE TABLE IF NOT EXISTS {t} (
+    {pk}
+    scope TEXT NOT NULL DEFAULT '',
+    user_id TEXT NOT NULL,
+    delta_paise INTEGER NOT NULL,
+    balance_after_paise INTEGER NOT NULL,
+    kind TEXT NOT NULL DEFAULT '',
+    note TEXT NOT NULL DEFAULT '',
+    created_ts REAL NOT NULL
+)
+"""
+
+_TX_SELECT = ("id, user_id, delta_paise, balance_after_paise, kind, note, "
+              "created_ts, COALESCE(scope, '')")
+
 #: Everyone who has used the bot, including customers who never got a wallet
 #: row (a wallet row is only written on credit/debit). Admin "All users",
 #: Total users, and broadcast UNION this with wallets/orders/topups.
@@ -412,6 +435,54 @@ def _order_from_row(row):
 
 
 @dataclass(frozen=True, slots=True)
+class WalletTx:
+    """One customer wallet credit or debit, with the balance after it."""
+
+    id: int
+    user_id: str
+    delta: Money
+    balance_after: Money
+    kind: str
+    note: str
+    ts: float
+    scope: str = ""
+
+
+def _tx_kind(kind: str, delta: Money) -> str:
+    k = (kind or "").strip().lower()[:40]
+    if not k:
+        k = "credit" if delta.paise >= 0 else "debit"
+    return k
+
+
+def _tx_note(note: str) -> str:
+    return (note or "")[:240]
+
+
+def _split_wallet_key(stored: str) -> tuple[str, str]:
+    """``scope:uid`` (clone wallets) → (scope, uid); else ('', stored)."""
+    s = (stored or "").strip()
+    if ":" in s:
+        a, b = s.rsplit(":", 1)
+        if a and b:
+            return a, b
+    return "", s
+
+
+def _tx_from_row(row) -> WalletTx:
+    return WalletTx(
+        id=int(row[0]),
+        user_id=str(row[1] or ""),
+        delta=Money(int(row[2])),
+        balance_after=Money(int(row[3])),
+        kind=str(row[4] or ""),
+        note=str(row[5] or ""),
+        ts=float(row[6] or 0),
+        scope=str(row[7] or ""),
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class Topup:
     """One customer payment awaiting (or past) owner review."""
 
@@ -499,6 +570,9 @@ class SqliteWallets(WalletStore):
             )
             self._conn.execute(_KV_SCHEMA.format(t="kv"))
             self._conn.execute(
+                _TX_SCHEMA.format(t="wallet_tx", pk="id INTEGER PRIMARY KEY AUTOINCREMENT,")
+            )
+            self._conn.execute(
                 _ORDERS_SCHEMA.format(t="orders", pk="id INTEGER PRIMARY KEY AUTOINCREMENT,")
             )
             self._conn.execute(_ACTIVE_SCHEMA.format(
@@ -512,6 +586,8 @@ class SqliteWallets(WalletStore):
             self._migrate_orders()
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_active ON activenumbers(scope, user_id)")
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_wallet_tx ON wallet_tx(scope, user_id, id)")
             self._conn.commit()
 
     def _migrate_orders(self) -> None:
@@ -936,7 +1012,11 @@ class SqliteWallets(WalletStore):
                 (user_id, amount.paise),
             )
 
-    def adjust(self, user_id: str, delta: Money) -> Money:
+    def adjust(self, user_id: str, delta: Money, *, kind: str = "",
+               note: str = "", **_kw) -> Money:
+        kind = _tx_kind(kind, delta)
+        note = _tx_note(note)
+        scope, bare = _split_wallet_key(user_id)
         with self._lock, self._conn:
             row = self._conn.execute(
                 "SELECT balance_paise FROM wallets WHERE user_id = ?", (user_id,)
@@ -949,7 +1029,31 @@ class SqliteWallets(WalletStore):
                 "ON CONFLICT(user_id) DO UPDATE SET balance_paise = excluded.balance_paise",
                 (user_id, new.paise),
             )
+            self._conn.execute(
+                "INSERT INTO wallet_tx(scope, user_id, delta_paise, "
+                " balance_after_paise, kind, note, created_ts) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (scope, bare, delta.paise, new.paise, kind, note, time.time()),
+            )
         return new
+
+    def list_wallet_tx(self, user_id: str, *, scope: str = "",
+                       limit: int = 20, offset: int = 0
+                       ) -> tuple[list[WalletTx], int]:
+        """Newest-first page of this customer's wallet ledger."""
+        limit = max(1, min(int(limit or 20), 50))
+        offset = max(0, int(offset or 0))
+        with self._lock:
+            total = self._conn.execute(
+                "SELECT COUNT(*) FROM wallet_tx WHERE scope = ? AND user_id = ?",
+                (scope, user_id),
+            ).fetchone()[0]
+            rows = self._conn.execute(
+                f"SELECT {_TX_SELECT} FROM wallet_tx "
+                "WHERE scope = ? AND user_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
+                (scope, user_id, limit, offset),
+            ).fetchall()
+        return [_tx_from_row(r) for r in rows], int(total or 0)
 
     def create_smm_order(self, **kw) -> int:
         return self._smm.create(**kw)
@@ -1003,6 +1107,9 @@ class PostgresWallets(WalletStore):
             self._conn.execute(_TOPUPS_SCHEMA.format(
                 t=self._tt, pk="id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"))
             self._conn.execute(_KV_SCHEMA.format(t=self._tk))
+            self._tx = f"{schema}.wallet_tx"
+            self._conn.execute(_TX_SCHEMA.format(
+                t=self._tx, pk="id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"))
             self._to = f"{schema}.orders"
             self._conn.execute(_ORDERS_SCHEMA.format(
                 t=self._to, pk="id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,"))
@@ -1022,6 +1129,9 @@ class PostgresWallets(WalletStore):
             safe = schema.replace("-", "_").replace('"', "")
             self._conn.execute(
                 f'CREATE INDEX IF NOT EXISTS "idx_active_{safe}" ON {self._ta}(scope, user_id)')
+            self._conn.execute(
+                f'CREATE INDEX IF NOT EXISTS "idx_wallet_tx_{safe}" '
+                f'ON {self._tx}(scope, user_id, id)')
 
     # -- active numbers ----------------------------------------------------
     def record_active(self, *, user_id, slug, phone, provider_order_id="",
@@ -1422,7 +1532,8 @@ class PostgresWallets(WalletStore):
                 (user_id, amount.paise),
             )
 
-    def adjust(self, user_id: str, delta: Money) -> Money:
+    def adjust(self, user_id: str, delta: Money, *, kind: str = "",
+               note: str = "", **_kw) -> Money:
         # Two steps in one transaction, NOT a naive INSERT..ON CONFLICT..DO
         # UPDATE with ``delta`` as the candidate balance: Postgres validates
         # CHECK constraints on the INSERT candidate /before/ conflict
@@ -1434,6 +1545,9 @@ class PostgresWallets(WalletStore):
         #   1. Upsert a zero row (candidate 0 is always CHECK-safe).
         #   2. UPDATE the row to the new balance; the CHECK guards the FINAL
         #      value, so a genuine overdraft still dies loudly at the DB.
+        kind = _tx_kind(kind, delta)
+        note = _tx_note(note)
+        scope, bare = _split_wallet_key(user_id)
         with self._lock:
             try:
                 with self._conn.transaction():
@@ -1447,6 +1561,13 @@ class PostgresWallets(WalletStore):
                         "WHERE user_id = %s RETURNING balance_paise",
                         (delta.paise, user_id),
                     ).fetchone()
+                    self._conn.execute(
+                        f"INSERT INTO {self._tx}(scope, user_id, delta_paise, "
+                        f" balance_after_paise, kind, note, created_ts) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                        (scope, bare, delta.paise, int(row[0]), kind, note,
+                         time.time()),
+                    )
             except self._integrity as exc:
                 # The final-value CHECK fired: an overdraft, not a bug.
                 raise WalletError(f"balance cannot go negative for {user_id}") from exc
@@ -1454,6 +1575,23 @@ class PostgresWallets(WalletStore):
         if new.is_negative:
             raise WalletError(f"balance cannot go negative for {user_id}")
         return new
+
+    def list_wallet_tx(self, user_id: str, *, scope: str = "",
+                       limit: int = 20, offset: int = 0
+                       ) -> tuple[list[WalletTx], int]:
+        limit = max(1, min(int(limit or 20), 50))
+        offset = max(0, int(offset or 0))
+        with self._lock:
+            total = self._conn.execute(
+                f"SELECT COUNT(*) FROM {self._tx} WHERE scope = %s AND user_id = %s",
+                (scope, user_id),
+            ).fetchone()[0]
+            rows = self._conn.execute(
+                f"SELECT {_TX_SELECT} FROM {self._tx} "
+                "WHERE scope = %s AND user_id = %s ORDER BY id DESC LIMIT %s OFFSET %s",
+                (scope, user_id, limit, offset),
+            ).fetchall()
+        return [_tx_from_row(r) for r in rows], int(total or 0)
 
     def create_smm_order(self, **kw) -> int:
         return self._smm.create(**kw)

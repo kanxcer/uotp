@@ -234,9 +234,10 @@ def test_wallet_history_has_transaction_button():
     assert "Transaction history" in wh.text
     assert "Active purchase" in wh.text
     assert "Telegram" in wh.text
-    # A top-up appears as a credit.
+    # A credited top-up appears as a credit on the wallet ledger.
     tid = wallets.create_topup(USER, INR(100))
     wallets.decide_topup(tid, "approved", decided_by=OWNER)
+    router.credit(USER, INR(100), kind="deposit", note="top-up")
     wh2 = ui.button(USER, "tx")
     assert "Credits" in wh2.text and "₹100.00" in wh2.text
 

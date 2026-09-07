@@ -436,6 +436,97 @@ def test_short_balance_refuses_before_add(tmp_path):
     store.close()
 
 
+def test_place_logs_boost_tx_and_posts_update(tmp_path):
+    store = SqliteWallets(str(tmp_path / "w.db"))
+    store.adjust(USER, INR(500))
+    posted = []
+
+    def announce(service, amount, *, delivered=False):
+        posted.append((service, str(amount), delivered))
+
+    mock = MockSmmProvider([_svc_row()], balance=Decimal("10"))
+    cat = SmmCatalog(mock, usd_inr=Decimal("95"), markup=Decimal("0.45"),
+                     min_charge=Money(100))
+    cat.refresh()
+    shop = SmmShop(mock, cat, store, announce=announce)
+    svc = cat.get("1261")
+    row = shop.place(USER, svc, 1000, "https://tiktok.com/@secret")
+    txs, _n = store.list_wallet_tx(USER)
+    kinds = [t.kind for t in txs]
+    assert "boost" in kinds
+    boost = next(t for t in txs if t.kind == "boost")
+    assert boost.delta.paise == -row.charge.paise
+    assert "TikTok" in boost.note
+    assert posted and posted[0][0] == "TikTok Views" and posted[0][2] is False
+    blob = " ".join(p[0] for p in posted)
+    assert USER not in blob and "tiktok.com" not in blob
+    ui, _ = _otp_ui(wallets=store, smm_shop=shop)
+    ui.button(OWNER, "a:smm")
+    wh = ui.button(USER, "tx")
+    assert "Social boost" in wh.text
+    assert "TikTok" in wh.text
+    store.close()
+
+
+def test_completed_boost_posts_delivered(tmp_path):
+    store = SqliteWallets(str(tmp_path / "w.db"))
+    store.adjust(USER, INR(500))
+    posted = []
+
+    def announce(service, amount, *, delivered=False):
+        posted.append((service, delivered))
+
+    mock = MockSmmProvider([_svc_row()], balance=Decimal("10"))
+    cat = SmmCatalog(mock, usd_inr=Decimal("95"), markup=Decimal("0.45"))
+    cat.refresh()
+    shop = SmmShop(mock, cat, store, announce=announce)
+    svc = cat.get("1261")
+    shop.place(USER, svc, 1000, "https://tiktok.com/@x")
+    mock.complete("1", remains=0, partial=False)
+    shop.poll_open()
+    assert any(delivered for _s, delivered in posted)
+    assert posted[0][1] is False  # place
+    store.close()
+
+
+def test_boost_refund_is_on_the_ledger(tmp_path):
+    store = SqliteWallets(str(tmp_path / "w.db"))
+    store.adjust(USER, INR(500))
+    mock = MockSmmProvider([_svc_row()], balance=Decimal("10"))
+    cat = SmmCatalog(mock, usd_inr=Decimal("95"), markup=Decimal("0.45"))
+    cat.refresh()
+    shop = SmmShop(mock, cat, store)
+    svc = cat.get("1261")
+    shop.place(USER, svc, 1000, "https://tiktok.com/@x")
+    mock.orders["1"]["status"] = "Canceled"
+    mock.orders["1"]["remains"] = 1000
+    shop.poll_open()
+    txs, _n = store.list_wallet_tx(USER)
+    kinds = [t.kind for t in txs]
+    assert "boost" in kinds and "boost_refund" in kinds
+    ui, _ = _otp_ui(wallets=store, smm_shop=shop)
+    wh = ui.button(USER, "tx")
+    assert "Boost refund" in wh.text or "Social boost" in wh.text
+    store.close()
+
+
+def test_history_shows_admin_credit_debit_and_paginates(tmp_path):
+    store = SqliteWallets(str(tmp_path / "w.db"))
+    ui, router = _otp_ui(wallets=store)
+    router.credit(USER, INR(200), kind="admin", note="owner credit")
+    router._debit(USER, INR(25), kind="admin", note="owner debit")
+    for i in range(10):
+        router.credit(USER, INR(10), kind="deposit", note=f"pay {i}")
+    wh = ui.button(USER, "tx")
+    assert "Credits" in wh.text
+    datas = [d for row in wh.rows for _, d in row]
+    assert any(d.startswith("tx:") for d in datas)
+    page2 = ui.button(USER, "tx:1")
+    assert "Transaction history" in page2.text
+    assert "Owner adjust" in page2.text
+    store.close()
+
+
 def test_provider_usd_short_refuses_before_debit(tmp_path):
     store = SqliteWallets(str(tmp_path / "w.db"))
     store.adjust(USER, INR(500))
