@@ -544,7 +544,7 @@ def _try_smm_shop(settings: Settings, wallets, *, owner_alert=None,
         if not ok:
             log.warning("smm notify failed for %s: %s", user_id, err)
 
-    def announce(service, amount, *, delivered=False):
+    def announce(service, amount, *, delivered=False, order_id=""):
         if updates_poster is None:
             return
         try:
@@ -553,6 +553,7 @@ def _try_smm_shop(settings: Settings, wallets, *, owner_alert=None,
                 service, amount,
                 bot=getattr(updates_poster, "bot_username", "") or "",
                 delivered=delivered,
+                order_id=str(order_id or ""),
             ))
         except Exception:  # noqa: BLE001 - never roll back money for a channel post
             log.debug("smm updates channel post failed", exc_info=True)

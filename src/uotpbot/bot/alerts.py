@@ -258,20 +258,28 @@ def purchase_update(service: str, amount, *, bot: str = "") -> str:
     )
 
 
-def boost_update(service: str, amount, *, bot: str = "", delivered: bool = False) -> str:
-    """Public updates-channel copy for a social-boost sale. Never includes the customer."""
-    if delivered:
-        return (
-            "📣 **Social Boost Delivered**\n\n"
-            f"**Service:** {service}\n"
-            f"**Amount:** {amount}\n\n"
-            f"Thank you for using our service! ❤️{_bot_tag(bot)}"
-        )
+def boost_update(service: str, amount, *, bot: str = "", delivered: bool = False,
+                 order_id: str = "", server: str = "") -> str:
+    """Public updates-channel copy for a social-boost sale.
+
+    Never includes the customer, the real link, or an OTP. Link is always
+    the word ``hidden``.
+    """
+    handle = (bot or "").strip().lstrip("@")
+    thanks = f"\n\nThanks for Purchase @{handle} 🔄" if handle else "\n\nThanks for Purchase 🔄"
+    title = "📅 **Order Delivered**" if delivered else "📅 **New Order Success**"
+    oid = str(order_id or "").strip()
+    oid_line = f"\n**Order ID:** `{oid}`" if oid else ""
+    server_s = (server or "").strip()
+    server_line = f"\n**Server:** {server_s}" if server_s else ""
     return (
-        "📣 **Social Boost Order**\n\n"
-        f"**Service:** {service}\n"
-        f"**Amount:** {amount}\n\n"
-        f"Order received.{_bot_tag(bot)}"
+        f"{title}\n\n"
+        "**Link:** hidden\n"
+        f"**Price:** {amount}\n"
+        f"**Service:** {service}"
+        f"{oid_line}"
+        f"{server_line}"
+        f"{thanks}"
     )
 
 

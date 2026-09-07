@@ -58,13 +58,20 @@ def test_copy_matches_the_asked_templates():
     assert "Withdrawal Successful" in w
     assert "₹12" in w
     assert "@YCOTP_Bot" in w
-    b = boost_update("TikTok Views", INR("15.00"), bot="YCOTP_Bot")
-    assert "Social Boost Order" in b
+    b = boost_update("TikTok Views", INR("15.00"), bot="YCOTP_Bot", order_id="99")
+    assert "New Order Success" in b
     assert "TikTok Views" in b
+    assert "**Link:** hidden" in b
+    assert "**Price:**" in b
+    assert "`99`" in b
+    assert "Thanks for Purchase @YCOTP_Bot" in b
     assert USER not in b
     assert "http" not in b.lower()
-    d = boost_update("TikTok Views", INR("15.00"), bot="YCOTP_Bot", delivered=True)
-    assert "Social Boost Delivered" in d
+    assert "tiktok.com" not in b.lower()
+    d = boost_update("TikTok Views", INR("15.00"), bot="YCOTP_Bot",
+                     delivered=True, order_id="99")
+    assert "Order Delivered" in d
+    assert "**Link:** hidden" in d
     assert USER not in d
 
 

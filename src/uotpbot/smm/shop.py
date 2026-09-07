@@ -229,7 +229,10 @@ class SmmShop:
         if row is None:
             # Scope-less fallback (tests / unscoped store).
             row = self._store_get(oid)
-        self._announce_boost(svc.name, sell, delivered=False)
+        self._announce_boost(
+            svc.name, sell, delivered=False,
+            order_id=str(getattr(row, "id", "") or oid or ""),
+        )
         return row
 
     def _store_get(self, oid: int) -> SmmOrderRow:
@@ -253,16 +256,21 @@ class SmmShop:
             log.exception("smm refund-after-fail could not credit %s %s", user_id, amount)
 
     def _announce_boost(self, service: str, amount: Money, *,
-                        delivered: bool = False) -> None:
+                        delivered: bool = False, order_id: str = "") -> None:
         """Public updates-channel post. Never includes the customer, OTP, or link."""
         fn = self.announce
         if not callable(fn):
             return
         try:
-            fn(service, amount, delivered=delivered)
+            fn(service, amount, delivered=delivered, order_id=order_id)
         except TypeError:
             try:
-                fn(service, amount)
+                fn(service, amount, delivered=delivered)
+            except TypeError:
+                try:
+                    fn(service, amount)
+                except Exception:  # noqa: BLE001
+                    log.debug("smm updates announce failed", exc_info=True)
             except Exception:  # noqa: BLE001
                 log.debug("smm updates announce failed", exc_info=True)
         except Exception:  # noqa: BLE001
@@ -346,7 +354,9 @@ class SmmShop:
                 if updated.status == "completed":
                     self._announce_boost(
                         updated.service_name or f"#{updated.service_id}",
-                        updated.charge, delivered=True)
+                        updated.charge, delivered=True,
+                        order_id=str(updated.id or ""),
+                    )
         return notices
 
     def _apply(self, order: SmmOrderRow, st: SmmStatus, *, wallets) -> SmmOrderRow:
