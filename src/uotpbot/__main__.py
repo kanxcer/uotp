@@ -476,7 +476,7 @@ def _serve(settings: Settings) -> int:
 
 
 def _try_smm_shop(settings: Settings, wallets, *, owner_alert=None,
-                  registry=None):
+                  registry=None, updates_poster=None):
     """Build the social-boost shop if SMM_API_KEY is set. Never fails boot."""
     from decimal import Decimal
 

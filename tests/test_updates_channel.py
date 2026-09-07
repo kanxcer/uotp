@@ -168,3 +168,10 @@ def test_famgateway_button_credit_posts_deposit():
         assert "FamPay Automatic" in sent[0]["text"]
     finally:
         ledger.close()
+
+
+def test_try_smm_shop_accepts_updates_poster():
+    """Boot passes updates_poster into _try_smm_shop; missing kwarg crashes serve."""
+    import inspect
+    from uotpbot.__main__ import _try_smm_shop
+    assert "updates_poster" in inspect.signature(_try_smm_shop).parameters
