@@ -47,6 +47,55 @@ def test_polling_accepts_all_update_types():
     assert app.calls[0].get("allowed_updates") is Update.ALL_TYPES
 
 
+def test_polling_replaces_a_closed_event_loop():
+    """After run_polling returns, the thread's loop is closed. The next
+    HealthServer restart must install a fresh loop or PTB dies instantly
+    (RuntimeError: Event loop is closed) while /healthz still looks fine.
+    """
+    import asyncio
+
+    from uotpbot.bot.telegram import _ensure_open_event_loop
+
+    dead = asyncio.new_event_loop()
+    asyncio.set_event_loop(dead)
+    dead.close()
+    assert dead.is_closed()
+    _ensure_open_event_loop()
+    live = asyncio.get_event_loop()
+    try:
+        assert live is not dead
+        assert not live.is_closed()
+        live.run_until_complete(asyncio.sleep(0))
+    finally:
+        if not live.is_closed():
+            live.close()
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
+
+def test_start_polling_succeeds_after_a_closed_loop():
+    """_start_polling itself must recover, not only the helper."""
+    import asyncio
+
+    dead = asyncio.new_event_loop()
+    asyncio.set_event_loop(dead)
+    dead.close()
+    app = FakeApp()
+    try:
+        _start_polling(app)
+        assert app.calls, "run_polling was never called"
+        assert app.calls[0].get("stop_signals") == ()
+        live = asyncio.get_event_loop()
+        assert not live.is_closed()
+    finally:
+        try:
+            loop = asyncio.get_event_loop()
+            if loop is not None and not loop.is_closed():
+                loop.close()
+        except RuntimeError:
+            pass
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
+
 def test_reply_markup_normalizes_flat_rows():
     """A Reply whose ``rows`` is a FLAT tuple of (label, data) pairs must render
     instead of raising. This is exactly the bug that made the 🆘 Support button

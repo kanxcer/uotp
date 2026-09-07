@@ -815,6 +815,28 @@ def build_from_settings(settings: Settings, router_factory: Any) -> Any:
     return app
 
 
+def _ensure_open_event_loop() -> None:
+    """Give this thread an open asyncio loop, replacing a closed one.
+
+    ``Application.run_polling`` closes its loop on the way out
+    (``close_loop=True``). HealthServer restarts the poller in the *same*
+    thread; on Python 3.12+ ``asyncio.get_event_loop()`` then returns that
+    closed loop and the next ``run_polling`` dies immediately with
+    ``RuntimeError: Event loop is closed``.
+
+    Live 2026-09-07: the poller returned cleanly (~12:55 UTC), every 5s
+    restart failed that way, Telegram stayed silent, and ``/healthz`` still
+    reported ``poller_alive: true`` because the supervisor thread itself
+    never died.
+    """
+    try:
+        asyncio.get_running_loop()
+        return
+    except RuntimeError:
+        pass
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
+
 def _start_polling(app: Any) -> None:
     """Run the polling loop in whatever thread called us.
 
@@ -825,6 +847,7 @@ def _start_polling(app: Any) -> None:
     while the (health-gated) HTTP server keeps serving. Empty tuple registers
     no handlers; shutdown is the process's SIGTERM, handled by the HTTP layer.
     """
+    _ensure_open_event_loop()
     app.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=())
 
 
