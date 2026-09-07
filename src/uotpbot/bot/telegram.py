@@ -24,7 +24,7 @@ from typing import Any, Optional
 
 from ..config import Settings
 from .commands import CommandRouter
-from .ui import MenuUI, _REPLY_MENU
+from .ui import MenuUI, _REPLY_MENU, reply_keyboard_rows
 
 __all__ = ["TelegramFrontend", "run_bot", "build_from_settings"]
 
@@ -133,7 +133,8 @@ except ImportError:  # pragma: no cover
     HAS_TELEGRAM = False
 
 
-def _reply_menu_markup(include_admin: bool = False) -> object:
+def _reply_menu_markup(include_admin: bool = False,
+                      include_smm: bool = False) -> object:
     """The always-visible bottom menu (ReplyKeyboardMarkup).
 
     Lives at the bottom of the chat so a customer never has to type. Only one
@@ -145,12 +146,15 @@ def _reply_menu_markup(include_admin: bool = False) -> object:
     ``include_admin`` hides the owner-only "⚙️ Admin Panel" key from every
     non-owner (customers must never see an owner screen). The routing still
     re-checks ownership, so even a crafted press goes nowhere.
+
+    ``include_smm`` adds 📣 Social boost when the owner has the shop on.
     """
     if not HAS_TELEGRAM:
         return None
     from telegram import KeyboardButton, ReplyKeyboardMarkup
 
-    rows = [row for row in _REPLY_MENU
+    source = reply_keyboard_rows(include_smm=include_smm)
+    rows = [row for row in source
             if include_admin or all(not _is_admin_label(label) for label, _cb in row)]
     return ReplyKeyboardMarkup(
         [[KeyboardButton(label) for label, _cb in row] for row in rows],
@@ -352,6 +356,7 @@ class TelegramFrontend:
         famgateway_base_url: str = "https://famgateway.in",
         public_url: str = "",
         bot_token: str = "",
+        smm_api_key: str = "",
     ) -> None:
         self.router = router
         self.ui = ui or MenuUI(
@@ -359,6 +364,7 @@ class TelegramFrontend:
             famgateway_api_key=famgateway_api_key,
             famgateway_base_url=famgateway_base_url,
             public_url=public_url,
+            smm_api_key=smm_api_key,
         )
         if bot_token:
             attach_force_sub_checks(self.ui, bot_token)
@@ -639,11 +645,16 @@ class TelegramFrontend:
             self._remember_fg_message(sent, reply)
             return
         is_owner = False
+        include_smm = False
         if getattr(reply, "persistent_menu", False):
             user = getattr(message, "from_user", None)
             uid = str(getattr(user, "id", "")) if user else ""
             is_owner = bool(uid) and self.router._is_owner(uid)
-        markup = _reply_menu_markup(include_admin=is_owner) \
+            try:
+                include_smm = bool(self.ui.smm_enabled())
+            except Exception:  # noqa: BLE001
+                include_smm = False
+        markup = _reply_menu_markup(include_admin=is_owner, include_smm=include_smm) \
             if getattr(reply, "persistent_menu", False) else _reply_markup(reply)
         await message.reply_text(reply.text, reply_markup=markup)
 
@@ -745,6 +756,7 @@ async def _post_init(app: Any) -> None:  # pragma: no cover - network call
         await app.bot.set_my_commands([
             ("start", "🏠 Open the menu"),
             ("buy", "🛒 Buy a number"),
+            ("boost", "📣 Social boost"),
             ("list", "📋 All services"),
             ("wallet", "💰 Balance & add money"),
             ("help", "❓ How it works"),
@@ -775,6 +787,7 @@ def build_from_settings(settings: Settings, router_factory: Any) -> Any:
                                     "https://famgateway.in"),
         public_url=getattr(settings, "public_url", ""),
         bot_token=token,
+        smm_api_key=getattr(settings, "smm_api_key", "") or "",
     )
     # Durable refunds: boot the retry worker so any refund left pending by an
     # earlier crash/redeploy is credited now (idempotent; safe on rebuilds).

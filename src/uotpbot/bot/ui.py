@@ -107,9 +107,25 @@ _REPLY_MENU: tuple[tuple[tuple[str, str], ...], ...] = (
     # it. The owner opens the panel from the inline "📊 Owner" button on the
     # main menu (or /admin). A typed "admin panel" still routes, owner-gated.
 )
+#: Shown on the bottom keyboard only while Social boost is ON (shop + toggle).
+_SOCIAL_BOOST_LABEL = "📣 Social boost"
+
+def reply_keyboard_rows(*, include_smm: bool = False
+                        ) -> tuple[tuple[tuple[str, str], ...], ...]:
+    """Persistent keyboard rows. Social boost sits next to Buy when enabled."""
+    if include_smm:
+        return (
+            (("🛒 Buy Number", "l"), (_SOCIAL_BOOST_LABEL, "sm")),
+            (("🧾 My Numbers", "o"), ("💰 Wallet", "w")),
+            (("⭐ Favourites", "fav"), ("❓ Help", "h")),
+            (("🆘 Support", "support"),),
+        )
+    return _REPLY_MENU
+
 REPLY_MENU_LABELS: dict[str, str] = {
     label: cb for row in _REPLY_MENU for label, cb in row
 }
+REPLY_MENU_LABELS[_SOCIAL_BOOST_LABEL] = "sm"
 #: Case-insensitive lookup (a Telegram reply-keyboard press arrives lowercased).
 REPLY_MENU_LABELS_LOW: dict[str, str] = {
     label.lower(): cb for label, cb in REPLY_MENU_LABELS.items()
@@ -144,6 +160,7 @@ class MenuUI:
         famgateway_api_key: str = "",
         famgateway_base_url: str = "https://famgateway.in",
         public_url: str = "",
+        smm_api_key: str = "",
         history_size: int = 20,
         now: Optional[Callable[[], float]] = None,
     ) -> None:
@@ -193,6 +210,9 @@ class MenuUI:
         #: Social boost is OFF by default even when SMM_API_KEY is set. The
         #: owner flips it from the admin panel; persists in kv across deploys.
         self._smm_memory = False
+        #: Env default for the panel API key. Owner can set a kv override from
+        #: the admin panel (same pattern as FamGateway) without a redeploy.
+        self._smm_api_default = (smm_api_key or "").strip()
         #: user_id -> [(timestamp, slug, ok, one-line summary)].
         #: Session-scoped by design; say that on the screen.
         self._history: dict[str, list[tuple[float, str, bool, str]]] = {}
@@ -565,6 +585,43 @@ class MenuUI:
                 pass
         self._smm_memory = new
         return new
+
+    @property
+    def smm_api_key(self) -> str:
+        """Live panel API key: kv override wins over the env default."""
+        store = self._feature_store()
+        if store is not None:
+            try:
+                v = store.kv_get("smm_api_key")
+                if v:
+                    return v
+            except Exception:  # noqa: BLE001
+                pass
+        return self._smm_api_default
+
+    def _set_smm_api_key(self, value: str) -> None:
+        """Persist the owner-edited Social boost panel key. Main owner only."""
+        if self._is_clone:
+            return
+        value = (value or "").strip()
+        store = self._feature_store() or self._store_for_kv()
+        if store is not None:
+            try:
+                store.kv_set("smm_api_key", value)
+            except Exception:  # noqa: BLE001
+                pass
+        self._smm_api_default = value
+        boot = getattr(self.router, "smm_boot", None)
+        if callable(boot) and value:
+            try:
+                boot(value)
+            except Exception:  # noqa: BLE001 - kv is saved; next boot retries
+                log.warning("smm_boot after key save failed", exc_info=True)
+        elif value:
+            shop = getattr(self.router, "smm_shop", None)
+            prov = getattr(shop, "provider", None) if shop is not None else None
+            if prov is not None and hasattr(prov, "api_key"):
+                prov.api_key = value
 
     def _bot_closed_reply(self, user_id: str) -> Optional[Reply]:
         """A reply when a non-owner is shut out by the access switch, else None."""
@@ -1199,6 +1256,9 @@ class MenuUI:
         if low in ("/start", "/help"):
             self._wizard.pop(user_id, None)
             return self.main_menu(user_id)
+        if low in ("/boost", "/smm", "social boost"):
+            self._wizard.pop(user_id, None)
+            return self.button(user_id, "sm")
         # "My numbers" as a typed command or phrase must go to the SAME screen
         # as the 🧾 My numbers button, not fall through to search (which returns
         # the menu and looks like "not working").
@@ -1750,6 +1810,13 @@ class MenuUI:
                    "Send `off` to disable and revert to the UPI + screenshot "
                    "flow.\n"
                    f"(current: {'set ✅' if self.famgateway_api_key else 'not set ❌'})"),
+            "smmkey": ("📣 SOCIAL BOOST API KEY",
+                       "Send the Casper SMM / PerfectPanel v2 API key. "
+                       "This only wires Social boost — OTP, wallets, clones "
+                       "and FamGateway stay as they are.\n\n"
+                       "Send `off` to clear the override (an env key still "
+                       "applies after restart).\n"
+                       f"(current: {'set ✅' if self.smm_api_key else 'not set ❌'})"),
             "fs": ("📢 FORCE SUBSCRIBE CHANNEL",
                    "Send the channel customers must join:\n"
                    "• `@username` for a public channel\n"
@@ -1850,6 +1917,35 @@ class MenuUI:
                     "amount.",
                     ok=True, rows=((("💰 Preview Add Money", "t"),),
                                    (("📊 Admin Panel", "a"),)),
+                )
+            if action == "smmkey":
+                val = (body.strip() or "")
+                if val.lower() in ("off", "disable", "none", "clear", "-"):
+                    self._set_smm_api_key("")
+                    return Reply(
+                        "✅ Social boost API key override cleared. "
+                        "OTP, wallets and FamGateway are unchanged.",
+                        ok=True, rows=((("📊 Admin Panel", "a"),),),
+                    )
+                if len(val) < 8:
+                    return Reply(
+                        "That doesn't look like a panel API key "
+                        "(keys are much longer). Send it again, or `off` to "
+                        "clear — ✖️ Cancel to abort.",
+                        ok=False, rows=((("✖️ Cancel", "a"),),),
+                    )
+                self._set_smm_api_key(val)
+                wired = getattr(self.router, "smm_shop", None) is not None
+                extra = (
+                    " The shop is live. Turn 📣 Social boost on/off from "
+                    "the owner panel when you want customers to see it."
+                    if wired else
+                    " Saved. If the shop didn't start this session, it will "
+                    "on the next restart — OTP is unaffected."
+                )
+                return Reply(
+                    "✅ Social boost API key saved." + extra,
+                    ok=True, rows=((("📊 Admin Panel", "a"),),),
                 )
             if action == "fs":
                 return self._apply_force_sub_input(user_id, body)
@@ -2414,6 +2510,10 @@ class MenuUI:
             smm_line = f"📣 Social boost: {'on' if self.smm_enabled() else 'off'}"
         else:
             smm_line = "📣 Social boost: not configured"
+        smm_row = ((("🔑 SMM API key", "ax:smmkey"),),)
+        if smm_shop is not None:
+            smm_row = ((("📣 Social boost on/off", "a:smm"),
+                        ("🔑 SMM API key", "ax:smmkey")),)
         return Reply(
             "📊 Owner panel\n\n"
             f"🏦 Provider wallet: {status['provider_wallet']}\n"
@@ -2436,7 +2536,7 @@ class MenuUI:
             rows=(
                 ((f"👥 All users ({users})", "ax:users"), ("🚫 Ban/Unban", "ax:ban")),
                 (("🔓 Users may use bot", "a:on"), ("🤖 Clone-bot on/off", "a:cb")),
-                *(( (("📣 Social boost on/off", "a:smm"),), ) if smm_shop is not None else ()),
+                *smm_row,
                 (("📢 Force sub", "a:fs"), ("📣 Updates channel", "a:uc")),
                 (("📊 Metrics", "ax:metrics"),),
                 payouts_row,
@@ -3111,6 +3211,8 @@ class MenuUI:
             if action == "fg":
                 # 💳 Edit the FamGateway API key (auto-credit top-ups).
                 return self._admin_input_prompt(user_id, "fg")
+            if action == "smmkey":
+                return self._admin_input_prompt(user_id, "smmkey")
             if action == "fs":
                 return self._admin_input_prompt(user_id, "fs")
             if action == "uc":
@@ -3311,7 +3413,7 @@ class MenuUI:
             return True
         if kind == "ax" and len(parts) >= 2 and parts[1] in {
             "credit", "debit", "fg", "upi", "sunkcost", "provider", "metrics",
-            "uc",
+            "uc", "smmkey",
         }:
             return True
         return False

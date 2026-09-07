@@ -403,9 +403,37 @@ def _serve(settings: Settings) -> int:
         registry=subbots.registry if subbots else None,
         updates_poster=updates_poster,
     )
+    smm_stop_holder: list = [smm_stop]
     if smm_shop is not None:
         main_router.smm_shop = smm_shop
         smm_box.append(smm_shop)
+
+    def smm_boot(key: str) -> None:
+        """Wire / re-key the shop from the owner panel. Never logs the key."""
+        key = (key or "").strip()
+        if not key:
+            return
+        existing = getattr(main_router, "smm_shop", None)
+        if existing is not None:
+            prov = getattr(existing, "provider", None)
+            if prov is not None and hasattr(prov, "api_key"):
+                prov.api_key = key
+            return
+        from dataclasses import replace as _replace
+        shop, stop = _try_smm_shop(
+            _replace(settings, smm_api_key=key), wallets,
+            owner_alert=owner_alert.send,
+            registry=subbots.registry if subbots else None,
+            updates_poster=updates_poster,
+        )
+        if shop is None:
+            return
+        main_router.smm_shop = shop
+        smm_box.append(shop)
+        if stop is not None:
+            smm_stop_holder[0] = stop
+
+    main_router.smm_boot = smm_boot
     wallet_monitor = WalletMonitor(
         provider, notify_owner=owner_alert.send,
         check_interval=float(settings.wallet_monitor_seconds),
@@ -467,8 +495,8 @@ def _serve(settings: Settings) -> int:
         server.serve_forever()
     finally:
         sweep_stop.set()
-        if smm_stop is not None:
-            smm_stop.set()
+        if smm_stop_holder[0] is not None:
+            smm_stop_holder[0].set()
         wallet_monitor.stop()
     if subbots is not None:
         subbots.manager.stop_all()

@@ -92,17 +92,51 @@ class SmmOrderRow:
     @property
     def refill_days(self) -> int:
         try:
-            return max(0, int(self.extra_map().get("refill_days") or 0))
+            n = max(0, int(self.extra_map().get("refill_days") or 0))
         except (TypeError, ValueError):
-            return 0
+            n = 0
+        if n:
+            return n
+        from .catalog import _days_from
+        return _days_from(self.service_name or "")
 
-    def refill_open(self, now: Optional[float] = None) -> bool:
-        """True while the supplier refill window is still open."""
-        if not self.refillable:
-            return False
+    def refill_open(self, now: Optional[float] = None, *, svc=None) -> bool:
+        """True while the supplier refill window is still open.
+
+        Old rows (placed before we stored ``refillable`` / ``refill_days``)
+        still qualify when the live catalogue or the saved service name says
+        the product has a refill window (e.g. ``60 Days ♻️``).
+        """
         if self.status not in {"completed", "partial"}:
             return False
-        days = self.refill_days
+        refillable = bool(self.refillable)
+        days = 0
+        try:
+            days = max(0, int(self.extra_map().get("refill_days") or 0))
+        except (TypeError, ValueError):
+            days = 0
+        svc_name = ""
+        if svc is not None:
+            if getattr(svc, "refill", False):
+                refillable = True
+            try:
+                extra_days = int(getattr(svc, "refill_days", 0) or 0)
+            except (TypeError, ValueError):
+                extra_days = 0
+            if extra_days > 0:
+                days = days or extra_days
+            svc_name = str(getattr(svc, "name", "") or "")
+        name = svc_name or self.service_name or ""
+        if days <= 0 or not refillable:
+            from .catalog import _days_from
+            named = _days_from(name)
+            if named:
+                days = days or named
+                refillable = True
+            elif "refill" in name.lower() or "♻" in name:
+                refillable = True
+        if not refillable:
+            return False
         if days <= 0:
             return True
         data = self.extra_map()

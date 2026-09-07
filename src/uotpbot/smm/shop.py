@@ -522,13 +522,25 @@ class SmmShop:
         return f"📣 Social boost update: {name} is now {order.status}."
 
     def request_refill(self, order: SmmOrderRow) -> str:
+        svc = None
+        cat = getattr(self, "catalog", None)
+        get = getattr(cat, "get", None) if cat is not None else None
+        if callable(get):
+            try:
+                svc = get(order.service_id)
+            except Exception:  # noqa: BLE001
+                svc = None
         open_fn = getattr(order, "refill_open", None)
         if callable(open_fn):
-            if not open_fn():
-                if not order.refillable:
-                    raise SmmUserError("This service has no refill.")
+            try:
+                allowed = bool(open_fn(svc=svc))
+            except TypeError:
+                allowed = bool(open_fn())
+            if not allowed:
                 if order.status not in {"completed", "partial"}:
                     raise SmmUserError("Refill is only available after delivery.")
+                if not (order.refillable or getattr(svc, "refill", False)):
+                    raise SmmUserError("This service has no refill.")
                 raise SmmUserError("The refill window for this order has ended.")
         else:
             if not order.refillable:

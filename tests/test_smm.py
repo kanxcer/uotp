@@ -599,3 +599,177 @@ def test_refill_button_on_history_for_supplier_window(tmp_path):
     with pytest.raises(SmmUserError, match="window"):
         shop.request_refill(stale)
     store.close()
+
+
+def test_old_completed_refill_orders_show_button(tmp_path):
+    """Pre-extra completed rows still get 🔁 Refill from name or catalogue."""
+    store = SqliteWallets(str(tmp_path / "w.db"))
+    mock = MockSmmProvider([_svc_row(
+        refill=True, name="IG Followers 60 Days ♻️",
+    )], balance=Decimal("10"))
+    cat = SmmCatalog(mock, usd_inr=Decimal("95"), markup=Decimal("0.45"),
+                     min_charge=Money(100))
+    cat.refresh()
+    shop = SmmShop(mock, cat, store)
+    oid = store.create_smm_order(
+        user_id=USER,
+        service_id="1261",
+        service_name="IG Followers 60 Days ♻️",
+        platform="instagram",
+        category="Instagram | Followers",
+        link="https://instagram.com/x",
+        quantity=1000,
+        charge=Money(100),
+        cost=Money(50),
+        provider_order_id="old-1",
+        status="completed",
+        remains=0,
+        refillable=False,
+        extra="",
+    )
+    row = store.get_smm_order(oid, user_id=USER)
+    assert row is not None
+    assert not row.refillable
+    assert not row.extra
+    assert row.refill_open()
+    ui, _ = _otp_ui(wallets=store, smm_shop=shop)
+    ui.button(OWNER, "a:smm")
+    hist = ui.button(USER, "sm:o")
+    blob = " ".join(l for r in hist.rows for l, _ in r)
+    assert "🔁 Refill" in blob
+    detail = ui.button(USER, f"sm:od:{oid}")
+    dblob = " ".join(l for r in detail.rows for l, _ in r)
+    assert "🔁 Refill" in dblob
+    mock.orders["old-1"] = {
+        "service": "1261", "link": "https://instagram.com/x",
+        "quantity": 1000, "status": "Completed", "charge": "0.01",
+        "remains": 0, "start_count": 0, "currency": "USD",
+    }
+    shop.request_refill(row)
+    assert mock.refill_calls == ["old-1"]
+    store.close()
+
+
+def test_old_refill_from_live_catalogue_when_name_is_plain(tmp_path):
+    store = SqliteWallets(str(tmp_path / "w.db"))
+    mock = MockSmmProvider([_svc_row(refill=True, refill_days=30,
+                                     name="TikTok Views")],
+                           balance=Decimal("10"))
+    cat = SmmCatalog(mock, usd_inr=Decimal("95"), markup=Decimal("0.45"))
+    cat.refresh()
+    shop = SmmShop(mock, cat, store)
+    oid = store.create_smm_order(
+        user_id=USER,
+        service_id="1261",
+        service_name="TikTok Views",
+        platform="tiktok",
+        category="TikTok | Views",
+        link="https://tiktok.com/@x",
+        quantity=1000,
+        charge=Money(100),
+        provider_order_id="old-2",
+        status="completed",
+        remains=0,
+        refillable=False,
+        extra="",
+    )
+    row = store.get_smm_order(oid, user_id=USER)
+    assert row.refill_open(svc=cat.get("1261"))
+    ui, _ = _otp_ui(wallets=store, smm_shop=shop)
+    ui.button(OWNER, "a:smm")
+    hist = ui.button(USER, "sm:o")
+    blob = " ".join(l for r in hist.rows for l, _ in r)
+    assert "🔁 Refill" in blob
+    store.close()
+
+
+def test_persistent_keyboard_and_slash_boost(tmp_path):
+    from uotpbot.bot.ui import reply_keyboard_rows, _SOCIAL_BOOST_LABEL
+
+    off = reply_keyboard_rows(include_smm=False)
+    assert not any(_SOCIAL_BOOST_LABEL in (lbl for lbl, _ in row) for row in off)
+    on = reply_keyboard_rows(include_smm=True)
+    labels = [lbl for row in on for lbl, _ in row]
+    assert _SOCIAL_BOOST_LABEL in labels
+    assert labels[0] == "🛒 Buy Number"
+    store = SqliteWallets(str(tmp_path / "w.db"))
+    mock = MockSmmProvider([_svc_row()], balance=Decimal("10"))
+    cat = SmmCatalog(mock, usd_inr=Decimal("95"), markup=Decimal("0.45"))
+    cat.refresh()
+    shop = SmmShop(mock, cat, store)
+    ui, _ = _otp_ui(wallets=store, smm_shop=shop)
+    leftover = ui.text(USER, "📣 Social boost")
+    assert "switched off" in leftover.text
+    ui.button(OWNER, "a:smm")
+    hub = ui.text(USER, "/boost")
+    assert "Social boost" in hub.text
+    assert any(cb.startswith("sm:pl:") for row in hub.rows for _, cb in row)
+    store.close()
+
+
+def test_admin_smm_api_key_isolated_never_echoed(tmp_path):
+    store = SqliteWallets(str(tmp_path / "w.db"))
+    ui, router = _otp_ui(wallets=store)
+    booted = []
+    router.smm_boot = lambda k: booted.append(k)
+    panel = ui.admin_panel(OWNER)
+    assert any(d == "ax:smmkey" for row in panel.rows for _, d in row)
+    assert not any(d == "a:smm" for row in panel.rows for _, d in row)
+    prompt = ui.button(OWNER, "ax:smmkey")
+    assert "SOCIAL BOOST API KEY" in prompt.text
+    secret = "casper-panel-key-xxxxxxxx"
+    saved = ui.text(OWNER, secret)
+    assert saved.ok
+    assert secret not in saved.text
+    assert store.kv_get("smm_api_key") == secret
+    assert ui.smm_api_key == secret
+    assert booted == [secret]
+    assert "OTP" in saved.text or "unchanged" in saved.text.lower() or "restart" in saved.text.lower()
+    assert "Owner only" in ui.button(USER, "ax:smmkey").text
+    store.close()
+
+
+def test_clone_cannot_set_smm_key_or_toggle():
+    from uotpbot.wallets import ScopedWallets
+
+    catalog = Catalog({
+        "telegram": ServiceCost("telegram", "Telegram", "messaging", INR(10),
+                                Decimal("0.94")),
+    })
+    ledger = Ledger()
+    pricer = Pricer(catalog)
+    provider = MockProvider({"telegram": catalog.sticker_price("telegram")},
+                            balance=INR(9999), seed=5)
+    engine = BotEngine(catalog, provider, ledger, pricer,
+                       config=EngineConfig(otp_timeout_seconds=0.3, poll_interval=0.01))
+    store = SqliteWallets(":memory:")
+    mock = MockSmmProvider([_svc_row()], balance=Decimal("10"))
+    cat = SmmCatalog(mock, usd_inr=Decimal("95"), markup=Decimal("0.45"))
+    cat.refresh()
+    shop = SmmShop(mock, cat, store)
+    router = CommandRouter(
+        engine, catalog, pricer, ledger, owner_id="clone-owner",
+        allowed_users=("clone-owner", USER),
+        wallets=ScopedWallets(store, "clone1"),
+        is_clone=True, clone_bot_id="clone1", platform_wallets=store,
+    )
+    router.smm_shop = shop
+    ui = MenuUI(router)
+    try:
+        panel = ui.admin_panel("clone-owner")
+        datas = {d for row in (panel.rows or ()) for _l, d in row}
+        blob = panel.text + " ".join(l for row in (panel.rows or ()) for l, _ in row)
+        assert "ax:smmkey" not in datas
+        assert "a:smm" not in datas
+        assert "SMM API" not in blob
+        blocked = ui.button("clone-owner", "ax:smmkey")
+        assert not blocked.ok
+        blocked2 = ui.button("clone-owner", "a:smm")
+        assert not blocked2.ok
+        ui._set_smm_api_key("should-not-save")
+        assert store.kv_get("smm_api_key") in (None, "")
+        assert ui.smm_enabled() is False  # platform toggle off; clone cannot flip
+        assert ui._toggle_smm() is False
+        assert store.kv_get("feature_smm") in (None, "")
+    finally:
+        ledger.close()

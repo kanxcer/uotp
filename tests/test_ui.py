@@ -245,6 +245,10 @@ def test_reply_menu_hides_admin_from_users():
     labels = [lbl for row in _REPLY_MENU for lbl, _cb in row]
     assert "⚙️ Admin Panel" not in labels
     assert "🛒 Buy Number" in labels
+    from uotpbot.bot.ui import reply_keyboard_rows, _SOCIAL_BOOST_LABEL
+    smm_labels = [lbl for row in reply_keyboard_rows(include_smm=True) for lbl, _ in row]
+    assert _SOCIAL_BOOST_LABEL in smm_labels
+    assert not any(_is_admin_label(lbl) for lbl in smm_labels)
 
 
 def test_validity_resume_naive_timestamp_is_tz_safe():

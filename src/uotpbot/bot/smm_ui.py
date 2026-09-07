@@ -1,7 +1,7 @@
 """📣 Social boost screens. Callbacks are ``sm:*`` (never OTP prefixes).
 
-The persistent keyboard is unchanged; this shop is inline-only and hidden
-unless ``router.smm_shop`` is set (i.e. ``SMM_API_KEY`` is present).
+The shop is hidden unless ``router.smm_shop`` is set and the owner toggle
+is on. The persistent bottom keyboard then also carries 📣 Social boost.
 """
 
 from __future__ import annotations
@@ -39,6 +39,25 @@ def _clone_owner(ui) -> str:
     if getattr(ui.router, "is_clone", False):
         return str(getattr(ui.router, "owner_id", "") or "")
     return ""
+
+
+def _can_refill(ui, order) -> bool:
+    """True when 🔁 Refill should show — including old rows missing extra."""
+    shop = _shop(ui)
+    svc = None
+    if shop is not None:
+        try:
+            svc = shop.catalog.get(order.service_id)
+        except Exception:  # noqa: BLE001
+            svc = None
+    open_fn = getattr(order, "refill_open", None)
+    if callable(open_fn):
+        try:
+            return bool(open_fn(svc=svc))
+        except TypeError:
+            return bool(open_fn())
+    return bool(getattr(order, "refillable", False)
+                and getattr(order, "status", "") in {"completed", "partial"})
 
 
 def _trunc(text: str, n: int = 28) -> str:
@@ -466,8 +485,7 @@ def my_boosts(ui, user_id: str) -> Reply:
             f"{tag} · {_trunc(o.service_name, 16)} · {o.charge}",
             f"sm:od:{o.id}",
         )]
-        open_fn = getattr(o, "refill_open", None)
-        if callable(open_fn) and open_fn():
+        if _can_refill(ui, o):
             pair.append(("🔁 Refill", f"sm:rf:{o.id}"))
         rows.append(tuple(pair))
     rows.append((("📣 New boost", "sm"), ("🏠 Menu", "m")))
@@ -518,11 +536,7 @@ def order_detail(ui, user_id: str, oid_s: str) -> Reply:
     if row.link:
         lines.append(f"\n🔗 {row.link}")
     actions: list[tuple[str, str]] = []
-    open_fn = getattr(row, "refill_open", None)
-    if callable(open_fn) and open_fn():
-        actions.append(("🔁 Refill", f"sm:rf:{row.id}"))
-    elif (not callable(open_fn) and row.refillable
-          and row.status in {"completed", "partial"}):
+    if _can_refill(ui, row):
         actions.append(("🔁 Refill", f"sm:rf:{row.id}"))
     if row.cancelable and row.status in OPEN_STATUSES:
         actions.append(("♻️ Cancel", f"sm:cx:{row.id}"))
