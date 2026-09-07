@@ -391,6 +391,52 @@ def test_clone_withdraw_request_pings_platform_bot_not_clone():
         ledger.close()
 
 
+def test_paid_payout_button_drops_the_row():
+    """Tapping ✅ Paid (apw:) must settle and remove the request from the list.
+
+    The payouts screen always rendered Paid/Decline buttons, but button()
+    never dispatched ``apw`` / ``adw``, so an already-accepted request kept
+    showing under 💸 Clone payouts.
+    """
+    catalog = Catalog({
+        "blinkit": ServiceCost(
+            "blinkit", "Blinkit", "food", INR(10),
+            Decimal("0.94"), Decimal("0.04"), Decimal("0.95"),
+        ),
+    }, (WalletPack("Pro", INR(1000), INR(1150)),))
+    ledger = Ledger()
+    pricer = Pricer(catalog)
+    provider = MockProvider({"blinkit": INR(10)}, balance=INR(5000), seed=3)
+    engine = BotEngine(catalog, provider, ledger, pricer)
+    store = SqliteWallets(":memory:")
+    router = CommandRouter(
+        engine, catalog, pricer, ledger, owner_id="platform-owner",
+        wallets=store,
+    )
+    ui = MenuUI(router)
+    try:
+        credit_earnings(store, "clone-owner", INR(80))
+        wd = request_withdraw(store, "clone-owner", INR(40), "me@okaxis")
+        listing = ui.button("platform-owner", "a:wd")
+        assert listing.ok
+        assert wd in listing.text
+        assert f"apw:{wd}" in {d for row in (listing.rows or ()) for _l, d in row}
+        paid = ui.button("platform-owner", f"apw:{wd}")
+        assert paid.ok, paid.text
+        assert "Marked paid" in paid.text
+        assert "Nothing waiting" in paid.text
+        again = ui.button("platform-owner", "a:wd")
+        assert again.ok
+        assert "Nothing waiting" in again.text
+        assert wd not in again.text
+        assert pending_withdrawals(store) == []
+        stale = ui.button("platform-owner", f"apw:{wd}")
+        assert not stale.ok
+        assert "isn't pending" in stale.text
+    finally:
+        ledger.close()
+
+
 def test_settle_payout_pings_clone_owner_on_clone_bot():
     """Mark paid/decline must notify the clone owner on their clone, not YC OTP."""
     catalog = Catalog({

@@ -3082,6 +3082,13 @@ class MenuUI:
             return self.decide_topup(user_id, parts[1], approve=True)
         if kind == "ad" and len(parts) == 2:
             return self.decide_topup(user_id, parts[1], approve=False)
+        # Clone payouts: ✅ Paid / ❌ Decline. These used to fall through as
+        # unknown taps, so a request the owner already "accepted" stayed on
+        # the waiting list forever.
+        if kind == "apw" and len(parts) == 2:
+            return self.settle_payout(user_id, parts[1], paid=True)
+        if kind == "adw" and len(parts) == 2:
+            return self.settle_payout(user_id, parts[1], paid=False)
         if kind == "fg" and len(parts) == 3:
             # FamGateway payment buttons: fg:pay:<order> / fg:check:<order>.
             if parts[1] == "pay" or parts[1] == "check":
