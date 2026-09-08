@@ -127,6 +127,15 @@ def _credit_fg_wallet(store, uid: str, order_id: str, amount_dec, *, notifier=No
         set_ = getattr(store, "kv_set", None)
         if callable(set_):
             set_(f"fg_credited:{order_id}", "1")
+        touch = getattr(store, "touch_user", None)
+        if callable(touch):
+            try:
+                try:
+                    touch(uid, scope=scope)
+                except TypeError:
+                    touch(uid)
+            except Exception:  # noqa: BLE001 - directory is not the money path
+                pass
     except Exception as exc:  # noqa: BLE001
         log.error("FamGateway credit failed for %s: %s", order_id, exc)
         return False

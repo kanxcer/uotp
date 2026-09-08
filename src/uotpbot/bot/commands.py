@@ -1784,15 +1784,41 @@ class CommandRouter:
             orders = list(ofn(user_id=uid, limit=20))
         except Exception as exc:  # noqa: BLE001
             return Reply(f"Could not read orders: {exc}", ok=False)
-        if not orders:
+        smm = []
+        try:
+            if uid:
+                sfn = getattr(store, "user_smm_orders", None)
+                if callable(sfn):
+                    smm = list(sfn(uid, limit=20))
+            else:
+                sfn = getattr(store, "recent_smm_orders", None)
+                if callable(sfn):
+                    smm = list(sfn(limit=20))
+        except Exception:  # noqa: BLE001 - OTP list still useful
+            smm = []
+        if not orders and not smm:
             return Reply(f"No orders{' for ' + uid if uid else ''} yet.")
         lines = [f"📦 Orders ({'user ' + uid if uid else 'all'}):"]
+        merged: list[tuple[float, list[str]]] = []
         for o in orders:
             when = format_ts(o.ts, sep=" · ", time_fmt="%H:%M")
             name = self.catalog.get(o.slug).name if self.catalog.has(o.slug) else o.slug
             badge = "✅" if o.success else "♻️"
-            lines.append(f"\n{badge} #{o.id} · {name} · {o.gross} · {o.status or ('delivered' if o.success else 'refunded')} · {when}")
-            lines.append(f"    {o.phone} · user `{o.user_id}`")
+            merged.append((float(o.ts or 0), [
+                f"\n{badge} #{o.id} · {name} · {o.gross} · {o.status or ('delivered' if o.success else 'refunded')} · {when}",
+                f"    {o.phone} · user `{o.user_id}`",
+            ]))
+        for o in smm:
+            when = format_ts(o.ts, sep=" · ", time_fmt="%H:%M")
+            name = o.service_name or f"#{o.service_id}"
+            badge = "♻️" if o.refunded.paise >= o.charge.paise and o.charge.paise else "📣"
+            merged.append((float(o.ts or 0), [
+                f"\n{badge} boost #{o.id} · {name} · {o.charge} · {o.status} · {when}",
+                f"    qty {o.quantity} · user `{o.user_id}`",
+            ]))
+        merged.sort(key=lambda e: -e[0])
+        for _ts, bits in merged[:20]:
+            lines.extend(bits)
         return Reply("\n".join(lines))
 
     def cmd_users(self, user_id: str, args: list[str]) -> Reply:
@@ -1859,9 +1885,9 @@ class CommandRouter:
             lines.append(f"\n`{u}` · {bal}{when}{tag}")
         nav: list[tuple[str, str]] = []
         if page > 0:
-            nav.append(("◀️ Prev", f"ax:users:{page - 1}"))
+            nav.append(("◀️ Prev", f"ax:ulist:{page - 1}"))
         if (page + 1) * _USERS_PAGE < total:
-            nav.append(("Next ▶️", f"ax:users:{page + 1}"))
+            nav.append(("Next ▶️", f"ax:ulist:{page + 1}"))
         rows: list[tuple[tuple[str, str], ...]] = []
         if nav:
             rows.append(tuple(nav))

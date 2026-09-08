@@ -292,7 +292,7 @@ class MenuUI:
         """The wallet store backing top-ups, or None in dict-mode (tests/dev)."""
         return getattr(self.router, "wallets", None)
 
-    def _touch_user(self, user_id: str) -> None:
+    def _touch_user(self, user_id: str, username: str = "") -> None:
         """Remember this Telegram id used the bot, even with a ₹0 wallet.
 
         Best-effort: a directory write must never block a tap. Tests and
@@ -303,9 +303,37 @@ class MenuUI:
         if not callable(fn) or not user_id:
             return
         try:
-            fn(user_id)
+            fn(user_id, username=username)
+        except TypeError:
+            try:
+                fn(user_id)
+            except Exception:  # noqa: BLE001
+                log.debug("touch_user failed for %s", user_id, exc_info=True)
         except Exception:  # noqa: BLE001 - directory is not the money path
             log.debug("touch_user failed for %s", user_id, exc_info=True)
+
+    def note_user(self, user_id: str, username: str = "") -> None:
+        """Transport hook: record last-seen + Telegram username."""
+        self._touch_user(user_id, username=username)
+
+    _USERS_BTN_PAGE = 8
+
+    def _username_of(self, uid: str) -> str:
+        store = self._store
+        fn = getattr(store, "usernames", None)
+        if not callable(fn) or not uid:
+            return ""
+        try:
+            return str((fn() or {}).get(str(uid), "") or "")
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _tg_profile_url(self, uid: str, username: str = "") -> str:
+        """Inline button payload that opens the user's Telegram profile."""
+        handle = (username or self._username_of(uid) or "").lstrip("@")
+        if handle:
+            return f"url:https://t.me/{handle}"
+        return f"url:tg://user?id={uid}"
 
     @property
     def support_contact(self) -> str:
@@ -1794,6 +1822,10 @@ class MenuUI:
             "broadcast": ("📢 BROADCAST TO ALL CUSTOMERS",
                           "Send your announcement text, e.g.\n"
                           "`Big sale today on all numbers!`"),
+            "finduser": ("🔍 FIND USER",
+                         "Send the customer's Telegram user id, e.g.\n"
+                         "`1234567890`\n\n"
+                         "Opens their profile so you can tap 👤 Open Telegram."),
             "support": ("🆘 EDIT SUPPORT USERNAME",
                         "Send the support username customers see on the 🆘 "
                         "Support screen, e.g.\n`@your_support`\n"
@@ -1869,6 +1901,15 @@ class MenuUI:
                     return Reply("Please send the announcement text.",
                                  ok=False, rows=((("✖️ Cancel", "a"),),))
                 return self.router.handle(user_id, f"/broadcast {text}")
+            if action == "finduser":
+                uid = (body.strip().split() or [""])[0].lstrip("@")
+                if not uid or not uid.lstrip("-").isdigit():
+                    return Reply(
+                        "Send just the Telegram user id (digits), e.g. `1234567890`.",
+                        ok=False, rows=((("✖️ Cancel", "a"),),),
+                    )
+                self._wizard.pop(user_id, None)
+                return self.user_profile(user_id, uid)
             if action == "support":
                 val = (body.strip() or "").lstrip("@")
                 if not val:
@@ -2171,6 +2212,7 @@ class MenuUI:
                 self.router.credit(uid, money)
             if callable(set_):
                 set_(key, "1")
+            self._touch_user(uid)
             self._fg_orders.pop(order_id, None)
             # Edit the QR message the customer was looking at to a success note
             # so they SEE the credit instantly (same as the webhook/sweep path).
@@ -2534,7 +2576,8 @@ class MenuUI:
             f"{smm_line}\n\n"
             "Full P&L: /report · Health: /status",
             rows=(
-                ((f"👥 All users ({users})", "ax:users"), ("🚫 Ban/Unban", "ax:ban")),
+                ((f"👥 All users ({users})", "ax:users"), ("🔍 Find user", "ax:finduser")),
+                (("🚫 Ban/Unban", "ax:ban"),),
                 (("🔓 Users may use bot", "a:on"), ("🤖 Clone-bot on/off", "a:cb")),
                 *smm_row,
                 (("📢 Force sub", "a:fs"), ("📣 Updates channel", "a:uc")),
@@ -2629,7 +2672,10 @@ class MenuUI:
                 f"   owner `{b.owner_id}` · {user_bit}{float_bit}\n"
                 f"   {state} · {created} · earnings {earn}"
             )
-            rows.append(((f"👁 {b.id[:8]}", f"a:cld:{b.id}"),))
+            rows.append((
+                (f"👁 {b.id[:8]}", f"a:cld:{b.id}"),
+                ("👤 Owner", self._tg_profile_url(b.owner_id)),
+            ))
         nav: list[tuple[str, str]] = []
         if page > 0:
             nav.append(("◀️ Prev", f"a:cl:{page - 1}"))
@@ -2701,6 +2747,7 @@ class MenuUI:
             f"Created: {bot.created_at}\n"
             f"Mode: {mode}",
             rows=(
+                (("👤 Open owner", self._tg_profile_url(bot.owner_id)),),
                 (("🔄 Restart", f"a:clr:{bot.id}"),),
                 (("◀️ Clone bots", "a:cl"), ("◀️ Owner panel", "a")),
             ),
@@ -2782,7 +2829,8 @@ class MenuUI:
             f"📢 Force sub: {self.force_sub_label()}",
             rows=(
                 ((f"💸 Withdraw ({earn})", "ax:withdraw"),),
-                ((f"👥 All users ({users})", "ax:users"), ("🚫 Ban/Unban", "ax:ban")),
+                ((f"👥 All users ({users})", "ax:users"), ("🔍 Find user", "ax:finduser")),
+                (("🚫 Ban/Unban", "ax:ban"),),
                 (("📢 Force sub", "a:fs"),),
                 (("📦 Orders", "a:o"), ("📢 Broadcast", "ax:broadcast")),
                 (("🛠 Toggle maintenance", "a:mm"), ("🆘 Support username", "ax:support")),
@@ -2922,32 +2970,187 @@ class MenuUI:
         fn = getattr(store, "float_stats", None)
         return fn() if callable(fn) else None
 
-    def orders_screen(self, user_id: str) -> Reply:
-        """Owner's per-order P&L: every sale with the profit it made."""
+    def users_screen(self, user_id: str, page: int = 0) -> Reply:
+        """Owner All users: one row per customer with Open Telegram."""
         if not self.router._is_owner(user_id):
             return Reply("Owner only.", ok=False, rows=((("🏠 Menu", "m"),),))
         store = self._store
-        fn = getattr(store, "recent_orders", None)
-        orders = fn(limit=10) if callable(fn) else []
-        if not orders:
-            return Reply("📦 No orders yet.", rows=((("◀️ Owner panel", "a"),),))
-        lines = ["📦 Recent orders (newest first):"]
-        tot_g = tot_p = 0
-        n = 0
-        for o in orders:
+        lister = getattr(store, "list_users", None)
+        per = self._USERS_BTN_PAGE
+        page = max(0, int(page or 0))
+        page_rows: list = []
+        total = 0
+        if callable(lister):
+            try:
+                page_rows, total = lister(limit=per, offset=page * per)
+            except Exception as exc:  # noqa: BLE001
+                return Reply(
+                    f"Could not read users: {exc}",
+                    ok=False, rows=((("◀️ Owner panel", "a"),),),
+                )
+        else:
+            ufn = getattr(store, "user_ids", None) if store is not None else None
+            if callable(ufn):
+                try:
+                    uids = list(ufn())
+                except Exception as exc:  # noqa: BLE001
+                    return Reply(
+                        f"Could not read users: {exc}",
+                        ok=False, rows=((("◀️ Owner panel", "a"),),),
+                    )
+            else:
+                bals = getattr(self.router, "balances", None) or {}
+                uids = [str(u) for u in bals.keys()]
+            total = len(uids)
+            uids = sorted(
+                uids,
+                key=lambda u: (self.router.balance_of(u).paise, str(u)),
+                reverse=True,
+            )
+            page_rows = [(u, 0.0) for u in uids[page * per: (page + 1) * per]]
+        if total == 0:
+            return Reply(
+                "👥 All users\n\nNobody has used this bot yet.",
+                rows=((("◀️ Owner panel", "a"),),),
+            )
+        pages = max(1, (int(total) + per - 1) // per)
+        if page >= pages:
+            page = pages - 1
+            if callable(lister):
+                try:
+                    page_rows, total = lister(limit=per, offset=page * per)
+                except Exception:  # noqa: BLE001
+                    pass
+        names: dict[str, str] = {}
+        nfn = getattr(store, "usernames", None)
+        if callable(nfn):
+            try:
+                names = dict(nfn() or {})
+            except Exception:  # noqa: BLE001
+                names = {}
+        lines = [
+            f"👥 All users ({total}) · page {page + 1}/{pages}",
+            "",
+            "Tap a customer for their profile, or 👤 to open Telegram.",
+        ]
+        rows: list[tuple[tuple[str, str], ...]] = []
+        for uid, seen in page_rows:
+            uid = str(uid)
+            bal = self.router.balance_of(uid)
+            handle = names.get(uid) or ""
+            tag = f" @{handle}" if handle else ""
+            when = f" · {format_ts(seen, sep=' ', time_fmt='%H:%M')}" if seen else ""
+            lines.append(f"\n`{uid}`{tag} · {bal}{when}")
+            label = f"{uid} · {bal}"
+            if len(label) > 30:
+                label = f"{uid[:14]} · {bal}"
+            rows.append((
+                (label, f"ax:up:{uid}"),
+                ("👤 Open", self._tg_profile_url(uid, handle)),
+            ))
+        nav: list[tuple[str, str]] = []
+        if page > 0:
+            nav.append(("◀️ Prev", f"ax:users:{page - 1}"))
+        if pages > 1:
+            nav.append((f"{page + 1}/{pages}", "nop"))
+        if page < pages - 1:
+            nav.append(("Next ▶️", f"ax:users:{page + 1}"))
+        if nav:
+            rows.append(tuple(nav))
+        rows.append((("🔍 Find user", "ax:finduser"),))
+        rows.append((("◀️ Owner panel", "a"),))
+        return Reply("\n".join(lines), rows=tuple(rows))
+
+    def user_profile(self, owner_id: str, uid: str) -> Reply:
+        """One customer: balance + Open Telegram (and money tools on main)."""
+        if not self.router._is_owner(owner_id):
+            return Reply("Owner only.", ok=False, rows=((("🏠 Menu", "m"),),))
+        uid = (uid or "").strip()
+        if not uid:
+            return self.users_screen(owner_id)
+        handle = self._username_of(uid)
+        bal = self.router.balance_of(uid)
+        at = f"@{handle}" if handle else "(no @username yet — Open still works)"
+        text = (
+            f"👤 User `{uid}`\n"
+            f"Telegram: {at}\n"
+            f"💰 Balance: {bal}"
+        )
+        rows: list[tuple[tuple[str, str], ...]] = [
+            (("👤 Open Telegram", self._tg_profile_url(uid, handle)),),
+        ]
+        if not self._is_clone:
+            rows.append((("💳 Add balance", "ax:credit"), ("↩️ Deduct", "ax:debit")))
+        rows.append((("🚫 Ban/Unban", "ax:ban"),))
+        rows.append((("◀️ All users", "ax:users"), ("◀️ Owner panel", "a")))
+        return Reply(text, rows=tuple(rows))
+
+    def orders_screen(self, user_id: str, page: int = 0) -> Reply:
+        """Owner's per-order P&L: OTP numbers and Social boost."""
+        if not self.router._is_owner(user_id):
+            return Reply("Owner only.", ok=False, rows=((("🏠 Menu", "m"),),))
+        store = self._store
+        otp_fn = getattr(store, "recent_orders", None)
+        smm_fn = getattr(store, "recent_smm_orders", None)
+        otp = list(otp_fn(limit=40)) if callable(otp_fn) else []
+        smm = []
+        if callable(smm_fn):
+            try:
+                smm = list(smm_fn(limit=40))
+            except Exception:  # noqa: BLE001
+                smm = []
+        items: list[tuple[float, str]] = []
+        tot_g = tot_p = n = 0
+        for o in otp:
             when = format_ts(o.ts, sep=" · ", time_fmt="%H:%M")
             if o.success:
                 ratio = o.profit_ratio
                 pct = f" ({ratio:.0%})" if ratio is not None else ""
-                lines.append(f"\n✅ {when} · {o.slug} · {o.gross} → profit {o.profit}{pct}")
+                line = f"\n✅ {when} · {o.slug} · {o.gross} → profit {o.profit}{pct}"
                 tot_g += o.gross.paise
                 tot_p += o.profit.paise
                 n += 1
             else:
-                lines.append(f"\n♻️ {when} · {o.slug} · refunded")
-        if n:
+                line = f"\n♻️ {when} · {o.slug} · refunded"
+            items.append((float(o.ts or 0), line))
+        for o in smm:
+            when = format_ts(o.ts, sep=" · ", time_fmt="%H:%M")
+            name = o.service_name or f"#{o.service_id}"
+            profit = Money(o.charge.paise - o.cost.paise - o.refunded.paise)
+            if o.refunded.paise >= o.charge.paise and o.charge.paise:
+                line = f"\n♻️ {when} · 📣 {name} · refunded"
+            else:
+                line = (
+                    f"\n📣 {when} · {name} · {o.charge} → profit {profit}"
+                    f" · {o.status}"
+                )
+                tot_g += max(0, o.charge.paise - o.refunded.paise)
+                tot_p += profit.paise
+                n += 1
+            items.append((float(o.ts or 0), line))
+        if not items:
+            return Reply("📦 No orders yet.", rows=((("◀️ Owner panel", "a"),),))
+        items.sort(key=lambda e: -e[0])
+        per = 10
+        pages = max(1, (len(items) + per - 1) // per)
+        page = max(0, min(int(page or 0), pages - 1))
+        window = items[page * per: (page + 1) * per]
+        lines = [
+            f"📦 Recent orders (OTP + Social boost) · page {page + 1}/{pages}"
+        ]
+        lines.extend(line for _ts, line in window)
+        if n and tot_g:
             lines.append(f"\n—— shown sales margin: {tot_p / tot_g:.0%}")
-        return Reply("\n".join(lines), rows=((("◀️ Owner panel", "a"),),))
+        rows: list[tuple[tuple[str, str], ...]] = []
+        nav: list[tuple[str, str]] = []
+        if page > 0:
+            nav.append(("◀️ Prev", f"a:o:{page - 1}"))
+        if page < pages - 1:
+            nav.append(("Next ▶️", f"a:o:{page + 1}"))
+        if nav:
+            rows.append(tuple(nav))
+        rows.append((("◀️ Owner panel", "a"),))
+        return Reply("\n".join(lines), rows=tuple(rows))
 
     def _pending_topups(self) -> list:
         store = self._store
@@ -3105,7 +3308,7 @@ class MenuUI:
             if parts[1] == "qr":
                 return self.qr_screen(user_id)
             if parts[1] == "o":
-                return self.orders_screen(user_id)
+                return self.orders_screen(user_id, 0)
             if parts[1] == "mm":
                 if not self.router._is_owner(user_id):
                     return Reply("Owner only.", ok=False, rows=((("🏠 Menu", "m"),),))
@@ -3189,6 +3392,8 @@ class MenuUI:
                 )
             return self._badtap()
         if kind == "a" and len(parts) == 3:
+            if parts[1] == "o":
+                return self.orders_screen(user_id, _int(parts[2], 0))
             if parts[1] == "cl":
                 return self.clones_screen(user_id, _int(parts[2], 0))
             if parts[1] == "cld":
@@ -3205,12 +3410,17 @@ class MenuUI:
             action = parts[1]
             if action == "users":
                 page = _int(parts[2], 0) if len(parts) >= 3 else 0
+                return self.users_screen(user_id, page)
+            if action == "ulist":
+                page = _int(parts[2], 0) if len(parts) >= 3 else 0
                 return self._with_back(self.router.handle(user_id, f"/users {page}"))
+            if action == "up" and len(parts) >= 3:
+                return self.user_profile(user_id, parts[2])
             if action in {"orders", "metrics", "provider", "sunkcost"}:
                 # Command replies render fine but carry no navigation; wrap
                 # them so the owner never gets stuck (Fix: back button everywhere).
                 return self._with_back(self.router.handle(user_id, f"/{action}"))
-            if action in {"credit", "debit", "ban", "broadcast"}:
+            if action in {"credit", "debit", "ban", "broadcast", "finduser"}:
                 return self._admin_input_prompt(user_id, action)
             if action == "support":
                 # ✏️ Edit the support username customers see on 🆘 Support.

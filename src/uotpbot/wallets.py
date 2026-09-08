@@ -188,13 +188,19 @@ class ScopedWallets(WalletStore):
     def user_ids(self):
         return self._inner.user_ids(scope=self._scope)
 
-    def touch_user(self, user_id: str, *, scope: str = "") -> None:
+    def touch_user(self, user_id: str, *, scope: str = "", username: str = "") -> None:
         # Scope always comes from this wrapper: a sub-bot must not write
         # another bot's seen-user row.
-        self._inner.touch_user(user_id, scope=self._scope)
+        self._inner.touch_user(user_id, scope=self._scope, username=username)
 
     def list_users(self, *, limit: int = 40, offset: int = 0):
         return self._inner.list_users(scope=self._scope, limit=limit, offset=offset)
+
+    def usernames(self):
+        return self._inner.usernames(scope=self._scope)
+
+    def recent_smm_orders(self, *, limit: int = 20, **_kw):
+        return self._inner.recent_smm_orders(scope=self._scope, limit=limit)
 
     def create_smm_order(self, **kw):
         kw["scope"] = self._scope
@@ -322,9 +328,16 @@ CREATE TABLE IF NOT EXISTS {t} (
     user_id TEXT NOT NULL,
     first_seen REAL NOT NULL,
     last_seen REAL NOT NULL,
+    username TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (scope, user_id)
 )
 """
+
+
+def _clean_username(raw: str) -> str:
+    """Telegram @username without the at-sign; empty if nothing usable."""
+    s = (raw or "").strip().lstrip("@")
+    return s[:32] if s else ""
 
 
 def _bare_wallet_uid(stored: str, scope: str) -> str:
@@ -611,6 +624,9 @@ class SqliteWallets(WalletStore):
             "activenumbers": {
                 # Sub-bot scope isolation for live numbers.
                 "scope": "TEXT NOT NULL DEFAULT ''",
+            },
+            "seen_users": {
+                "username": "TEXT NOT NULL DEFAULT ''",
             },
         }
         for table, cols in migrations.items():
@@ -913,19 +929,35 @@ class SqliteWallets(WalletStore):
                     " WHERE user_id NOT LIKE '%:%'").fetchone()
         return {"users": users, "float": Money(int(row[0] if row else 0))}
 
-    def touch_user(self, user_id: str, *, scope: str = "") -> None:
+    def touch_user(self, user_id: str, *, scope: str = "", username: str = "") -> None:
         """Record that ``user_id`` just used this bot (idempotent upsert)."""
         uid = (user_id or "").strip()
         if not uid:
             return
         now = time.time()
+        handle = _clean_username(username)
         with self._lock, self._conn:
             self._conn.execute(
-                "INSERT INTO seen_users(scope, user_id, first_seen, last_seen) "
-                "VALUES (?, ?, ?, ?) "
-                "ON CONFLICT(scope, user_id) DO UPDATE SET last_seen = excluded.last_seen",
-                (scope, uid, now, now),
+                "INSERT INTO seen_users(scope, user_id, first_seen, last_seen, username) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(scope, user_id) DO UPDATE SET "
+                " last_seen = excluded.last_seen, "
+                " username = CASE WHEN excluded.username <> '' "
+                " THEN excluded.username ELSE seen_users.username END",
+                (scope, uid, now, now, handle),
             )
+
+    def usernames(self, *, scope: str = "") -> dict[str, str]:
+        """``user_id -> telegram username`` for this scope (empty names omitted)."""
+        out: dict[str, str] = {}
+        with self._lock:
+            for uid, name in self._conn.execute(
+                "SELECT user_id, COALESCE(username, '') FROM seen_users WHERE scope = ?",
+                (scope,),
+            ):
+                if uid and name:
+                    out[str(uid)] = str(name)
+        return out
 
     def user_ids(self, *, scope: str = "") -> list[str]:
         """Every customer id for this scope (seen, wallets, orders, topups, live)."""
@@ -951,13 +983,16 @@ class SqliteWallets(WalletStore):
                 ):
                     if uid:
                         ids.add(str(uid))
-            for table in ("orders", "topups", "activenumbers"):
-                for (uid,) in self._conn.execute(
-                    f"SELECT DISTINCT user_id FROM {table} WHERE scope = ?",
-                    (scope,),
-                ):
-                    if uid:
-                        ids.add(str(uid))
+            for table in ("orders", "topups", "activenumbers", "wallet_tx", "smm_orders"):
+                try:
+                    for (uid,) in self._conn.execute(
+                        f"SELECT DISTINCT user_id FROM {table} WHERE scope = ?",
+                        (scope,),
+                    ):
+                        if uid:
+                            ids.add(str(uid))
+                except sqlite3.OperationalError:
+                    continue
         return sorted(ids)
 
     def list_users(self, *, scope: str = "", limit: int = 40, offset: int = 0
@@ -1070,6 +1105,9 @@ class SqliteWallets(WalletStore):
 
     def open_smm_orders(self, *, limit: int = 200) -> list[SmmOrderRow]:
         return self._smm.list_open(limit=limit)
+
+    def recent_smm_orders(self, *, scope: str = "", limit: int = 20) -> list[SmmOrderRow]:
+        return self._smm.list_recent(scope=scope, limit=limit)
 
     def update_smm_order(self, oid: int, **kw) -> bool:
         return self._smm.update(oid, **kw)
@@ -1421,6 +1459,9 @@ class PostgresWallets(WalletStore):
                 # Sub-bot scope isolation for live numbers.
                 "scope": "TEXT NOT NULL DEFAULT ''",
             },
+            self._ts: {
+                "username": "TEXT NOT NULL DEFAULT ''",
+            },
         }
         for table, cols in migrations.items():
             for name, ddl in cols.items():
@@ -1445,18 +1486,34 @@ class PostgresWallets(WalletStore):
                     f" {self._t} WHERE user_id NOT LIKE '%:%'").fetchone()
         return {"users": users, "float": Money(int(row[0] if row else 0))}
 
-    def touch_user(self, user_id: str, *, scope: str = "") -> None:
+    def touch_user(self, user_id: str, *, scope: str = "", username: str = "") -> None:
         uid = (user_id or "").strip()
         if not uid:
             return
         now = time.time()
+        handle = _clean_username(username)
         with self._lock:
             self._conn.execute(
-                f"INSERT INTO {self._ts}(scope, user_id, first_seen, last_seen) "
-                "VALUES (%s, %s, %s, %s) "
-                "ON CONFLICT(scope, user_id) DO UPDATE SET last_seen = EXCLUDED.last_seen",
-                (scope, uid, now, now),
+                f"INSERT INTO {self._ts}(scope, user_id, first_seen, last_seen, username) "
+                "VALUES (%s, %s, %s, %s, %s) "
+                "ON CONFLICT(scope, user_id) DO UPDATE SET "
+                " last_seen = EXCLUDED.last_seen, "
+                " username = CASE WHEN EXCLUDED.username <> '' "
+                f" THEN EXCLUDED.username ELSE {self._ts}.username END",
+                (scope, uid, now, now, handle),
             )
+
+    def usernames(self, *, scope: str = "") -> dict[str, str]:
+        out: dict[str, str] = {}
+        with self._lock:
+            for uid, name in self._conn.execute(
+                f"SELECT user_id, COALESCE(username, '') FROM {self._ts} "
+                "WHERE scope = %s",
+                (scope,),
+            ):
+                if uid and name:
+                    out[str(uid)] = str(name)
+        return out
 
     def user_ids(self, *, scope: str = "") -> list[str]:
         ids: set[str] = set()
@@ -1481,13 +1538,20 @@ class PostgresWallets(WalletStore):
                 ):
                     if uid:
                         ids.add(str(uid))
-            for table in (self._to, self._tt, self._ta):
-                for (uid,) in self._conn.execute(
-                    f"SELECT DISTINCT user_id FROM {table} WHERE scope = %s",
-                    (scope,),
-                ):
-                    if uid:
-                        ids.add(str(uid))
+            extra = [self._to, self._tt, self._ta, self._tx]
+            smm_t = getattr(self._smm, "_t", "")
+            if smm_t:
+                extra.append(smm_t)
+            for table in extra:
+                try:
+                    for (uid,) in self._conn.execute(
+                        f"SELECT DISTINCT user_id FROM {table} WHERE scope = %s",
+                        (scope,),
+                    ):
+                        if uid:
+                            ids.add(str(uid))
+                except Exception:  # noqa: BLE001 - table may not exist on old DBs
+                    continue
         return sorted(ids)
 
     def list_users(self, *, scope: str = "", limit: int = 40, offset: int = 0
@@ -1614,6 +1678,9 @@ class PostgresWallets(WalletStore):
 
     def open_smm_orders(self, *, limit: int = 200) -> list[SmmOrderRow]:
         return self._smm.list_open(limit=limit)
+
+    def recent_smm_orders(self, *, scope: str = "", limit: int = 20) -> list[SmmOrderRow]:
+        return self._smm.list_recent(scope=scope, limit=limit)
 
     def update_smm_order(self, oid: int, **kw) -> bool:
         return self._smm.update(oid, **kw)

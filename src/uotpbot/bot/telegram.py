@@ -415,6 +415,13 @@ class TelegramFrontend:
         user_id = str(getattr(user, "id", "")) if user else ""
         if not user_id:
             return
+        uname = (getattr(user, "username", None) or "") if user else ""
+        note = getattr(self.ui, "note_user", None)
+        if callable(note):
+            try:
+                note(user_id, uname)
+            except Exception:  # noqa: BLE001 - directory is not the money path
+                pass
         # Owner setting force-sub can forward a channel post instead of typing
         # @username — that's the reliable way to capture a private channel id.
         fwd = _forwarded_channel_ref(message)
@@ -467,6 +474,13 @@ class TelegramFrontend:
         if not user_id:
             await query.answer()
             return
+        uname = (getattr(user, "username", None) or "") if user else ""
+        note = getattr(self.ui, "note_user", None)
+        if callable(note):
+            try:
+                note(user_id, uname)
+            except Exception:  # noqa: BLE001 - directory is not the money path
+                pass
         data = query.data or ""
         message = getattr(query, "message", None)
         if data.startswith("cb:"):
@@ -629,6 +643,13 @@ class TelegramFrontend:
         user_id = str(getattr(user, "id", "")) if user else ""
         if not user_id:
             return
+        uname = (getattr(user, "username", None) or "") if user else ""
+        note = getattr(self.ui, "note_user", None)
+        if callable(note):
+            try:
+                note(user_id, uname)
+            except Exception:  # noqa: BLE001 - directory is not the money path
+                pass
         file_id = photos[-1].file_id  # largest size Telegram offered
         reply = await _run_offloop(self.ui.photo, user_id, file_id)
         await self._deliver_reply(message, reply)

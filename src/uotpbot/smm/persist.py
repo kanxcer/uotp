@@ -280,6 +280,18 @@ class SmmStore:
             ).fetchall()
         return [_row(r) for r in rows]
 
+    def list_recent(self, *, scope: str = "", limit: int = 20) -> list[SmmOrderRow]:
+        """Newest-first social-boost orders for this scope (owner P&L)."""
+        sql = (
+            f"SELECT {_SELECT} FROM {self._t} WHERE scope = ? "
+            "ORDER BY id DESC LIMIT ?"
+        )
+        with self._lock:
+            rows = self._conn.execute(
+                self._sql(sql), (scope, int(limit)),
+            ).fetchall()
+        return [_row(r) for r in rows]
+
     def list_open(self, *, limit: int = 200) -> list[SmmOrderRow]:
         """Every still-open order that has an upstream id (poller)."""
         placeholders = ",".join("?" * len(OPEN_SQL_STATUSES))

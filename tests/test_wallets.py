@@ -345,14 +345,14 @@ def test_cmd_users_paginates_past_the_old_30_cap(tmp_path):
     assert "page 1/" in first.text
     assert "Customers (45)" in first.text
     datas = [d for row in first.rows for _l, d in row]
-    assert "ax:users:1" in datas
+    assert "ax:ulist:1" in datas
     # All 45 must be reachable; the first page is 40, not a silent [:30].
     # Each id is wrapped in a backtick pair (`uid`).
     assert first.text.count("`") == 80
     second = router.handle(OWNER, "/users 1")
     assert second.ok and "page 2/" in second.text
     assert second.text.count("`") == 10
-    via_btn = ui.button(OWNER, "ax:users:1")
+    via_btn = ui.button(OWNER, "ax:ulist:1")
     assert via_btn.ok and "page 2/" in via_btn.text
     store.close()
 
@@ -382,3 +382,33 @@ def test_cmd_users_highest_balance_first(tmp_path):
     assert listed.text.index("`zzz`") < listed.text.index("`mmm`") < listed.text.index("`aaa`")
     store.close()
 
+
+
+def test_touch_user_stores_username(tmp_path):
+    store = SqliteWallets(str(tmp_path / "w.db"))
+    store.touch_user("5365205423", username="@PayeeOne")
+    store.touch_user("5365205423", username="")  # empty must not wipe
+    assert store.usernames() == {"5365205423": "PayeeOne"}
+    scoped = ScopedWallets(store, "cloneA")
+    scoped.touch_user("6506051814", username="clone_user")
+    assert scoped.usernames() == {"6506051814": "clone_user"}
+    assert "6506051814" not in store.usernames()
+    store.close()
+
+
+def test_user_ids_include_wallet_tx_and_smm_without_touch(tmp_path):
+    """A FamPay credit / social-boost buy must show in All users even if
+    the customer never tapped /start (no seen_users row)."""
+    store = SqliteWallets(str(tmp_path / "w.db"))
+    store.adjust("5365205423", INR(20), kind="deposit", note="FamPay")
+    oid = store.create_smm_order(
+        user_id="6506051814", service_id="7", service_name="IG Followers",
+        quantity=10, charge=INR(19), cost=INR(10),
+    )
+    assert oid
+    ids = set(store.user_ids())
+    assert "5365205423" in ids
+    assert "6506051814" in ids
+    recent = store.recent_smm_orders(limit=10)
+    assert any(o.user_id == "6506051814" for o in recent)
+    store.close()

@@ -95,6 +95,15 @@ def test_admin_users_button(rig):
     router.credit(USER, INR(100))
     r = ui.button(OWNER, "ax:users")
     assert r.ok and USER in r.text
+    datas = [d for row in (r.rows or ()) for _l, d in row]
+    assert any(d.startswith("url:tg://user?id=") or d.startswith("url:https://t.me/")
+               for d in datas)
+    assert f"ax:up:{USER}" in datas
+    profile = ui.button(OWNER, f"ax:up:{USER}")
+    assert profile.ok and USER in profile.text
+    pdata = [d for row in (profile.rows or ()) for _l, d in row]
+    assert any("Open Telegram" in l for row in (profile.rows or ()) for l, _ in row)
+    assert any(d.startswith("url:") for d in pdata)
 
 
 def test_admin_bad_input_reprompts_not_crash(rig):
@@ -102,3 +111,53 @@ def test_admin_bad_input_reprompts_not_crash(rig):
     ui.button(OWNER, "ax:credit")
     r = ui.text(OWNER, "two fifty")
     assert not r.ok and "Format" in r.text
+
+
+def test_admin_panel_find_user_and_orders_include_smm(tmp_path):
+    from uotpbot.wallets import SqliteWallets
+
+    catalog = Catalog({
+        "telegram": ServiceCost("telegram", "Telegram", "messaging", INR(10),
+                                Decimal("0.94"), Decimal("0.04"), Decimal("0.95")),
+    }, (WalletPack("Pro", INR(1000), INR(1150)),))
+    ledger = Ledger()
+    pricer = Pricer(catalog)
+    provider = MockProvider(
+        {"telegram": catalog.sticker_price("telegram")}, balance=INR(5000), seed=5)
+    engine = BotEngine(catalog, provider, ledger, pricer)
+    store = SqliteWallets(str(tmp_path / "w.db"))
+    router = CommandRouter(
+        engine, catalog, pricer, ledger, owner_id=OWNER, allowed_users=(OWNER, USER),
+        wallets=store,
+    )
+    ui = MenuUI(router)
+    try:
+        panel = ui.admin_panel(OWNER)
+        labels = [lbl for row in panel.rows for lbl, _ in row]
+        assert any("Find user" in lbl for lbl in labels)
+        store.record_order(user_id=USER, slug="telegram", amount=INR(10), success=True,
+                           profit=INR(4))
+        store.create_smm_order(
+            user_id=USER, service_id="7", service_name="IG Followers",
+            quantity=50, charge=INR(19), cost=INR(8),
+        )
+        orders = ui.button(OWNER, "a:o")
+        assert orders.ok
+        assert "Social boost" in orders.text or "📣" in orders.text
+        assert "IG Followers" in orders.text
+        assert "telegram" in orders.text
+        listed = router.handle(OWNER, "/orders")
+        assert listed.ok and "IG Followers" in listed.text
+        store.touch_user(USER, username="payee_one")
+        users = ui.button(OWNER, "ax:users")
+        assert "payee_one" in users.text or "@payee_one" in users.text
+        datas = [d for row in (users.rows or ()) for _l, d in row]
+        assert "url:https://t.me/payee_one" in datas
+        prompt = ui.button(OWNER, "ax:finduser")
+        assert "FIND USER" in prompt.text
+        found = ui.text(OWNER, USER)
+        assert found.ok and USER in found.text
+        assert any("Open Telegram" in l for row in (found.rows or ()) for l, _ in row)
+    finally:
+        store.close()
+        ledger.close()
