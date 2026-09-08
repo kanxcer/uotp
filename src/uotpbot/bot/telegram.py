@@ -237,11 +237,19 @@ def _normalize_rows(rows) -> list[list[tuple[str, str]]]:
 
 
 def _inline_button(label: str, data: str):
-    """One inline button: ``url:https://...`` becomes a URL button, else callback."""
-    if isinstance(data, str) and data.startswith("url:"):
+    """One inline button: ``url:https://...`` becomes a URL button, else callback.
+
+    Empty / blank ``url:`` payloads are dropped (not turned into a callback):
+    a single invalid URL button makes Telegram reject the whole keyboard, which
+    looks like the parent screen “not responding”.
+    """
+    if not isinstance(data, str) or not data.strip():
+        return None
+    if data.startswith("url:"):
         url = data[4:].strip()
-        if url:
-            return InlineKeyboardButton(label, url=url)
+        if not url.startswith(("http://", "https://")):
+            return None
+        return InlineKeyboardButton(label, url=url)
     return InlineKeyboardButton(label, callback_data=data)
 
 
@@ -258,16 +266,21 @@ def _reply_markup(reply) -> object:
         return None
     rows = _normalize_rows(getattr(reply, "rows", ()) or ())
     if rows:
-        return InlineKeyboardMarkup([
-            [_inline_button(label, data) for label, data in row]
-            for row in rows
-        ])
+        grid = []
+        for row in rows:
+            built = [b for b in (_inline_button(label, data) for label, data in row) if b]
+            if built:
+                grid.append(built)
+        return InlineKeyboardMarkup(grid) if grid else None
     buttons = getattr(reply, "buttons", ()) or ()
     if not buttons:
         return None
-    return InlineKeyboardMarkup([
-        [_inline_button(label, data)] for label, data in buttons
-    ])
+    built = []
+    for label, data in buttons:
+        b = _inline_button(label, data)
+        if b:
+            built.append([b])
+    return InlineKeyboardMarkup(built) if built else None
 
 
 def _forwarded_channel_ref(message: Any) -> Optional[str]:
@@ -770,8 +783,17 @@ class TelegramFrontend:
             return
         try:
             await message.edit_text(reply.text, reply_markup=markup)
-        except Exception:  # pragma: no cover - "message is not modified"
-            pass
+        except Exception as exc:  # pragma: no cover - "message is not modified"
+            if "not modified" in str(exc).lower():
+                return
+            log.warning("edit_text failed (%s); sending a new message", exc)
+            try:
+                await message.reply_text(reply.text, reply_markup=markup)
+            except Exception:
+                try:
+                    await message.reply_text(reply.text)
+                except Exception:
+                    pass
 
     async def _safe_edit_text(self, message: Any, text: str) -> None:
         if self._is_photo_message(message):

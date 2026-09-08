@@ -96,14 +96,13 @@ def test_admin_users_button(rig):
     r = ui.button(OWNER, "ax:users")
     assert r.ok and USER in r.text
     datas = [d for row in (r.rows or ()) for _l, d in row]
-    assert any(d.startswith("url:tg://user?id=") or d.startswith("url:https://t.me/")
-               for d in datas)
+    # No username → no URL button (tg://user makes Telegram reject the keyboard).
+    assert not any(d.startswith("url:tg://") for d in datas)
     assert f"ax:up:{USER}" in datas
     profile = ui.button(OWNER, f"ax:up:{USER}")
     assert profile.ok and USER in profile.text
     pdata = [d for row in (profile.rows or ()) for _l, d in row]
-    assert any("Open Telegram" in l for row in (profile.rows or ()) for l, _ in row)
-    assert any(d.startswith("url:") for d in pdata)
+    assert not any(d.startswith("url:tg://") for d in pdata)
 
 
 def test_admin_bad_input_reprompts_not_crash(rig):

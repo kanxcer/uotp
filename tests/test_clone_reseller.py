@@ -341,8 +341,8 @@ def test_main_admin_lists_every_clone_with_owner_and_stats():
         assert "ownerA" in listing.text
         assert "ownerB" in listing.text
         ldata = [d for row in (listing.rows or ()) for _l, d in row]
-        assert any(d.startswith("url:tg://user?id=ownerA") or d == "url:tg://user?id=ownerA"
-                   for d in ldata)
+        assert not any(str(d).startswith("url:tg://") for d in ldata)
+        assert any(str(d).startswith("a:cld:") for d in ldata)
         assert "38%" in listing.text
         assert "20%" in listing.text
         assert a.id[:8] in listing.text
@@ -351,7 +351,7 @@ def test_main_admin_lists_every_clone_with_owner_and_stats():
         assert detail.ok
         assert "ownerA" in detail.text
         ddata = [d for row in (detail.rows or ()) for _l, d in row]
-        assert any(str(d).startswith("url:") for d in ddata)
+        assert not any(str(d).startswith("url:tg://") for d in ddata)
         assert "38%" in detail.text
         assert a.bot_token not in detail.text
         assert "a:clr:" + a.id in {d for row in (detail.rows or ()) for _l, d in row}

@@ -329,11 +329,18 @@ class MenuUI:
             return ""
 
     def _tg_profile_url(self, uid: str, username: str = "") -> str:
-        """Inline button payload that opens the user's Telegram profile."""
+        """URL-button payload, or empty when Telegram would reject it.
+
+        ``tg://user?id=`` is legal in the Bot API but Telegram rejects the
+        *whole* inline keyboard (BUTTON_URL_INVALID) when any listed user
+        hides their forward-link. That made 👥 All users look dead: the
+        callback answered, the message never changed. Only ``https://t.me/``
+        usernames are safe on a multi-button screen.
+        """
         handle = (username or self._username_of(uid) or "").lstrip("@")
-        if handle:
+        if handle and all(c.isalnum() or c == "_" for c in handle):
             return f"url:https://t.me/{handle}"
-        return f"url:tg://user?id={uid}"
+        return ""
 
     @property
     def support_contact(self) -> str:
@@ -2751,6 +2758,12 @@ class MenuUI:
             if getattr(bot.mode, "value", "") == "platform_api"
             else "own API"
         )
+        crows: list[tuple[tuple[str, str], ...]] = []
+        owner_url = self._tg_profile_url(bot.owner_id)
+        if owner_url:
+            crows.append((("👤 Open owner", owner_url),))
+        crows.append((("🔄 Restart", f"a:clr:{bot.id}"),))
+        crows.append((("◀️ Clone bots", "a:cl"), ("◀️ Owner panel", "a")))
         return Reply(
             f"🤖 Clone `{bot.id}`\n\n"
             f"Owner: `{bot.owner_id}`\n"
@@ -2760,11 +2773,7 @@ class MenuUI:
             f"Owner earnings: {earn}\n"
             f"Created: {bot.created_at}\n"
             f"Mode: {mode}",
-            rows=(
-                (("👤 Open owner", self._tg_profile_url(bot.owner_id)),),
-                (("🔄 Restart", f"a:clr:{bot.id}"),),
-                (("◀️ Clone bots", "a:cl"), ("◀️ Owner panel", "a")),
-            ),
+            rows=tuple(crows),
         )
 
     def clone_restart(self, user_id: str, bot_id: str) -> Reply:
@@ -3058,10 +3067,11 @@ class MenuUI:
             label = f"{uid} · {bal}"
             if len(label) > 30:
                 label = f"{uid[:14]} · {bal}"
-            rows.append((
-                (label, f"ax:up:{uid}"),
-                ("👤 Open", self._tg_profile_url(uid, handle)),
-            ))
+            row = [(label, f"ax:up:{uid}")]
+            open_url = self._tg_profile_url(uid, handle)
+            if open_url:
+                row.append(("👤 Open", open_url))
+            rows.append(tuple(row))
         nav: list[tuple[str, str]] = []
         if page > 0:
             nav.append(("◀️ Prev", f"ax:users:{page - 1}"))
@@ -3084,15 +3094,16 @@ class MenuUI:
             return self.users_screen(owner_id)
         handle = self._username_of(uid)
         bal = self.router.balance_of(uid)
-        at = f"@{handle}" if handle else "(no @username yet — Open still works)"
+        at = f"@{handle}" if handle else "(no @username — Telegram blocks profile links)"
         text = (
             f"👤 User `{uid}`\n"
             f"Telegram: {at}\n"
             f"💰 Balance: {bal}"
         )
-        rows: list[tuple[tuple[str, str], ...]] = [
-            (("👤 Open Telegram", self._tg_profile_url(uid, handle)),),
-        ]
+        rows: list[tuple[tuple[str, str], ...]] = []
+        open_url = self._tg_profile_url(uid, handle)
+        if open_url:
+            rows.append((("👤 Open Telegram", open_url),))
         if not self._is_clone:
             rows.append((("💳 Add balance", "ax:credit"), ("↩️ Deduct", "ax:debit")))
         rows.append((("🚫 Ban/Unban", "ax:ban"),))
