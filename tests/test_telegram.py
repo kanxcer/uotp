@@ -29,6 +29,26 @@ class FakeApp:
         self.calls.append(kwargs)
 
 
+def test_telegram_loop_pulse_starts_none_then_ages():
+    import time
+
+    from uotpbot.bot import telegram as tg
+
+    with tg._PULSE_LOCK:
+        previous = tg._PULSE_AT
+        tg._PULSE_AT = 0.0
+    try:
+        assert tg.telegram_loop_age() is None
+        tg.note_telegram_loop()
+        age = tg.telegram_loop_age()
+        assert age is not None and age < 1.0
+        time.sleep(0.05)
+        assert tg.telegram_loop_age() >= 0.05
+    finally:
+        with tg._PULSE_LOCK:
+            tg._PULSE_AT = previous
+
+
 def test_polling_registers_no_signal_handlers():
     app = FakeApp()
     _start_polling(app)

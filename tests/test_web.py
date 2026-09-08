@@ -130,12 +130,45 @@ class BrokenProvider(MockProvider):
 
 
 # -------------------------------------------------------------- checks
+def test_telegram_loop_pulse_starts_none_then_ages():
+    import time
+
+    from uotpbot.bot import telegram as tg
+
+    with tg._PULSE_LOCK:
+        previous = tg._PULSE_AT
+        tg._PULSE_AT = 0.0
+    try:
+        assert tg.telegram_loop_age() is None
+        tg.note_telegram_loop()
+        age = tg.telegram_loop_age()
+        assert age is not None and age < 1.0
+        time.sleep(0.05)
+        assert tg.telegram_loop_age() >= 0.04
+    finally:
+        with tg._PULSE_LOCK:
+            tg._PULSE_AT = previous
+
+
+def test_keep_awake_url_from_render_and_public(monkeypatch):
+    from uotpbot.web import keep_awake_url
+
+    monkeypatch.delenv("PUBLIC_URL", raising=False)
+    monkeypatch.delenv("RENDER_EXTERNAL_URL", raising=False)
+    assert keep_awake_url() == ""
+    monkeypatch.setenv("RENDER_EXTERNAL_URL", "uotp.onrender.com")
+    assert keep_awake_url() == "https://uotp.onrender.com/healthz"
+    monkeypatch.setenv("PUBLIC_URL", "https://example.test/")
+    assert keep_awake_url() == "https://example.test/healthz"
+
+
 def test_liveness_never_touches_the_network(rig):
     server, _, _ = rig
     code, body = server.liveness()
     assert code == 200
     assert body["status"] == "ok"
     assert body["uptime_seconds"] >= 0
+    assert body["telegram_loop_age_seconds"] is None
 
 
 def test_liveness_survives_a_dead_provider(rig):
@@ -341,6 +374,14 @@ def test_poller_crash_does_not_kill_the_server(rig):
     code, _ = server.liveness()
     assert code == 200
     server._poller_thread = None  # stop the restart loop
+
+
+def test_liveness_reports_telegram_loop_age(rig):
+    server, _, _ = rig
+    server._telegram_loop_age = lambda: 1.25
+    code, body = server.liveness()
+    assert code == 200
+    assert body["telegram_loop_age_seconds"] == 1.2
 
 
 def test_no_poller_is_allowed(rig):

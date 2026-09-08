@@ -139,6 +139,79 @@ def test_registry_uses_schema_qualified_table(pg):
     assert '"uotp"."subbots"' in insert and "%s" in insert
 
 
+def test_dsn_keepalive_adds_tcp_probes():
+    from uotpbot.pgstore import _dsn_keepalive
+
+    url = _dsn_keepalive("postgres://u:p@h:5432/db")
+    assert "keepalives=1" in url
+    assert "keepalives_idle=30" in url
+    assert url.count("keepalives=1") == 1
+    already = _dsn_keepalive(url)
+    assert already == url
+    kv = _dsn_keepalive("host=h user=u dbname=db")
+    assert "keepalives=1" in kv
+
+
+def test_reconnecting_connection_retries_after_closed():
+    """The live 2026-09-08 failure: session closed, every tap died."""
+    from uotpbot.pgstore import ReconnectingConnection
+
+    class Flaky:
+        n = 0
+
+        def __init__(self) -> None:
+            self.closed = False
+            self.sql: list[str] = []
+
+        def execute(self, sql, params=()):
+            Flaky.n += 1
+            if Flaky.n == 1:
+                self.closed = True
+                raise RuntimeError("the connection is closed")
+            self.sql.append(sql)
+            return self
+
+        def close(self) -> None:
+            self.closed = True
+
+    made: list[Flaky] = []
+
+    def factory():
+        c = Flaky()
+        made.append(c)
+        return c
+
+    wrap = ReconnectingConnection(factory)
+    wrap.execute("SELECT 1")
+    assert len(made) == 2
+    assert made[1].sql == ["SELECT 1"]
+
+
+def test_reconnecting_connection_does_not_retry_integrity_errors():
+    from uotpbot.pgstore import ReconnectingConnection
+
+    class Bad:
+        closed = False
+
+        def execute(self, sql, params=()):
+            raise RuntimeError("duplicate key value violates unique constraint")
+
+        def close(self) -> None:
+            pass
+
+    wrap = ReconnectingConnection(lambda: Bad())
+    with pytest.raises(RuntimeError, match="unique"):
+        wrap.execute("INSERT")
+
+
+def test_pg_conn_dead_detects_closed_session():
+    from uotpbot.pgstore import _pg_conn_dead
+
+    assert _pg_conn_dead(RuntimeError("the connection is closed"))
+    assert not _pg_conn_dead(RuntimeError("duplicate key value violates unique constraint"))
+    assert not _pg_conn_dead(ValueError("nope"))
+
+
 def test_unsafe_schema_names_are_rejected(pg):
     with pytest.raises(StorageError):
         PostgresLedger("postgres://fake", schema='public; DROP TABLE x')

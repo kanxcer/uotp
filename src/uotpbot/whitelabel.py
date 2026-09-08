@@ -619,9 +619,34 @@ class MultiBotManager:
 
     # -- internals -------------------------------------------------------
     def _supervise(self, bot_id: str, target: Callable[[], Any], stop: threading.Event) -> None:
-        try:
-            target()
-        except Exception as exc:  # noqa: BLE001 - record, never crash the process
-            self._errors[bot_id] = f"{type(exc).__name__}: {exc}"
-        finally:
-            stop.set()
+        import logging
+        log = logging.getLogger("uotpbot.whitelabel")
+        while not stop.is_set():
+            try:
+                target()
+                if stop.is_set():
+                    return
+                self._errors[bot_id] = "poller returned"
+                log.warning(
+                    "sub-bot %s poller returned; restarting in %ss",
+                    bot_id, self.restart_delay,
+                )
+            except Exception as exc:  # noqa: BLE001 - record, never crash the process
+                self._errors[bot_id] = f"{type(exc).__name__}: {exc}"
+                if _fatal_poller_error(exc):
+                    log.error("sub-bot %s poller fatal: %s", bot_id, exc)
+                    return
+                log.exception(
+                    "sub-bot %s poller crashed; restarting in %ss",
+                    bot_id, self.restart_delay,
+                )
+            if stop.wait(self.restart_delay):
+                return
+
+
+def _fatal_poller_error(exc: BaseException) -> bool:
+    """True when retrying would hammer Telegram (revoked token, conflict)."""
+    blob = f"{type(exc).__name__} {exc}".lower()
+    return any(s in blob for s in (
+        "unauthorized", "invalid token", "token revoked", "401", "conflict",
+    ))

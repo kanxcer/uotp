@@ -38,6 +38,8 @@ import secrets
 import signal
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Optional
@@ -46,12 +48,32 @@ from .engine import BotEngine
 from .ledger import Ledger, LedgerError
 from .provider.base import ProviderError
 
-__all__ = ["HealthServer", "run_web", "PORT_ENV"]
+__all__ = ["HealthServer", "run_web", "PORT_ENV", "keep_awake_url"]
 
 log = logging.getLogger("uotpbot.web")
 
 PORT_ENV = "PORT"
 DEFAULT_PORT = 8080
+#: Render's free web services spin down after ~15 minutes without inbound
+#: HTTP. Hit our own public /healthz just under that so the process never
+#: idles out while it is still running. (A sleeping process cannot ping
+#: itself; that's why this is a keep-awake, not a wake-from-sleep.)
+KEEP_AWAKE_SECONDS = 240.0
+STALL_MAX_AGE = 90.0
+
+
+def keep_awake_url() -> str:
+    """Public /healthz URL, or empty when we have no external hostname."""
+    raw = (
+        os.environ.get("PUBLIC_URL")
+        or os.environ.get("RENDER_EXTERNAL_URL")
+        or ""
+    ).strip()
+    if not raw:
+        return ""
+    if "://" not in raw:
+        raw = "https://" + raw
+    return raw.rstrip("/") + "/healthz"
 
 
 @dataclass(slots=True)
@@ -89,6 +111,7 @@ class HealthServer:
         metrics_token: str = "",
         famgateway_webhook: Optional[Callable[[bytes, str, str],
                                                tuple[int, dict]]] = None,
+        telegram_loop_age: Optional[Callable[[], Optional[float]]] = None,
     ) -> None:
         self.engine = engine
         self.ledger = ledger
@@ -117,10 +140,19 @@ class HealthServer:
         self._started = time.monotonic()
         self._poller_thread: Optional[threading.Thread] = None
         self._httpd: Optional[ThreadingHTTPServer] = None
+        #: Seconds since the Telegram asyncio loop last beat, or None.
+        self._telegram_loop_age = telegram_loop_age
+        self._keep_awake_stop = threading.Event()
 
     # -- checks ----------------------------------------------------------
     def liveness(self) -> tuple[int, dict[str, Any]]:
         """Always 200 if we can answer. Never calls the network."""
+        age: Optional[float] = None
+        if self._telegram_loop_age is not None:
+            try:
+                age = self._telegram_loop_age()
+            except Exception:  # noqa: BLE001 - liveness never raises
+                age = None
         return 200, {
             "status": "ok",
             "uptime_seconds": round(time.monotonic() - self._started, 1),
@@ -129,6 +161,9 @@ class HealthServer:
             )
             if self._poller is not None
             else None,
+            "telegram_loop_age_seconds": (
+                None if age is None else round(age, 1)
+            ),
             "subbots_running": (
                 self._subbots.running() if self._subbots is not None else None
             ),
@@ -317,10 +352,67 @@ class HealthServer:
 
         self._poller_thread = threading.Thread(target=run, name="poller", daemon=True)
         self._poller_thread.start()
+        self._start_stall_watch()
+
+    def _in_pytest(self) -> bool:
+        return bool(os.environ.get("PYTEST_CURRENT_TEST"))
+
+    def _start_stall_watch(self) -> None:
+        """Exit the process if the Telegram loop beat goes stale.
+
+        ``poller_alive`` only means the supervisor *thread* is up. After
+        ``run_polling`` closes its loop the thread sits in ``sleep(5)`` /
+        crash-loops and Telegram is silent. A stale pulse is that failure;
+        ``os._exit`` lets the platform replace us with a fresh process.
+        """
+        if self._poller is None or self._telegram_loop_age is None:
+            return
+        if self._in_pytest() or os.environ.get("UOTP_STALL_EXIT", "1") == "0":
+            return
+
+        def watch() -> None:
+            while True:
+                time.sleep(15)
+                try:
+                    age = self._telegram_loop_age()  # type: ignore[misc]
+                except Exception:  # noqa: BLE001
+                    continue
+                if age is None:
+                    continue
+                if age > STALL_MAX_AGE:
+                    log.error(
+                        "telegram event loop stalled (%.0fs); exiting so "
+                        "the platform restarts us",
+                        age,
+                    )
+                    os._exit(78)
+
+        threading.Thread(target=watch, name="tg-watch", daemon=True).start()
+
+    def _start_keep_awake(self) -> None:
+        """Ping our public /healthz so a free Render service never idles."""
+        url = keep_awake_url()
+        if not url or self._in_pytest():
+            return
+
+        def ping() -> None:
+            while not self._keep_awake_stop.wait(KEEP_AWAKE_SECONDS):
+                try:
+                    req = urllib.request.Request(
+                        url, headers={"User-Agent": "uotpbot-keepawake"},
+                    )
+                    with urllib.request.urlopen(req, timeout=15) as resp:
+                        resp.read(64)
+                except Exception as exc:  # noqa: BLE001 - never kill HTTP
+                    log.warning("keep-awake ping failed: %s", type(exc).__name__)
+
+        threading.Thread(target=ping, name="keep-awake", daemon=True).start()
+        log.info("keep-awake pinging %s every %.0fs", url, KEEP_AWAKE_SECONDS)
 
     def serve_forever(self) -> None:
         """Bind $PORT and serve until SIGTERM/SIGINT."""
         self.start_poller()
+        self._start_keep_awake()
         # 0.0.0.0 is required: platforms route to the container's external
         # interface, and binding 127.0.0.1 makes the service unreachable.
         self._httpd = ThreadingHTTPServer(("0.0.0.0", self.port), self._handler_class())
@@ -332,6 +424,7 @@ class HealthServer:
         def shutdown(signum: int, _frame: Any) -> None:
             log.info("received signal %s, shutting down", signum)
             stop.set()
+            self._keep_awake_stop.set()
             if self._httpd:
                 threading.Thread(target=self._httpd.shutdown, daemon=True).start()
 

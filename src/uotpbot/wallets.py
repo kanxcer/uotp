@@ -1096,7 +1096,13 @@ class PostgresWallets(WalletStore):
         if not schema.isidentifier():
             raise WalletError(f"unsafe schema name {schema!r}")
         self._lock = threading.RLock()
-        self._conn = psycopg.connect(dsn, autocommit=True, prepare_threshold=None)
+        # Same reconnecting session as the ledger: a closed Supabase
+        # connection must not freeze every customer tap until a redeploy.
+        from .pgstore import StorageError, _connect_pg
+        try:
+            self._conn = _connect_pg(dsn)
+        except StorageError as exc:
+            raise WalletError(str(exc)) from exc
         self._integrity = psycopg.errors.IntegrityError
         self._t = f"{schema}.wallets"
         self._tt = f"{schema}.topups"

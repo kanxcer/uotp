@@ -19,6 +19,7 @@ import asyncio
 import logging
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
@@ -26,9 +27,33 @@ from ..config import Settings
 from .commands import CommandRouter
 from .ui import MenuUI, _REPLY_MENU, reply_keyboard_rows
 
-__all__ = ["TelegramFrontend", "run_bot", "build_from_settings"]
+__all__ = [
+    "TelegramFrontend", "run_bot", "build_from_settings",
+    "note_telegram_loop", "telegram_loop_age",
+]
 
 log = logging.getLogger("uotpbot.telegram")
+
+#: Last time the poller's asyncio loop ran a scheduled beat. A separate
+#: watchdog thread treats a stale pulse as "Telegram is silent even though
+#: the poller thread is still alive" -- the 2026-09-07 closed-loop failure.
+_PULSE_AT = 0.0
+_PULSE_LOCK = threading.Lock()
+
+
+def note_telegram_loop() -> None:
+    """Mark the poller event loop as alive. Called from that loop."""
+    global _PULSE_AT
+    with _PULSE_LOCK:
+        _PULSE_AT = time.monotonic()
+
+
+def telegram_loop_age() -> Optional[float]:
+    """Seconds since the last loop beat, or None if polling never started."""
+    with _PULSE_LOCK:
+        if _PULSE_AT <= 0:
+            return None
+        return time.monotonic() - _PULSE_AT
 
 
 # TWO pools, deliberately separate. This is the difference between "My numbers"
@@ -848,6 +873,7 @@ def _start_polling(app: Any) -> None:
     no handlers; shutdown is the process's SIGTERM, handled by the HTTP layer.
     """
     _ensure_open_event_loop()
+    note_telegram_loop()
     app.run_polling(allowed_updates=Update.ALL_TYPES, stop_signals=())
 
 

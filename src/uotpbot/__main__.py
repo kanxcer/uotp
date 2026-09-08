@@ -470,6 +470,8 @@ def _serve(settings: Settings) -> int:
             )
         log.info("white-label: %d of %d sub-bot poller(s) alive", len(live), len(started))
 
+    from .bot.telegram import telegram_loop_age
+
     server = HealthServer(
         engine, ledger,
         poller=poller,
@@ -480,6 +482,7 @@ def _serve(settings: Settings) -> int:
         famgateway_webhook=_famgateway_webhook(settings, wallets,
                                                notifier=payment_notifier,
                                                updates=updates_poster),
+        telegram_loop_age=telegram_loop_age,
     )
     # Background FamGateway sweeper: verify open orders and credit any that are
     # paid, so a dropped/missed webhook never loses a payment. Daemon thread;
@@ -764,6 +767,7 @@ def _run_subbot(bot, router, settings: Settings, manager=None) -> None:
         # Fresh loop: a previous run_polling closed the thread's loop, and the
         # next start would raise RuntimeError: Event loop is closed.
         _ensure_open_event_loop()
+        note_telegram_loop()
         app.run_polling(stop_signals=())
     finally:
         if manager is not None:

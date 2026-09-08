@@ -679,6 +679,33 @@ def test_inactive_bots_are_not_started():
     assert mgr.start_all() == []
 
 
+def test_poller_that_returns_is_restarted():
+    """run_polling returning used to leave the clone dead until a redeploy."""
+    reg = SubBotRegistry()
+    bot = reg.add(SubBot(owner_id="u1", bot_token=GOOD_TOKEN,
+                         mode=SubBotMode.PLATFORM_API, fee=DEFAULT_PLATFORM_FEE))
+    calls = {"n": 0}
+
+    def target(sb, r):
+        def run():
+            calls["n"] += 1
+            if calls["n"] < 2:
+                return
+            time.sleep(0.4)
+        return run
+
+    mgr = MultiBotManager(reg, lambda sb: None, target, restart_delay=0.05)
+    try:
+        mgr.start(bot.id)
+        deadline = time.time() + 2
+        while calls["n"] < 2 and time.time() < deadline:
+            time.sleep(0.01)
+        assert calls["n"] >= 2
+        assert bot.id in mgr.running()
+    finally:
+        mgr.stop_all()
+
+
 def test_restart_replaces_a_dead_poller():
     reg = SubBotRegistry()
     bot = reg.add(SubBot(owner_id="u1", bot_token=GOOD_TOKEN,
