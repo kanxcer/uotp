@@ -15,7 +15,9 @@ from .commands import CommandRouter, Reply
 
 __all__ = ["handle", "handle_text"]
 
-_PAGE = 8  # 4 rows of 2
+_PAGE = 8  # one full-width row each — two-up clips names on phones
+#: Telegram Bot API hard-limit for inline button text.
+_BTN = 64
 _STATUS = {
     "pending": "⏳ Pending",
     "in_progress": "🔄 In progress",
@@ -61,8 +63,77 @@ def _can_refill(ui, order) -> bool:
 
 
 def _trunc(text: str, n: int = 28) -> str:
-    text = (text or "").strip()
+    text = " ".join((text or "").split())
     return text if len(text) <= n else text[: n - 1] + "…"
+
+
+def _btn(text: str, n: int = _BTN) -> str:
+    """Fit a label into Telegram's 64-char inline-button limit."""
+    return _trunc(text, n)
+
+
+# Drop a repeated platform word so "Telegram Indian Members" becomes
+# "Indian Members" on a button already under ✈️ Telegram.
+_PLATFORM_ALIASES: dict[str, tuple[str, ...]] = {
+    "instagram": ("instagram",),
+    "tiktok": ("tiktok", "tik tok"),
+    "youtube": ("youtube",),
+    "telegram": ("telegram",),
+    "facebook": ("facebook",),
+    "twitter": ("twitter", "x (twitter)"),
+    "spotify": ("spotify",),
+    "snapchat": ("snapchat",),
+    "twitch": ("twitch",),
+    "linkedin": ("linkedin",),
+    "threads": ("threads",),
+    "discord": ("discord",),
+    "whatsapp": ("whatsapp",),
+    "pinterest": ("pinterest",),
+    "reddit": ("reddit",),
+    "website": ("website",),
+    "google": ("google",),
+}
+
+
+def _short_name(name: str, platform: str) -> str:
+    s = " ".join((name or "").split())
+    if not s:
+        return s
+    aliases = _PLATFORM_ALIASES.get(platform or "", ())
+    low = s.lower()
+    for alias in sorted(aliases, key=len, reverse=True):
+        for sep in (" | ", " |", "| ", " – ", " - ", ": ", " "):
+            prefix = alias + sep
+            if low.startswith(prefix):
+                cut = s[len(prefix):].lstrip(" |:-–")
+                if cut:
+                    return cut
+    return s
+
+
+def _price_label(price, name: str) -> str:
+    """Price first so a clipped mobile button still shows the rupees."""
+    head = f"{price} · "
+    room = max(8, _BTN - len(head))
+    return head + _btn(name, room)
+
+
+def _min_price(shop, svc, extra: Decimal):
+    try:
+        return shop.catalog.quote(svc, svc.min_qty, extra_rate=extra)
+    except SmmError:
+        return None
+
+
+def _cat_from_price(shop, cid: str, extra: Decimal):
+    best = None
+    for svc in shop.catalog.services_in(cid):
+        price = _min_price(shop, svc, extra)
+        if price is None:
+            continue
+        if best is None or price.paise < best.paise:
+            best = price
+    return best
 
 
 def _int(text: str, default: int = 0) -> int:
@@ -213,13 +284,24 @@ def categories(ui, platform: str, page: int = 0) -> Reply:
     pages = max(1, (len(cats) + _PAGE - 1) // _PAGE)
     page = max(0, min(page, pages - 1))
     window = cats[page * _PAGE: (page + 1) * _PAGE]
+    extra = _extra(ui)
     rows: list[tuple[tuple[str, str], ...]] = []
-    for i in range(0, len(window), 2):
-        chunk = window[i:i + 2]
-        rows.append(tuple(
-            (_trunc(name, 22) + f" ({n})", f"sm:c:{cid}:0")
-            for cid, name, n in chunk
-        ))
+    lines = [
+        platform_label(platform),
+        "",
+        "Tap a category. Price is the cheapest starting price:",
+        "",
+    ]
+    for cid, name, n in window:
+        short = _short_name(name, platform)
+        price = _cat_from_price(shop, cid, extra)
+        if price is not None:
+            label = _price_label(price, f"{short} ({n})")
+            lines.append(f"{price}  {name} ({n})")
+        else:
+            label = _btn(f"{short} ({n})")
+            lines.append(f"{name} ({n})")
+        rows.append(((label, f"sm:c:{cid}:0"),))
     if pages > 1:
         nav: list[tuple[str, str]] = []
         if page > 0:
@@ -229,10 +311,7 @@ def categories(ui, platform: str, page: int = 0) -> Reply:
             nav.append(("Next ▶️", f"sm:pl:{platform}:{page + 1}"))
         rows.append(tuple(nav))
     rows.append((("◀️ Platforms", "sm"), ("🏠 Menu", "m")))
-    return Reply(
-        f"{platform_label(platform)}\n\nPick a category:",
-        rows=tuple(rows),
-    )
+    return Reply("\n".join(lines), rows=tuple(rows))
 
 
 def services(ui, cat_key: str, page: int = 0) -> Reply:
@@ -247,20 +326,21 @@ def services(ui, cat_key: str, page: int = 0) -> Reply:
     page = max(0, min(page, pages - 1))
     window = svcs[page * _PAGE: (page + 1) * _PAGE]
     extra = _extra(ui)
-    rows: list[tuple[tuple[str, str], ...]] = []
-    for i in range(0, len(window), 2):
-        pair = []
-        for svc in window[i:i + 2]:
-            try:
-                price = shop.catalog.quote(svc, svc.min_qty, extra_rate=extra)
-            except SmmError:
-                price = Money(0)
-            pair.append((
-                f"{_trunc(svc.name, 18)} · from {price}",
-                f"sm:s:{svc.service_id}",
-            ))
-        rows.append(tuple(pair))
     plat = shop.catalog.cat_platform(cat_key)
+    title = shop.catalog.cat_name(cat_key) or "Services"
+    rows: list[tuple[tuple[str, str], ...]] = []
+    lines = [
+        title,
+        "",
+        "Price is for the minimum quantity. Re-quoted when you confirm.",
+        "",
+    ]
+    for svc in window:
+        price = _min_price(shop, svc, extra) or Money(0)
+        short = _short_name(svc.name, plat)
+        label = _price_label(price, short) if price.paise else _btn(short)
+        lines.append(f"{price}  {svc.name}")
+        rows.append(((label, f"sm:s:{svc.service_id}"),))
     if pages > 1:
         nav: list[tuple[str, str]] = []
         if page > 0:
@@ -270,12 +350,7 @@ def services(ui, cat_key: str, page: int = 0) -> Reply:
             nav.append(("Next ▶️", f"sm:c:{cat_key}:{page + 1}"))
         rows.append(tuple(nav))
     rows.append(((f"◀️ {platform_label(plat)}", f"sm:pl:{plat}:0"), ("🏠 Menu", "m")))
-    title = shop.catalog.cat_name(cat_key) or "Services"
-    return Reply(
-        f"{_trunc(title, 40)}\n\nPrice is for the minimum quantity. "
-        "Re-quoted when you confirm.",
-        rows=tuple(rows),
-    )
+    return Reply("\n".join(lines), rows=tuple(rows))
 
 
 def _qty_choices(svc) -> list[int]:

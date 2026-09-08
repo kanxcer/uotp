@@ -350,6 +350,80 @@ def test_admin_toggle_smm_shows_and_hides(tmp_path):
     store.close()
 
 
+def test_smm_mobile_buttons_show_price_and_full_name(tmp_path):
+    """Two-up buttons on phones clipped 'Telegram Indian Memb…' and hid ₹.
+
+    Live 2026-09-08 screenshot: category grid was 2 columns, names truncated
+    before the unique part, no price on the button. One full-width row,
+    rupees first, platform prefix dropped, message repeats the full list.
+    """
+    from uotpbot.bot.smm_ui import _short_name, _price_label, _BTN
+
+    assert _short_name("Telegram Indian Members [Real]", "telegram") == (
+        "Indian Members [Real]")
+    assert _short_name("Telegram Auto Views", "telegram") == "Auto Views"
+    assert _short_name("Instagram Followers", "instagram") == "Followers"
+    priced = _price_label(INR("12.50"), "Indian Members [Real] (2)")
+    assert priced.startswith("₹")
+    assert "12.50" in priced
+    assert "Indian Members" in priced
+    assert len(priced) <= _BTN
+
+    store = SqliteWallets(str(tmp_path / "w.db"))
+    rows = [
+        _svc_row(service="t1", name="Telegram Indian Members [Real]",
+                 category="Telegram Indian Members", rate="0.50"),
+        _svc_row(service="t2", name="Telegram Indian Members HQ",
+                 category="Telegram Indian Members", rate="0.80"),
+        _svc_row(service="t3", name="Telegram Auto Views Fast",
+                 category="Telegram Auto Views", rate="0.10"),
+        _svc_row(service="t4", name="Telegram Bot Start [Join Member]",
+                 category="Telegram Bot Start [Join Member]", rate="1.00"),
+    ]
+    mock = MockSmmProvider(rows, balance=Decimal("10"))
+    cat = SmmCatalog(mock, usd_inr=Decimal("95"), markup=Decimal("0.45"),
+                     min_charge=Money(100))
+    cat.refresh()
+    shop = SmmShop(mock, cat, store)
+    ui, _ = _otp_ui(wallets=store, smm_shop=shop)
+    ui.button(OWNER, "a:smm")
+    cats = ui.button(USER, "sm:pl:telegram:0")
+    assert cats.ok
+    # One tappable category per row (nav/menu may still pair).
+    cat_rows = [row for row in cats.rows
+                if any(cb.startswith("sm:c:") for _l, cb in row)]
+    assert cat_rows
+    assert all(len(row) == 1 for row in cat_rows)
+    blob = " ".join(l for r in cat_rows for l, _ in r)
+    assert "₹" in blob
+    assert "Indian Members" in blob
+    assert "Auto Views" in blob
+    assert "Bot Start" in blob
+    # Message body keeps the un-truncated catalogue name + price.
+    assert "Telegram Indian Members" in cats.text
+    assert "₹" in cats.text
+    # No 22-char ellipsis hiding the unique part.
+    assert "Telegram I…" not in blob
+    assert "Telegram Indian Memb" not in blob or "Indian Members" in blob
+
+    cid = cat_id("Telegram Indian Members")
+    svcs = ui.button(USER, f"sm:c:{cid}:0")
+    svc_rows = [row for row in svcs.rows
+                if any(cb.startswith("sm:s:") for _l, cb in row)]
+    assert svc_rows
+    assert all(len(row) == 1 for row in svc_rows)
+    first = svc_rows[0][0][0]
+    assert first.startswith("₹")
+    assert "Indian Members" in first
+    assert "Telegram Indian Members [Real]" in svcs.text
+    assert any("sm:s:t1" in cb for r in svc_rows for _l, cb in r)
+    for row in cats.rows:
+        for label, cb in row:
+            assert len(label) <= 64
+            assert len(cb.encode()) <= 64
+    store.close()
+
+
 def test_ui_shows_smm_when_shop_wired(tmp_path):
     store = SqliteWallets(str(tmp_path / "w.db"))
     store.adjust(USER, INR(500))
