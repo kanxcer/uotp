@@ -734,7 +734,9 @@ def _provider_for(bot, settings: Settings):
 
 def _run_subbot(bot, router, settings: Settings, manager=None) -> None:
     """Long-poll one sub-bot. Raises if the transport is unavailable."""
-    from .bot.telegram import HAS_TELEGRAM, TelegramFrontend, _ensure_open_event_loop
+    from .bot.telegram import (
+        HAS_TELEGRAM, TelegramFrontend, _post_init, _start_polling,
+    )
 
     if not HAS_TELEGRAM:
         raise RuntimeError("python-telegram-bot is not installed")
@@ -751,7 +753,15 @@ def _run_subbot(bot, router, settings: Settings, manager=None) -> None:
                                     "https://famgateway.in"),
         public_url=getattr(settings, "public_url", "") or "",
     )
-    app = Application.builder().token(bot.bot_token).build()
+    # Same builder as the main bot: concurrent_updates so one slow tap cannot
+    # freeze the clone, post_init so the loop beat keeps the process alive.
+    app = (
+        Application.builder()
+        .token(bot.bot_token)
+        .post_init(_post_init)
+        .concurrent_updates(True)
+        .build()
+    )
     app.add_handler(CallbackQueryHandler(frontend.on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, frontend.on_message))
     app.add_handler(MessageHandler(filters.COMMAND, frontend.on_message))
@@ -761,14 +771,8 @@ def _run_subbot(bot, router, settings: Settings, manager=None) -> None:
         if callable(bind):
             bind(bot.id, app)
     try:
-        # stop_signals=(): same reason as bot.telegram -- we run in a background
-        # thread, and PTB's default signal handlers only work in the main thread.
-        # stop() on the manager calls Application.stop_running() to unblock this.
-        # Fresh loop: a previous run_polling closed the thread's loop, and the
-        # next start would raise RuntimeError: Event loop is closed.
-        _ensure_open_event_loop()
-        note_telegram_loop()
-        app.run_polling(stop_signals=())
+        # stop_signals=() + fresh loop live inside _start_polling, same as main.
+        _start_polling(app)
     finally:
         if manager is not None:
             unbind = getattr(manager, "unbind_app", None)

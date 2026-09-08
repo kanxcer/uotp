@@ -679,6 +679,48 @@ def test_inactive_bots_are_not_started():
     assert mgr.start_all() == []
 
 
+def test_run_subbot_uses_shared_polling_helper():
+    """Clone poller must not call note_telegram_loop without importing it.
+
+    Live 2026-09-08: NameError crashed every clone start, so the list showed
+    the traceback and getUpdates conflicted while it restarted every 5s.
+    """
+    import inspect
+    from uotpbot import __main__ as m
+    src = inspect.getsource(m._run_subbot)
+    assert "_start_polling" in src
+    assert "concurrent_updates" in src
+    assert "note_telegram_loop()" not in src
+
+
+def test_supervisor_clears_error_while_poller_is_running():
+    """A recovered clone must not keep advertising the last crash."""
+    import time
+    from uotpbot.whitelabel import MultiBotManager
+
+    reg = SubBotRegistry()
+    bot = reg.add(SubBot(owner_id="u1", bot_token=GOOD_TOKEN,
+                         mode=SubBotMode.PLATFORM_API, fee=DEFAULT_PLATFORM_FEE))
+    gate = threading.Event()
+
+    def target(sb, r):
+        def run():
+            gate.wait(2)
+        return run
+
+    mgr = MultiBotManager(reg, lambda sb: None, target, restart_delay=0.05)
+    try:
+        mgr.start(bot.id)
+        deadline = time.time() + 2
+        while bot.id not in mgr.running() and time.time() < deadline:
+            time.sleep(0.01)
+        assert bot.id in mgr.running()
+        assert bot.id not in mgr.errors()
+    finally:
+        gate.set()
+        mgr.stop_all()
+
+
 def test_poller_that_returns_is_restarted():
     """run_polling returning used to leave the clone dead until a redeploy."""
     reg = SubBotRegistry()

@@ -130,6 +130,17 @@ class BrokenProvider(MockProvider):
 
 
 # -------------------------------------------------------------- checks
+def test_post_init_arms_a_repeating_loop_beat():
+    """Without a 15s beat the stall watchdog would kill the process ~90s
+    after boot — that was making the live bot feel slow (constant restarts).
+    """
+    import inspect
+    from uotpbot.bot import telegram as tg
+    src = inspect.getsource(tg._post_init)
+    assert "note_telegram_loop" in src
+    assert "call_later" in src
+
+
 def test_telegram_loop_pulse_starts_none_then_ages():
     import time
 

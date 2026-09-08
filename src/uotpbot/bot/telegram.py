@@ -771,6 +771,16 @@ async def _post_init(app: Any) -> None:  # pragma: no cover - network call
     """
     try:
         loop = asyncio.get_running_loop()
+        note_telegram_loop()
+
+        def _beat() -> None:
+            note_telegram_loop()
+            try:
+                loop.call_later(15.0, _beat)
+            except RuntimeError:
+                pass
+
+        loop.call_later(15.0, _beat)
         for key in ("payment_notifier", "owner_alert"):
             obj = (getattr(app, "bot_data", None) or {}).get(key)
             if obj is not None and hasattr(obj, "set_loop"):

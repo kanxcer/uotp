@@ -2600,7 +2600,10 @@ class MenuUI:
             else:
                 mark, state = "⚪", "stopped"
             err = errors.get(b.id)
-            if err:
+            # A live poller may still carry a stale crash string from the
+            # last restart (NameError while we fixed the import). Don't show
+            # it as if the clone is broken.
+            if err and b.id not in running:
                 state += f" — {err}"
             users_n = None
             float_held = None
@@ -2666,7 +2669,7 @@ class MenuUI:
         else:
             mark, state = "⚪", "stopped"
         err = errors.get(bot.id)
-        if err:
+        if err and bot.id not in running:
             state += f" — {err}"
         store = self._fg_store() or self._store
         from ..reseller import earnings_balance

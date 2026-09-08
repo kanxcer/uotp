@@ -367,6 +367,58 @@ def test_main_admin_lists_every_clone_with_owner_and_stats():
         ledger.close()
 
 
+def test_clone_list_hides_stale_crash_when_poller_is_live():
+    """Live 2026-09-08: list said live — NameError: note_telegram_loop.
+
+    The supervisor keeps the last crash string even after a successful
+    restart. A live clone must not look broken.
+    """
+    catalog = Catalog({
+        "blinkit": ServiceCost(
+            "blinkit", "Blinkit", "food", INR(10),
+            Decimal("0.94"), Decimal("0.04"), Decimal("0.95"),
+        ),
+    }, (WalletPack("Pro", INR(1000), INR(1150)),))
+    ledger = Ledger()
+    pricer = Pricer(catalog)
+    provider = MockProvider({"blinkit": INR(10)}, balance=INR(5000), seed=3)
+    engine = BotEngine(catalog, provider, ledger, pricer)
+    store = SqliteWallets(":memory:")
+    registry = SubBotRegistry()
+    clone = SubBot(
+        owner_id="8362763548", bot_token=GOOD_TOKEN,
+        mode=SubBotMode.PLATFORM_API, fee=DEFAULT_PLATFORM_FEE,
+        reseller_rate=Decimal("0.38"),
+    )
+    registry.add(clone)
+
+    class _Mgr:
+        def running(self):
+            return [clone.id]
+
+        def errors(self):
+            return {clone.id: "NameError: name 'note_telegram_loop' is not defined"}
+
+    router = CommandRouter(
+        engine, catalog, pricer, ledger, owner_id="platform-owner",
+        wallets=store, subbots=registry, platform_fee=DEFAULT_PLATFORM_FEE,
+        subbot_manager=_Mgr(),
+    )
+    ui = MenuUI(router)
+    try:
+        listing = ui.button("platform-owner", "a:cl")
+        assert listing.ok
+        assert clone.id in listing.text
+        assert "live" in listing.text
+        assert "NameError" not in listing.text
+        assert "note_telegram_loop" not in listing.text
+        detail = ui.button("platform-owner", f"a:cld:{clone.id}")
+        assert "NameError" not in detail.text
+        assert "live" in detail.text.lower()
+    finally:
+        ledger.close()
+
+
 def test_clone_withdraw_request_pings_platform_bot_not_clone():
     """Payout request must land on YC OTP (platform token), not the clone chat."""
     router, ui, store, _, ledger, _ = _clone_rig()

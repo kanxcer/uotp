@@ -505,10 +505,11 @@ class MultiBotManager:
     by the engine the router factory hands back, so the split happens in the
     one place that already knows the sale's gross.
 
-    A poller that raises is logged and left dead rather than restarted in a
-    tight loop -- a bot with a revoked token would otherwise hammer Telegram's
-    API forever and get the *platform's* IP throttled, taking the main bot down
-    with it. Restart is explicit, via :meth:`restart`.
+    A poller that dies because the token is revoked or another getUpdates is
+    already running is left dead -- restarting those would hammer Telegram and
+    take the *platform* IP down with it. Any other exit (closed event loop,
+    a NameError we can fix, transient network) is retried after
+    ``restart_delay``. Restart is also explicit via :meth:`restart`.
     """
 
     def __init__(
@@ -622,6 +623,7 @@ class MultiBotManager:
         import logging
         log = logging.getLogger("uotpbot.whitelabel")
         while not stop.is_set():
+            self._errors.pop(bot_id, None)
             try:
                 target()
                 if stop.is_set():
