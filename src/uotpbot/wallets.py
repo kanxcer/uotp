@@ -326,8 +326,8 @@ _SEEN_SCHEMA = """
 CREATE TABLE IF NOT EXISTS {t} (
     scope TEXT NOT NULL DEFAULT '',
     user_id TEXT NOT NULL,
-    first_seen REAL NOT NULL,
-    last_seen REAL NOT NULL,
+    first_seen DOUBLE PRECISION NOT NULL,
+    last_seen DOUBLE PRECISION NOT NULL,
     username TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (scope, user_id)
 )

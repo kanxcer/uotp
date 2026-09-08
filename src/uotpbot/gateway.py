@@ -237,8 +237,20 @@ class FamGateway:
 
         Polling guidance: 3-5 seconds between calls; the gateway rate-limits
         anything faster. Returns a ``FamGatewayStatus``; check ``is_paid``.
+
+        HTTP 408 (expired) and 404 (unknown order) are terminal for that QR:
+        they come back as ``state`` ``expired`` / ``not_found`` rather than
+        raising, so the sweeper can stop polling and the customer sees the
+        truth instead of “still checking”.
         """
-        data = self._get("/api/verify-order.php", {"order_id": order_id})
+        try:
+            data = self._get("/api/verify-order.php", {"order_id": order_id})
+        except FamGatewayError as exc:
+            if exc.code == 408:
+                return FamGatewayStatus(state="expired", order_id=order_id)
+            if exc.code == 404:
+                return FamGatewayStatus(state="not_found", order_id=order_id)
+            raise
         d = data.get("data", {}) if isinstance(data.get("data"), dict) else {}
         state = str(data.get("status", "")).lower()
         # "success" from verify carries the txn; pending/expired have no data.

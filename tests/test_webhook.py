@@ -154,6 +154,48 @@ def test_sweep_credits_paid_orders_and_skips_unpaid():
     assert ("k", "https://famgateway.in") in calls
 
 
+def test_sweep_stops_polling_expired_orders():
+    """Expired QRs must be marked dead so the sweeper does not 408 forever."""
+    from uotpbot import __main__ as mm
+    import uotpbot.gateway as gw
+
+    wallets = SqliteWallets(":memory:")
+    wallets.kv_set("fg_order:fg_old", "222")
+    wallets.kv_set("fg_amt:fg_old", "15")
+    wallets.kv_set("fg_order:fg_wait", "333")
+    wallets.kv_set("fg_amt:fg_wait", "50")
+
+    calls = []
+
+    class _FakeG:
+        def __init__(self, key, base_url):
+            pass
+
+        def verify(self, order_id):
+            calls.append(order_id)
+
+            class S:
+                pass
+            s = S()
+            s.is_paid = False
+            s.state = "expired" if order_id == "fg_old" else "pending"
+            return s
+
+    orig = gw.FamGateway
+    gw.FamGateway = _FakeG
+    try:
+        mm._famgateway_sweep(wallets, "k", "https://famgateway.in")
+        mm._famgateway_sweep(wallets, "k", "https://famgateway.in")
+    finally:
+        gw.FamGateway = orig
+
+    assert wallets.balance("222") == Money(0)
+    assert wallets.kv_get("fg_dead:fg_old") == "expired"
+    assert wallets.kv_get("fg_credited:fg_old") is None
+    assert calls.count("fg_old") == 1, "expired order polled only once"
+    assert calls.count("fg_wait") == 2, "pending order still polled"
+
+
 # -- QR message auto-edit on payment completion ---------------------------
 def test_paid_order_edits_the_qr_message_via_notifier():
     """Once a payment is credited, the QR message the customer was looking at

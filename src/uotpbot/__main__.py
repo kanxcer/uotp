@@ -201,11 +201,12 @@ def _famgateway_sweep(store, key: str, base_url: str, *, notifier: object = None
     except Exception as exc:  # noqa: BLE001
         log.warning("could not build FamGateway client for sweep: %s", exc)
         return
+    set_ = getattr(store, "kv_set", None)
     for order_key, uid in scan("fg_order:").items():
         if not uid:
             continue
         order_id = order_key.split("fg_order:", 1)[-1]
-        if get_(f"fg_credited:{order_id}"):
+        if get_(f"fg_credited:{order_id}") or get_(f"fg_dead:{order_id}"):
             continue
         amt_s = get_(f"fg_amt:{order_id}")
         if not amt_s:
@@ -223,6 +224,17 @@ def _famgateway_sweep(store, key: str, base_url: str, *, notifier: object = None
                 continue
             _credit_fg_wallet(store, uid, order_id, amt, notifier=notifier,
                               updates=updates)
+            continue
+        state = str(getattr(status, "state", "") or "").lower()
+        if state in {"expired", "not_found"}:
+            # Terminal: keep polling these would 408 the gateway every minute
+            # and can delay a real pending payment behind a pile of dead QRs.
+            if callable(set_):
+                try:
+                    set_(f"fg_dead:{order_id}", state)
+                except Exception:  # noqa: BLE001
+                    pass
+            log.info("FamGateway order %s is %s; stopping sweep", order_id, state)
 
 
 def _start_fg_sweeper(settings: Settings, wallets, stop: threading.Event,

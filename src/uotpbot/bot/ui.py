@@ -1200,6 +1200,17 @@ class MenuUI:
         except Exception:  # noqa: BLE001 - the credit already happened
             pass
 
+    def _mark_fg_dead(self, order_id: str, reason: str = "expired") -> None:
+        """Stop the background sweep from polling a terminal QR."""
+        store = self._fg_store()
+        set_ = getattr(store, "kv_set", None) if store is not None else None
+        if not callable(set_) or not order_id:
+            return
+        try:
+            set_(f"fg_dead:{order_id}", reason or "expired")
+        except Exception:  # noqa: BLE001
+            pass
+
     def remember_fg_message(self, order_id: str, chat_id, message_id) -> None:
         """Record where a FamGateway QR message was sent so the webhook/sweep
         can edit it in place the moment payment is confirmed.
@@ -2173,12 +2184,15 @@ class MenuUI:
                     "just wait, or confirm again below. Order: "
                     f"`{order_id}`"
                 )
-                if status.state == "expired":
+                rows = ((("🔄 Check status", f"fg:check:{order_id}"),), (("🏠 Menu", "m"),))
+                if status.state in {"expired", "not_found"}:
+                    self._mark_fg_dead(order_id, status.state)
                     prompt = (
                         "⌛️ That payment QR expired.\n\n"
-                        "Tap below to generate a fresh one for the same amount."
+                        "If you already paid, message the owner with the UTR. "
+                        "Otherwise tap ➕ Add money for a fresh QR."
                     )
-                rows = ((("🔄 Check status", f"fg:check:{order_id}"),), (("🏠 Menu", "m"),))
+                    rows = ((("➕ Add money", "t"),), (("🏠 Menu", "m"),))
                 return Reply(prompt, ok=False, rows=rows)
             return self._credit_fg_order(uid, order_id, amount_dec)
 

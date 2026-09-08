@@ -97,3 +97,21 @@ def test_request_sends_a_real_user_agent():
     fg.create_order(50)
     assert op.ua and "Python-urllib" not in op.ua, \
         f"must not use urllib's blocked UA; got {op.ua!r}"
+
+
+def test_verify_http_408_is_expired_not_raise():
+    """A 5-minute QR that timed out must not look like a network blip."""
+    import urllib.error
+
+    class _Err:
+        def read(self):
+            return b'{"status":"expired"}'
+        def close(self):
+            pass
+
+    class _Opener:
+        def urlopen(self, req, timeout=12):
+            raise urllib.error.HTTPError("u", 408, "expired", hdrs=None, fp=_Err())
+
+    s = FamGateway(KEY, opener=_Opener()).verify("fg_EZY")
+    assert s.state == "expired" and not s.is_paid and s.order_id == "fg_EZY"
