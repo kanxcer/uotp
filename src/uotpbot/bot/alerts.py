@@ -299,9 +299,24 @@ def deposit_update(amount, *, method: str = "FamPay Automatic", bot: str = "") -
     )
 
 
-def purchase_update(service: str, amount, *, bot: str = "") -> str:
+def purchase_update(service: str, amount, *, bot: str = "",
+                    delivered: bool = False) -> str:
+    title = (
+        "📅 **Order Delivered**" if delivered
+        else "🛒 **Number Purchase Successful**"
+    )
     return (
-        "🛒 **Number Purchase Successful**\n\n"
+        f"{title}\n\n"
+        f"**Service:** {service}\n"
+        f"**Amount:** {amount}\n\n"
+        f"Thank you for using our service! ❤️{_bot_tag(bot)}"
+    )
+
+
+def order_placed_update(service: str, amount, *, bot: str = "") -> str:
+    """Public post when a number is allocated (OTP still pending)."""
+    return (
+        "📅 **New Order Success**\n\n"
         f"**Service:** {service}\n"
         f"**Amount:** {amount}\n\n"
         f"Thank you for using our service! ❤️{_bot_tag(bot)}"
@@ -385,7 +400,25 @@ class ChannelPoster:
         except Exception:  # noqa: BLE001
             return ""
 
+    def auto_post_on(self) -> bool:
+        """Master switch. Default ON so a configured channel keeps posting."""
+        store = self._store
+        get = getattr(store, "kv_get", None) if store is not None else None
+        if not callable(get):
+            return True
+        try:
+            v = get("feature_updates")
+            if v == "0":
+                return False
+            if v == "1":
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+
     def post(self, text: str) -> bool:
+        if not self.auto_post_on():
+            return False
         chat = self.chat_id()
         body = (text or "").strip()
         if not chat or not body:

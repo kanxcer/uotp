@@ -293,6 +293,62 @@ class CommandRouter:
     def _bot_handle(self) -> str:
         return (getattr(self, "platform_bot_username", "") or "").lstrip("@")
 
+    def _flag_store(self):
+        """Unscoped store for platform flags (referral on/off + rate)."""
+        plat = getattr(self, "platform_wallets", None)
+        if plat is not None:
+            return plat
+        return self.wallets
+
+    @staticmethod
+    def _otp_ref_key(result, token: str = "") -> str:
+        alloc = getattr(result, "_alloc", None) if result is not None else None
+        oid = getattr(alloc, "order_id", "") if alloc is not None else ""
+        if oid:
+            return f"otp:{oid}"
+        order = getattr(result, "order", None) if result is not None else None
+        oid = getattr(order, "order_id", "") if order is not None else ""
+        if oid:
+            return f"otp:{oid}"
+        if token:
+            return f"otp:{token}"
+        return ""
+
+    def _referral_notices(self, user_id: str, amount, *, order_key: str,
+                          label: str = "") -> tuple[tuple[str, str], ...]:
+        from ..referral import credit_spend
+
+        flags = self._flag_store()
+        wallets = self.wallets
+        if wallets is None or not order_key:
+            return ()
+        try:
+            payout = credit_spend(
+                flags, wallets, user_id, amount, order_key=order_key)
+        except Exception:  # noqa: BLE001 - never roll back a delivery
+            log.debug("referral credit failed", exc_info=True)
+            return ()
+        if payout is None:
+            return ()
+        what = label or "a number"
+        return ((payout.referrer_id,
+                 f"🎉 Referral reward: {payout.amount} added to your balance "
+                 f"({self.balance_of(payout.referrer_id)} now). "
+                 f"A friend bought {what}."),)
+
+    def _referral_clawback(self, *, order_key: str, refunded, original) -> None:
+        from ..referral import clawback_spend
+
+        flags = self._flag_store()
+        wallets = self.wallets
+        if wallets is None or not order_key:
+            return
+        try:
+            clawback_spend(
+                flags, wallets, order_key, refunded=refunded, original=original)
+        except Exception:  # noqa: BLE001
+            log.debug("referral clawback failed", exc_info=True)
+
     def _debit(self, user_id: str, amount: Money, *, kind: str = "purchase",
                note: str = "") -> Money:
         """Take funds off a customer wallet for a purchase."""
@@ -679,13 +735,18 @@ class CommandRouter:
             try:
                 from .alerts import purchase_update
                 self._announce_update(
-                    purchase_update(name, price, bot=self._bot_handle()))
+                    purchase_update(name, price, bot=self._bot_handle(),
+                                    delivered=True))
             except Exception:  # noqa: BLE001
                 pass
+            notices = self._referral_notices(
+                user_id, price, order_key=self._otp_ref_key(result),
+                label=name)
             return Reply(
                 f"✅ OTP for {name}: {result.otp}\n"
                 f"📱 Number: {result.phone}\n\n"
-                f"Charged {price} · Balance {self.balance_of(user_id)}"
+                f"Charged {price} · Balance {self.balance_of(user_id)}",
+                notify=notices,
             )
         # Failed: put the money back so the customer is never out of pocket.
         if result.refunded.paise > 0:
@@ -762,6 +823,12 @@ class CommandRouter:
             token = uuid.uuid4().hex[:12]
             self._awaiting[token] = (user_id, slug, result)
             self._record_active(user_id, slug, price, result, token)
+            try:
+                from .alerts import order_placed_update
+                self._announce_update(
+                    order_placed_update(name, price, bot=self._bot_handle()))
+            except Exception:  # noqa: BLE001
+                pass
             return self.await_reply(token, result)
         # Allocation failed (already refunded by the engine's _fail).
         self._record_order(user_id, slug, price, result)
@@ -965,6 +1032,10 @@ class CommandRouter:
         ok, _ = self.refunds.request(user_id, gross, token,
                                      reason="user_cancelled",
                                      ledger_posted=ledger_posted)
+        if ok or not already:
+            self._referral_clawback(
+                order_key=self._otp_ref_key(result, token),
+                refunded=gross, original=gross)
         if not already:
             self._record_cancel(user_id, slug, gross)
         name = self.catalog.get(slug).name if self.catalog.has(slug) else slug
@@ -1119,14 +1190,18 @@ class CommandRouter:
             # can receive MORE codes on it during its validity window (Fix #2).
             self._record_order(user_id, slug, result.order.gross_price, result,
                                keep_active=True)
+            name = self.catalog.get(slug).name if self.catalog.has(slug) else slug
             try:
                 from .alerts import purchase_update
-                name = self.catalog.get(slug).name if self.catalog.has(slug) else slug
                 self._announce_update(
                     purchase_update(name, result.order.gross_price,
-                                    bot=self._bot_handle()))
+                                    bot=self._bot_handle(), delivered=True))
             except Exception:  # noqa: BLE001
                 pass
+            notices = self._referral_notices(
+                user_id, result.order.gross_price,
+                order_key=self._otp_ref_key(result, token),
+                label=name)
             from ..catalog import PROVIDER_VALIDITY_MINUTES
             left = self._remaining_otp_minutes(getattr(result, "_alloc", None))
             if left is None or left < 5:
@@ -1142,6 +1217,7 @@ class CommandRouter:
                     (("🔁 Another", f"s:{slug}"), ("🧾 My numbers", "o")),
                     (("🏠 Menu", "m"),),
                 ),
+                notify=notices,
             )
             self._terminal[token] = reply
             return reply
@@ -1158,6 +1234,13 @@ class CommandRouter:
             if result.refunded.paise > 0 and not already_resolved:
                 self.refunds.apply_timeout_refund(
                     token, user_id, result.refunded, reason="no OTP"
+                )
+                order = getattr(result, "order", None)
+                original = getattr(order, "gross_price", None) if order is not None else None
+                self._referral_clawback(
+                    order_key=self._otp_ref_key(result, token),
+                    refunded=result.refunded,
+                    original=original or result.refunded,
                 )
             if already_resolved:
                 # A Cancel or an earlier poll already refunded this order: never
@@ -1945,4 +2028,3 @@ class CommandRouter:
             return Reply(f"🎯 Markup set to {new} — prices are now cost x {1 + new}.")
         setattr(self.pricer, "target_margin", new)
         return Reply(f"🎯 Target margin set to {new} ({new:.0%}).")
-

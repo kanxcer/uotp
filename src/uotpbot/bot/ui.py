@@ -210,6 +210,11 @@ class MenuUI:
         #: Social boost is OFF by default even when SMM_API_KEY is set. The
         #: owner flips it from the admin panel; persists in kv across deploys.
         self._smm_memory = False
+        #: Referral programme: OFF by default; owner flips from admin.
+        self._referral_memory = False
+        self._referral_rate_memory = None
+        #: Auto-post to the updates channel. Default ON (None = inherit).
+        self._updates_auto_memory = True
         #: Env default for the panel API key. Owner can set a kv override from
         #: the admin panel (same pattern as FamGateway) without a redeploy.
         self._smm_api_default = (smm_api_key or "").strip()
@@ -621,6 +626,155 @@ class MenuUI:
         self._smm_memory = new
         return new
 
+    def referral_enabled(self) -> bool:
+        """True while customers may invite friends. Default OFF. Platform flag."""
+        from ..referral import is_enabled
+        store = self._feature_store()
+        if store is not None:
+            try:
+                return is_enabled(store)
+            except Exception:  # noqa: BLE001
+                pass
+        return bool(self._referral_memory)
+
+    def referral_rate(self):
+        from ..referral import get_rate, DEFAULT_RATE
+        store = self._feature_store()
+        if store is not None:
+            try:
+                return get_rate(store)
+            except Exception:  # noqa: BLE001
+                pass
+        return self._referral_rate_memory or DEFAULT_RATE
+
+    def referral_label(self) -> str:
+        if not self.referral_enabled():
+            return "off"
+        rate = self.referral_rate()
+        return f"on · {rate:.0%}"
+
+    def _toggle_referral(self) -> bool:
+        if self._is_clone:
+            return self.referral_enabled()
+        from ..referral import is_enabled, set_enabled
+        store = self._feature_store() or self._store_for_kv()
+        if store is not None:
+            new = not is_enabled(store)
+            set_enabled(store, new)
+            self._referral_memory = new
+            return new
+        self._referral_memory = not self._referral_memory
+        return self._referral_memory
+
+    def _set_referral_rate(self, rate) -> None:
+        if self._is_clone:
+            return
+        from ..referral import set_rate
+        store = self._feature_store() or self._store_for_kv()
+        if store is not None:
+            set_rate(store, rate)
+        self._referral_rate_memory = rate
+
+    def updates_auto_on(self) -> bool:
+        """Master switch for auto-posts to the updates channel. Default ON."""
+        store = self._feature_store()
+        if store is not None:
+            try:
+                v = store.kv_get("feature_updates")
+                if v == "0":
+                    return False
+                if v == "1":
+                    return True
+            except Exception:  # noqa: BLE001
+                pass
+        return bool(self._updates_auto_memory)
+
+    def _toggle_updates_auto(self) -> bool:
+        if self._is_clone:
+            return self.updates_auto_on()
+        new = not self.updates_auto_on()
+        store = self._feature_store() or self._store_for_kv()
+        if store is not None:
+            try:
+                store.kv_set("feature_updates", "1" if new else "0")
+            except Exception:  # noqa: BLE001
+                pass
+        self._updates_auto_memory = new
+        return new
+
+    def _try_bind_referral(self, user_id: str, body: str) -> None:
+        from ..referral import bind, parse_start_payload
+        ref = parse_start_payload(body)
+        if not ref:
+            return
+        store = self._store_for_kv()
+        if store is None:
+            return
+        try:
+            bind(store, user_id, ref)
+        except Exception:  # noqa: BLE001
+            log.debug("referral bind failed", exc_info=True)
+
+    def invite_card(self, user_id: str) -> "Reply":
+        """👥 Invite & earn — share link + personal stats."""
+        from ..referral import invite_link, stats
+        if not self.referral_enabled():
+            return Reply(
+                "👥 Invite & earn is off right now.",
+                ok=False, rows=((("🏠 Menu", "m"),),),
+            )
+        rate = self.referral_rate()
+        handle = (getattr(self.router, "platform_bot_username", "") or "").lstrip("@")
+        if self._is_clone:
+            # Clone deep-links must open THIS bot, not the platform one.
+            handle = ""
+        link = invite_link(handle, user_id)
+        start_cmd = f"/start r_{user_id}"
+        store = self._store_for_kv()
+        n, earned = (0, None)
+        if store is not None:
+            try:
+                n, earned = stats(store, user_id)
+            except Exception:  # noqa: BLE001
+                n, earned = 0, None
+        from ..money import Money as _M
+        earned_s = str(earned) if earned is not None else str(_M(0))
+        share = (
+            f"Your link:\n`{link}`\n\n"
+            if link else
+            f"Share this with friends — they open this bot and send:\n`{start_cmd}`\n\n"
+        )
+        if link:
+            share += f"Or they send `{start_cmd}` after opening the bot.\n\n"
+        return Reply(
+            "👥 Invite & earn\n\n"
+            f"You earn {rate:.0%} of every number or social boost a friend "
+            "buys after they join with your link. Refunds reverse the reward.\n\n"
+            f"{share}"
+            f"Friends joined: {n}\n"
+            f"Earned: {earned_s}",
+            rows=((("🏠 Menu", "m"),),),
+        )
+
+    def referral_admin(self, user_id: str) -> "Reply":
+        if not self.router._is_owner(user_id) or self._is_clone:
+            return Reply("Owner only.", ok=False, rows=((("🏠 Menu", "m"),),))
+        on = self.referral_enabled()
+        rate = self.referral_rate()
+        text = (
+            f"👥 Referral — {'ON' if on else 'OFF'}\n\n"
+            f"Friends earn {rate:.0%} of a referred customer's net spend "
+            "(OTP delivered + social boost). Refunds claw it back.\n"
+            "Cap is 10%. Clones follow this rate and cannot change it.\n\n"
+            "Customers see 👥 Invite & earn on the menu when this is ON."
+        )
+        rows = (
+            (("🟢 Turn on" if not on else "🔴 Turn off", "a:reftog"),
+             ("✏️ Set percent", "ax:refrate")),
+            (("◀️ Owner panel", "a"),),
+        )
+        return Reply(text, rows=rows)
+
     @property
     def smm_api_key(self) -> str:
         """Live panel API key: kv override wins over the env default."""
@@ -964,6 +1118,10 @@ class MenuUI:
         if store is not None:
             try:
                 store.kv_set("updates_channel", json.dumps(payload))
+                # Turning the channel on/off also arms/disarms auto-post.
+                on = bool((payload.get("chat") or "").strip())
+                store.kv_set("feature_updates", "1" if on else "0")
+                self._updates_auto_memory = on
             except Exception:  # noqa: BLE001
                 pass
         poster = getattr(self.router, "updates_poster", None)
@@ -1299,7 +1457,10 @@ class MenuUI:
                    "⚙ owner panel", "owner panel"):
             self._wizard.pop(user_id, None)
             return self.admin_panel(user_id)
-        if low in ("/start", "/help"):
+        start_cmd = (low.split()[0].split("@", 1)[0] if low else "")
+        if start_cmd in ("/start", "/help") or low in ("/start", "/help"):
+            if start_cmd == "/start":
+                self._try_bind_referral(user_id, body)
             self._wizard.pop(user_id, None)
             return self.main_menu(user_id)
         if low in ("/boost", "/smm", "social boost"):
@@ -1366,6 +1527,8 @@ class MenuUI:
         ]
         if self.smm_enabled():
             rows.append((("📣 Social boost", "sm"),))
+        if self.referral_enabled():
+            rows.append((("👥 Invite & earn", "rf"),))
         rows += [
             ((f"💰 Balance: {balance}", "w"), ("🧾 My numbers", "o")),
             ((f"⭐ Favourites ({len(fav_slug)})", "fav"), ("❓ How it works", "h")),
@@ -1406,6 +1569,9 @@ class MenuUI:
             s for s in self.catalog.services()
             if category is None or s.category == category
         ]
+        serve = getattr(self.router.engine.provider, "can_serve", None)
+        if callable(serve):
+            all_services = [s for s in all_services if serve(s.slug)]
         if not all_services:
             return Reply(
                 f"No services in {category or 'the catalogue'} right now.",
@@ -1577,6 +1743,7 @@ class MenuUI:
         "boost": "Social boost",
         "boost_refund": "Boost refund",
         "debit": "Debit",
+        "referral": "Referral",
     }
 
     @staticmethod
@@ -1885,6 +2052,11 @@ class MenuUI:
                    "Add THIS bot as an administrator with Post messages.\n\n"
                    "Send `off` to disable.\n"
                    f"(current: {self.updates_channel_label()})"),
+            "refrate": ("👥 REFERRAL PERCENT",
+                        "Send the percent of a friend's net spend the "
+                        "referrer earns, e.g. `5` or `5%`.\n"
+                        "Allowed: 1% to 10%. Default is 5%.\n"
+                        f"(current: {self.referral_rate():.0%})"),
         }[action]
         self._wizard[user_id] = {"flow": "admin", "action": action, "step": "input"}
         return Reply(f"{prompt[0]}\n\n{prompt[1]}\n\nTap ✖️ Cancel to abort.",
@@ -2010,6 +2182,20 @@ class MenuUI:
                 return self._apply_force_sub_input(user_id, body)
             if action == "uc":
                 return self._apply_updates_channel_input(user_id, body)
+            if action == "refrate":
+                from ..referral import parse_rate
+                rate = parse_rate(body)
+                if rate is None:
+                    return Reply(
+                        "Send a percent between 1 and 10, e.g. `5` or `5%`.",
+                        ok=False, rows=((("✖️ Cancel", "a"),),),
+                    )
+                self._set_referral_rate(rate)
+                self._wizard.pop(user_id, None)
+                return Reply(
+                    f"✅ Referral is now {rate:.0%} of net spend.",
+                    rows=((("👥 Referral", "a:ref"),), (("◀️ Owner panel", "a"),)),
+                )
             if action == "withdraw":
                 return self._apply_withdraw(user_id, body)
             self._wizard.pop(user_id, None)
@@ -2593,6 +2779,8 @@ class MenuUI:
             f"🔓 Users may use bot: {'on' if self.bot_enabled() else 'off'}\n"
             f"📢 Force sub: {self.force_sub_label()}\n"
             f"📣 Updates channel: {self.updates_channel_label()}\n"
+            f"📣 Auto-post: {'on' if self.updates_auto_on() else 'off'}\n"
+            f"👥 Referral: {self.referral_label()}\n"
             f"{cbt_line}\n"
             f"{smm_line}\n\n"
             "Full P&L: /report · Health: /status",
@@ -2602,6 +2790,8 @@ class MenuUI:
                 (("🔓 Users may use bot", "a:on"), ("🤖 Clone-bot on/off", "a:cb")),
                 *smm_row,
                 (("📢 Force sub", "a:fs"), ("📣 Updates channel", "a:uc")),
+                ((f"📣 Auto-post {'on' if self.updates_auto_on() else 'off'}", "a:upost"),),
+                ((f"👥 Referral {'on' if self.referral_enabled() else 'off'}", "a:ref"),),
                 (("📊 Metrics", "ax:metrics"),),
                 payouts_row,
                 (("📦 Orders & per-order profit", "a:o"),),
@@ -3407,6 +3597,43 @@ class MenuUI:
                     "✅ Updates channel is OFF. No more public posts.",
                     rows=((("📣 Updates channel", "a:uc"),), (("◀️ Owner panel", "a"),)),
                 )
+            if parts[1] == "upost":
+                if not self.router._is_owner(user_id) or self._is_clone:
+                    return Reply("Owner only.", ok=False, rows=((("🏠 Menu", "m"),),))
+                if not self.updates_channel_config() and not self.updates_auto_on():
+                    # Turning ON with no destination: send them to set the channel.
+                    return Reply(
+                        "📣 Auto-post needs a channel first.\n\n"
+                        "Set the YC OTP updates channel, then this bot will post "
+                        "deposit success, number ordered, and OTP delivered "
+                        "(plus social boost) automatically.",
+                        rows=((("📣 Set updates channel", "a:uc"),),
+                              (("◀️ Owner panel", "a"),)),
+                    )
+                on = self._toggle_updates_auto()
+                text = (
+                    "✅ Auto-post is ON — deposits, ordered numbers, delivered "
+                    "OTPs and social boosts go to the updates channel."
+                    if on else
+                    "📣 Auto-post is OFF — the channel stays connected but "
+                    "this bot will not post until you turn it back on."
+                )
+                return Reply(text, rows=((("◀️ Owner panel", "a"),),))
+            if parts[1] == "ref":
+                return self.referral_admin(user_id)
+            if parts[1] == "reftog":
+                if not self.router._is_owner(user_id) or self._is_clone:
+                    return Reply("Owner only.", ok=False, rows=((("🏠 Menu", "m"),),))
+                on = self._toggle_referral()
+                text = (
+                    "✅ Referral is ON — customers see 👥 Invite & earn and "
+                    f"get {self.referral_rate():.0%} of a friend's net spend."
+                    if on else
+                    "👥 Referral is OFF — existing binds stay, but no new "
+                    "rewards until you turn it back on."
+                )
+                return Reply(text, rows=((("👥 Referral", "a:ref"),),
+                                         (("◀️ Owner panel", "a"),)))
             if parts[1] == "fsoff":
                 if not self.router._is_owner(user_id):
                     return Reply("Owner only.", ok=False, rows=((("🏠 Menu", "m"),),))
@@ -3462,6 +3689,8 @@ class MenuUI:
                 return self._admin_input_prompt(user_id, "fs")
             if action == "uc":
                 return self._admin_input_prompt(user_id, "uc")
+            if action == "refrate":
+                return self._admin_input_prompt(user_id, "refrate")
             if action == "withdraw":
                 return self.withdraw_prompt(user_id)
             return self._badtap()
@@ -3469,6 +3698,8 @@ class MenuUI:
             if len(parts) == 2 and parts[1] == "ok":
                 return self._force_sub_recheck(user_id)
             return self._force_sub_prompt()
+        if kind == "rf":
+            return self.invite_card(user_id)
         if kind == "fav":
             return self.favourites_card(user_id)
         if kind == "support":
@@ -3654,11 +3885,11 @@ class MenuUI:
         """True for platform-only admin tools that clone owners must not use."""
         if kind in {"ap", "ad", "apw", "adw"}:
             return True
-        if kind == "a" and len(parts) >= 2 and parts[1] in {"t", "qr", "cb", "wd", "on", "cl", "cld", "clr", "uc", "ucoff", "smm"}:
+        if kind == "a" and len(parts) >= 2 and parts[1] in {"t", "qr", "cb", "wd", "on", "cl", "cld", "clr", "uc", "ucoff", "smm", "ref", "reftog", "upost"}:
             return True
         if kind == "ax" and len(parts) >= 2 and parts[1] in {
             "credit", "debit", "fg", "upi", "sunkcost", "provider", "metrics",
-            "uc", "smmkey",
+            "uc", "smmkey", "refrate",
         }:
             return True
         return False

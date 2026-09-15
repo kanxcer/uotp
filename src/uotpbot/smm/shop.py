@@ -232,6 +232,20 @@ class SmmShop:
             svc.name, sell, delivered=False,
             order_id=str(getattr(row, "id", "") or oid or ""),
         )
+        try:
+            from ..referral import credit_spend
+            flags = self._store()
+            payout = credit_spend(
+                flags, wallets, user_id, sell,
+                order_key=f"smm:{oid}")
+            if payout is not None:
+                self._notify(
+                    scope, payout.referrer_id,
+                    f"🎉 Referral reward: {payout.amount} added to your balance. "
+                    f"A friend bought {svc.name}.",
+                )
+        except Exception:  # noqa: BLE001 - never roll back a boost
+            log.debug("smm referral credit failed", exc_info=True)
         return row
 
     @staticmethod
@@ -413,6 +427,16 @@ class SmmShop:
                 return order
             new_refunded = Money(order.refunded.paise + refund_delta.paise)
             log.info("smm refunded %s on order %s (%s)", refund_delta, order.id, new_status)
+            try:
+                from ..referral import clawback_spend
+                remaining = Money(max(0, order.charge.paise - order.refunded.paise))
+                clawback_spend(
+                    self._store(), platform, f"smm:{order.id}",
+                    refunded=refund_delta,
+                    original=remaining if remaining.paise > 0 else order.charge,
+                )
+            except Exception:  # noqa: BLE001 - refund already landed
+                log.debug("smm referral clawback failed", exc_info=True)
         earnings_paid = order.earnings_paid
         if (not earnings_paid) and new_status in {"completed", "partial"}:
             if self._maybe_credit_clone(order, new_refunded, platform):

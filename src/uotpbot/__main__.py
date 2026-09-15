@@ -55,6 +55,45 @@ def _warn_if_ephemeral(path: str, *, var: str = "LEDGER_PATH") -> None:
         )
 
 
+
+def _enrich_catalog(catalog, provider) -> None:
+    """Add missing handler-vocab services and overlay live getPrices.
+
+    Markup is unchanged: only the provider cost (list_price) moves. A live
+    getPrices failure is non-fatal — the bundled CSV stays in force.
+    """
+    from .catalog import ingest_handler_vocab
+
+    try:
+        n = ingest_handler_vocab(catalog)
+        if n:
+            log.info("catalogue: added %s missing services from handler vocab", n)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("catalogue vocab ingest skipped: %s", exc)
+    get_prices = getattr(provider, "get_prices", None)
+    if not callable(get_prices):
+        return
+    try:
+        prices = get_prices() or {}
+    except Exception as exc:  # noqa: BLE001 - CSV stays
+        log.warning("catalogue live prices skipped: %s", exc)
+        return
+    if not prices:
+        return
+    aliases: dict[str, str] = {}
+    hmap = getattr(provider, "_handler_map", None) or {}
+    for slug, code in hmap.items():
+        aliases[str(code).lower()] = str(slug)
+    try:
+        stats = catalog.apply_live_prices(prices, aliases=aliases)
+        log.info(
+            "catalogue: live prices updated=%s added=%s skipped=%s (markup unchanged)",
+            stats.get("updated"), stats.get("added"), stats.get("skipped"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("catalogue live price merge failed: %s", exc)
+
+
 def _build(settings: Settings):
     """Wire up catalogue, provider, ledger, pricer and engine."""
     from .catalog import load_catalog
@@ -62,6 +101,7 @@ def _build(settings: Settings):
 
     catalog = load_catalog(Path(settings.prices_path) if settings.prices_path else None)
     provider = UotpProvider(settings.uotp)
+    _enrich_catalog(catalog, provider)
     ledger = make_ledger(settings)
     if not settings.database_url:
         # With Postgres the durability story is the database's, not the disk's.

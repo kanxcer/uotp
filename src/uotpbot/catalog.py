@@ -313,6 +313,56 @@ class Catalog:
         cost = self.get(slug)
         return max(cost.list_price, self.min_charge, key=lambda m: m.paise)
 
+    def upsert(self, cost: ServiceCost) -> None:
+        """Insert or replace a service. Markup is not touched (list_price only)."""
+        self._services[self._norm(cost.slug)] = cost
+
+    def apply_live_prices(
+        self,
+        prices: Mapping[str, Money],
+        *,
+        aliases: Optional[Mapping[str, str]] = None,
+    ) -> dict[str, int]:
+        """Overlay live ``getPrices`` onto ``list_price``. Adds unknown slugs.
+
+        Selling markup is unchanged: only the provider cost moves. Returns
+        ``{updated, added, skipped}``.
+        """
+        updated = added = skipped = 0
+        alias = {str(k).lower(): str(v) for k, v in (aliases or {}).items()}
+        for raw_key, price in (prices or {}).items():
+            if price is None:
+                skipped += 1
+                continue
+            try:
+                money = price if isinstance(price, Money) else INR(str(price))
+            except Exception:  # noqa: BLE001
+                skipped += 1
+                continue
+            if getattr(money, "paise", 0) <= 0:
+                skipped += 1
+                continue
+            key = str(raw_key).strip()
+            slug = alias.get(key.lower()) or alias.get(self._norm(key)) or key
+            slug = self._norm(slug)
+            if self.has(slug):
+                old = self.get(slug)
+                if old.list_price.paise == money.paise:
+                    skipped += 1
+                    continue
+                self._services[slug] = old.with_overrides(list_price=money)
+                updated += 1
+            else:
+                self.upsert(ServiceCost(
+                    slug=slug,
+                    name=slug.replace("-", " ").title(),
+                    category="other",
+                    list_price=money,
+                    otp_success_rate=self.fallback_success_rate,
+                ))
+                added += 1
+        return {"updated": updated, "added": added, "skipped": skipped}
+
 
 #: The bundled price book lives INSIDE the package. A previous layout pointed
 #: at ``<repo>/data`` via ``parent.parent.parent``, which only exists in a
@@ -390,3 +440,48 @@ def default_catalog() -> Catalog:
     if _DEFAULT_CACHE is None:
         _DEFAULT_CACHE = load_catalog()
     return _DEFAULT_CACHE
+
+
+def ingest_handler_vocab(catalog: Catalog, path: Optional[Path] = None) -> int:
+    """Add buyable handler-vocab services that the CSV is missing.
+
+    Does not rewrite existing list prices (those come from the dashboard CSV
+    / live getPrices). Names default to a title-cased slug.
+    """
+    import json as _json
+
+    target = Path(path) if path else _DATA_DIR / "handler_vocab.json"
+    if not target.exists():
+        return 0
+    try:
+        data = _json.loads(target.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return 0
+    added = 0
+    op_prices = data.get("op_prices") or {}
+    names = data.get("map") or {}
+    for slug, ops in op_prices.items():
+        if catalog.has(slug):
+            continue
+        cheapest: Optional[Decimal] = None
+        if isinstance(ops, Mapping):
+            for v in ops.values():
+                try:
+                    d = Decimal(str(v))
+                except ArithmeticError:
+                    continue
+                if cheapest is None or d < cheapest:
+                    cheapest = d
+        if cheapest is None or cheapest <= 0:
+            continue
+        display = str(names.get(slug) or slug)
+        catalog.upsert(ServiceCost(
+            slug=catalog._norm(str(slug)),
+            name=display.replace("-", " ").replace("_", " ").title()
+            if display.lower() == str(slug).lower() else str(display),
+            category="other",
+            list_price=quantize_money(cheapest),
+            otp_success_rate=Decimal("0.90"),
+        ))
+        added += 1
+    return added

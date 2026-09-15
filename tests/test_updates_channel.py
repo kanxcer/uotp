@@ -161,7 +161,7 @@ def test_successful_purchase_posts_to_the_channel():
         assert reply.ok
         assert sent, "completed purchase must post to the updates channel"
         blob = sent[-1]["text"]
-        assert "Purchase Successful" in blob
+        assert "Order Delivered" in blob
         assert "Telegram" in blob
         assert "111111" not in blob  # never leak OTP
         assert USER not in blob
