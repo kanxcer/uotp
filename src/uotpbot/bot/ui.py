@@ -213,8 +213,8 @@ class MenuUI:
         #: Referral programme: OFF by default; owner flips from admin.
         self._referral_memory = False
         self._referral_rate_memory = None
-        #: Auto-post to the updates channel. Default ON (None = inherit).
-        self._updates_auto_memory = True
+        #: Fake activity feed on the updates channel. Default OFF.
+        self._updates_auto_memory = False
         #: Env default for the panel API key. Owner can set a kv override from
         #: the admin panel (same pattern as FamGateway) without a redeploy.
         self._smm_api_default = (smm_api_key or "").strip()
@@ -3605,18 +3605,22 @@ class MenuUI:
                     return Reply(
                         "📣 Auto-post needs a channel first.\n\n"
                         "Set the YC OTP updates channel, then this bot will post "
-                        "deposit success, number ordered, and OTP delivered "
-                        "(plus social boost) automatically.",
+                        "random live-looking activity there (deposits, numbers "
+                        "ordered, OTP delivered, social boosts). Turn it off "
+                        "any time to stop the fake feed.",
                         rows=((("📣 Set updates channel", "a:uc"),),
                               (("◀️ Owner panel", "a"),)),
                     )
                 on = self._toggle_updates_auto()
                 text = (
-                    "✅ Auto-post is ON — deposits, ordered numbers, delivered "
-                    "OTPs and social boosts go to the updates channel."
+                    "✅ Auto-post is ON — the updates channel will get random "
+                    "live-looking posts (deposits, numbers ordered, OTP "
+                    "delivered, social boosts). They are not real orders. "
+                    "Turn this off to stop them."
                     if on else
-                    "📣 Auto-post is OFF — the channel stays connected but "
-                    "this bot will not post until you turn it back on."
+                    "📣 Auto-post is OFF — no fake updates will be posted. "
+                    "Real customer deposits and orders still go to the "
+                    "channel if it is connected."
                 )
                 return Reply(text, rows=((("◀️ Owner panel", "a"),),))
             if parts[1] == "ref":

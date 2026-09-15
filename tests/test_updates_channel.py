@@ -191,3 +191,75 @@ def test_try_smm_shop_accepts_updates_poster():
     import inspect
     from uotpbot.__main__ import _try_smm_shop
     assert "updates_poster" in inspect.signature(_try_smm_shop).parameters
+
+
+def test_fake_updates_mimic_real_templates_and_never_leak():
+    import random
+    from uotpbot.bot.alerts import craft_fake_update, md_to_telegram_html
+
+    rng = random.Random(7)
+    texts = [craft_fake_update(bot="YCOTP_Bot", rng=rng) for _ in range(50)]
+    assert len(set(texts)) > 12
+    kinds_seen = set()
+    for t in texts:
+        html = md_to_telegram_html(t)
+        assert "**" not in html
+        assert "http" not in t.lower()
+        assert "t.me/" not in t.lower()
+        assert "**Server:**" not in t
+        assert "Server 5" not in t
+        assert "111111" not in t
+        low = t.lower()
+        if "new deposit success" in low:
+            kinds_seen.add("deposit")
+        elif "link:** hidden" in low or "**Link:** hidden" in t:
+            kinds_seen.add("boost")
+        elif "order delivered" in low:
+            kinds_seen.add("delivered")
+        elif "new order success" in low:
+            kinds_seen.add("order")
+        assert "tg://user" not in t
+        assert "@2" not in t  # never a customer handle/id
+    assert {"deposit", "order", "delivered", "boost"} <= kinds_seen
+
+
+def test_fake_feed_tick_silent_when_off():
+    from uotpbot.bot.alerts import fake_feed_tick
+
+    store = SqliteWallets(":memory:")
+    store.kv_set("updates_channel",
+                 '{"chat": "-1001", "title": "U", "username": "u", "link": ""}')
+    sent = []
+    poster = ChannelPoster(store, bot_username="YCOTP_Bot",
+                           send_fn=lambda p: sent.append(p) or (True, ""))
+    assert fake_feed_tick(poster) is False
+    assert sent == []
+    store.kv_set("feature_updates", "1")
+    assert fake_feed_tick(poster) is True
+    assert sent and "http" not in sent[0]["text"].lower()
+
+
+def test_fake_feed_stops_the_moment_auto_post_is_off():
+    import threading
+    import time
+    from uotpbot.bot.alerts import start_fake_feed
+
+    store = SqliteWallets(":memory:")
+    store.kv_set("updates_channel",
+                 '{"chat": "-1001", "title": "U", "username": "u", "link": ""}')
+    store.kv_set("feature_updates", "1")
+    sent = []
+    poster = ChannelPoster(store, bot_username="YCOTP_Bot",
+                           send_fn=lambda p: sent.append(p) or (True, ""))
+    stop = threading.Event()
+    start_fake_feed(poster, stop, delay_fn=lambda _rng: 0.04)
+    deadline = time.time() + 2.0
+    while time.time() < deadline and not sent:
+        time.sleep(0.04)
+    assert sent, "auto-post ON must emit fake activity"
+    store.kv_set("feature_updates", "0")
+    time.sleep(0.08)  # let an in-flight tick finish
+    frozen = len(sent)
+    time.sleep(0.35)
+    stop.set()
+    assert len(sent) == frozen, "OFF must not broadcast more fakes"

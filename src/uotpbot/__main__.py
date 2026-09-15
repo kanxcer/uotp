@@ -410,7 +410,7 @@ def _serve(settings: Settings) -> int:
     from .store import make_wallets
 
     wallets = make_wallets(settings)
-    from .bot.alerts import ChannelPoster, PaymentNotifier
+    from .bot.alerts import ChannelPoster, PaymentNotifier, start_fake_feed
     updates_poster = ChannelPoster(
         wallets, bot_token=getattr(settings, "telegram_token", "") or "",
     )
@@ -555,9 +555,15 @@ def _serve(settings: Settings) -> int:
         notifier=payment_notifier,
         updates=updates_poster,
     )
+    fake_stop = threading.Event()
+    start_fake_feed(
+        updates_poster, fake_stop,
+        catalog=catalog, pricer=pricer, smm_box=smm_box,
+    )
     try:
         server.serve_forever()
     finally:
+        fake_stop.set()
         sweep_stop.set()
         if smm_stop_holder[0] is not None:
             smm_stop_holder[0].set()

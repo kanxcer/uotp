@@ -177,19 +177,24 @@ def test_purchase_credits_referrer_and_notifies():
         ledger.close()
 
 
-def test_auto_post_toggle_silences_channel():
+def test_auto_post_toggle_only_gates_fakes():
     store = SqliteWallets(":memory:")
     store.kv_set("updates_channel",
                  '{"chat": "-10099", "title": "U", "username": "u", "link": ""}')
     sent = []
     poster = ChannelPoster(store, bot_username="YCOTP_Bot",
                            send_fn=lambda p: sent.append(p) or (True, ""))
+    assert poster.auto_post_on() is False
+    assert poster.post("real event") is True  # real sales still post
+    assert poster.post_fake("fake") is False
+    store.kv_set("feature_updates", "1")
     assert poster.auto_post_on() is True
-    assert poster.post("hello") is True
+    assert poster.post_fake("fake") is True
     store.kv_set("feature_updates", "0")
     assert poster.auto_post_on() is False
-    assert poster.post("hello2") is False
-    assert len(sent) == 1
+    assert poster.post_fake("fake2") is False
+    assert poster.post("real 2") is True
+    assert len(sent) == 3
 
 
 def test_ordered_and_delivered_copy():

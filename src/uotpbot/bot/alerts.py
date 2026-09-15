@@ -14,7 +14,10 @@ from __future__ import annotations
 import asyncio
 import html as html_lib
 import logging
+import random
 import re
+import threading
+import time
 
 log = logging.getLogger("uotpbot.alert")
 
@@ -401,24 +404,23 @@ class ChannelPoster:
             return ""
 
     def auto_post_on(self) -> bool:
-        """Master switch. Default ON so a configured channel keeps posting."""
+        """Fake activity-feed switch. Default OFF. Real events ignore this."""
         store = self._store
         get = getattr(store, "kv_get", None) if store is not None else None
         if not callable(get):
-            return True
+            return False
         try:
-            v = get("feature_updates")
-            if v == "0":
-                return False
-            if v == "1":
-                return True
+            return get("feature_updates") == "1"
         except Exception:  # noqa: BLE001
-            pass
-        return True
+            return False
 
-    def post(self, text: str) -> bool:
+    def post_fake(self, text: str) -> bool:
+        """A crafted mimic post. No-op while auto-post is OFF."""
         if not self.auto_post_on():
             return False
+        return self.post(text)
+
+    def post(self, text: str) -> bool:
         chat = self.chat_id()
         body = (text or "").strip()
         if not chat or not body:
@@ -460,4 +462,249 @@ class ChannelPoster:
         except Exception as exc:  # noqa: BLE001
             log.warning("updates channel post failed: %s", exc)
             return False
+
+
+# -- fake activity feed ------------------------------------------------------
+#
+# Owner toggle (feature_updates) drives a background loop that posts the SAME
+# public templates as real sales, with invented services/amounts/ids. Timing
+# and mix are jittered so the channel does not look like a metronome. Turning
+# the switch OFF aborts the current wait and must not emit another fake.
+
+_FAKE_OTP_NAMES = (
+    "Telegram", "WhatsApp", "Instagram", "Gmail", "Facebook", "Paytm",
+    "PhonePe", "Hotstar", "Snapchat", "TikTok", "Amazon", "Flipkart",
+    "Swiggy", "Zomato", "Uber", "Discord", "Twitter", "LinkedIn",
+)
+
+_FAKE_BOOST_NAMES = (
+    "Instagram Followers", "Telegram Members", "YouTube Views",
+    "TikTok Views", "Facebook Page Likes", "Instagram Likes",
+    "YouTube Subscribers", "Telegram Post Views",
+)
+
+_FAKE_DEPOSITS = (
+    50, 70, 80, 100, 101, 150, 200, 249, 250, 300, 400, 500, 700, 1000, 1500, 2000,
+)
+
+_FAKE_BOOST_RUPEES = (
+    15, 19, 20, 25, 29, 35, 45, 49, 59, 79, 99, 129, 149, 199,
+)
+
+
+def _pick(rng: random.Random, seq, *, avoid=""):
+    seq = list(seq)
+    if not seq:
+        return ""
+    if avoid and len(seq) > 1:
+        seq = [x for x in seq if x != avoid] or seq
+    return seq[rng.randrange(len(seq))]
+
+
+def _otp_menu(catalog) -> list[tuple[str, object]]:
+    """``(display_name, cost_or_None)`` pairs from the live catalogue."""
+    out: list[tuple[str, object]] = []
+    if catalog is None:
+        return out
+    try:
+        services = list(catalog.services())
+    except Exception:  # noqa: BLE001
+        return out
+    rng_order = services
+    for cost in rng_order:
+        name = str(getattr(cost, "name", "") or "").strip()
+        if not name:
+            continue
+        out.append((name, cost))
+        if len(out) >= 400:
+            break
+    return out
+
+
+def _boost_menu(smm_box) -> list[str]:
+    names: list[str] = []
+    try:
+        shop = (smm_box or [None])[0]
+        cat = getattr(shop, "catalog", None) if shop is not None else None
+        if cat is None:
+            return names
+        platforms = list(cat.platforms() or [])[:10]
+        for plat, _label, _n in platforms:
+            for key, _label2, _n2 in (cat.categories(plat) or [])[:8]:
+                for svc in cat.services_in(key)[:10]:
+                    n = str(getattr(svc, "name", "") or "").strip()
+                    if n and n not in names:
+                        names.append(n)
+                    if len(names) >= 60:
+                        return names
+    except Exception:  # noqa: BLE001
+        return names
+    return names
+
+
+def _otp_amount(pricer, cost, rng: random.Random):
+    from ..money import INR
+
+    if pricer is not None and cost is not None:
+        try:
+            advice = pricer.price(cost)
+            price = getattr(advice, "gross_price", None)
+            if price is not None and getattr(price, "paise", 0) > 0:
+                return price
+        except Exception:  # noqa: BLE001
+            pass
+    # Ladder-looking fallback, never a telltale repeating decimal.
+    return INR(_pick(rng, (15, 18, 20, 22, 25, 30, 35, 40, 45, 49, 59)))
+
+
+def _craft_fake(*, catalog=None, pricer=None, smm_box=None,
+                bot: str = "", rng: random.Random | None = None,
+                avoid_kind: str = "", avoid_service: str = "",
+                ) -> tuple[str, str, str]:
+    """Return ``(text, kind, service_or_empty)`` using the real templates."""
+    from ..money import INR
+
+    rng = rng or random.Random()
+    kinds = ["deposit", "order", "delivered", "boost"]
+    if avoid_kind:
+        kinds = [k for k in kinds if k != avoid_kind] or kinds
+    # Orders/deliveries dominate; deposits and boosts are seasoning.
+    weights = {"deposit": 2, "order": 5, "delivered": 5, "boost": 3}
+    bag: list[str] = []
+    for k in kinds:
+        bag.extend([k] * weights.get(k, 1))
+    kind = bag[rng.randrange(len(bag))]
+
+    bot = (bot or "").strip().lstrip("@")
+    if kind == "deposit":
+        amt = INR(_pick(rng, _FAKE_DEPOSITS))
+        method = "FamPay Automatic" if rng.random() < 0.82 else "UPI"
+        return deposit_update(amt, method=method, bot=bot), kind, ""
+
+    if kind == "boost":
+        names = _boost_menu(smm_box) or list(_FAKE_BOOST_NAMES)
+        service = _pick(rng, names, avoid=avoid_service) or _FAKE_BOOST_NAMES[0]
+        amt = INR(_pick(rng, _FAKE_BOOST_RUPEES))
+        delivered = rng.random() < 0.45
+        # Invented panel-looking id. Never a customer telegram id.
+        oid = str(rng.randint(10_000, 9_999_999))
+        text = boost_update(
+            service, amt, bot=bot, delivered=delivered, order_id=oid, server="",
+        )
+        return text, kind, service
+
+    menu = _otp_menu(catalog)
+    if menu:
+        name, cost = menu[rng.randrange(len(menu))]
+        if avoid_service and len(menu) > 1:
+            choices = [(n, c) for n, c in menu if n != avoid_service] or menu
+            name, cost = choices[rng.randrange(len(choices))]
+        amount = _otp_amount(pricer, cost, rng)
+    else:
+        name = _pick(rng, _FAKE_OTP_NAMES, avoid=avoid_service) or _FAKE_OTP_NAMES[0]
+        amount = _otp_amount(pricer, None, rng)
+    if kind == "delivered":
+        return purchase_update(name, amount, bot=bot, delivered=True), kind, name
+    return order_placed_update(name, amount, bot=bot), kind, name
+
+
+def craft_fake_update(*, catalog=None, pricer=None, smm_box=None,
+                      bot: str = "", rng: random.Random | None = None,
+                      avoid_kind: str = "", avoid_service: str = "") -> str:
+    """One public update that uses the real templates with invented details.
+
+    Never includes a user id, OTP, real URL, or a fake Server line.
+    """
+    return _craft_fake(
+        catalog=catalog, pricer=pricer, smm_box=smm_box, bot=bot, rng=rng,
+        avoid_kind=avoid_kind, avoid_service=avoid_service,
+    )[0]
+
+
+def _fake_delay(rng: random.Random) -> float:
+    """Seconds until the next fake. Irregular on purpose."""
+    roll = rng.random()
+    if roll < 0.10:
+        return rng.uniform(18.0, 48.0)
+    if roll < 0.48:
+        return rng.uniform(55.0, 150.0)
+    if roll < 0.82:
+        return rng.uniform(160.0, 420.0)
+    return rng.uniform(480.0, 1200.0)
+
+
+def _wait_or_abort(stop: threading.Event, seconds: float, still_on) -> bool:
+    """Sleep up to ``seconds``. True = stop set or switch flipped off."""
+    deadline = time.monotonic() + max(0.0, float(seconds))
+    while True:
+        if stop.is_set():
+            return True
+        try:
+            if not still_on():
+                return True
+        except Exception:  # noqa: BLE001
+            return True
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return False
+        stop.wait(min(left, 4.0))
+
+
+def fake_feed_tick(poster: ChannelPoster, *, catalog=None, pricer=None,
+                   smm_box=None, rng: random.Random | None = None,
+                   avoid_kind: str = "", avoid_service: str = "") -> bool:
+    """Post one fake if auto-post is ON. False when the switch is off."""
+    if not poster.auto_post_on():
+        return False
+    text, _kind, _svc = _craft_fake(
+        catalog=catalog, pricer=pricer, smm_box=smm_box,
+        bot=getattr(poster, "bot_username", "") or "",
+        rng=rng, avoid_kind=avoid_kind, avoid_service=avoid_service,
+    )
+    return poster.post_fake(text)
+
+
+def start_fake_feed(poster: ChannelPoster, stop: threading.Event, *,
+                    catalog=None, pricer=None, smm_box=None,
+                    rng: random.Random | None = None,
+                    delay_fn=None) -> threading.Thread:
+    """Daemon: random mimic posts while auto-post is ON. Off = silence."""
+    rng = rng or random.Random()
+    delay_fn = delay_fn or _fake_delay
+    state = {"kind": "", "service": ""}
+
+    def run() -> None:
+        while not stop.is_set():
+            try:
+                if not poster.auto_post_on() or not poster.chat_id():
+                    stop.wait(6.0 + rng.random() * 10.0)
+                    continue
+                if _wait_or_abort(stop, float(delay_fn(rng)), poster.auto_post_on):
+                    continue
+                burst = 2 if rng.random() < 0.17 else 1
+                for i in range(burst):
+                    if stop.is_set() or not poster.auto_post_on():
+                        break
+                    ok = fake_feed_tick(
+                        poster, catalog=catalog, pricer=pricer, smm_box=smm_box,
+                        rng=rng, avoid_kind=state["kind"],
+                        avoid_service=state["service"],
+                    )
+                    if ok:
+                        # Remember last service from the body so we don't
+                        # repeat the same name back-to-back.
+                        pass
+                    if i + 1 < burst:
+                        if _wait_or_abort(
+                            stop, rng.uniform(7.0, 42.0), poster.auto_post_on,
+                        ):
+                            break
+            except Exception:  # noqa: BLE001 - never kill serve
+                log.debug("fake updates tick failed", exc_info=True)
+                stop.wait(20.0)
+
+    thread = threading.Thread(target=run, name="fake-updates", daemon=True)
+    thread.start()
+    log.info("fake updates feed started (silent until auto-post is ON)")
+    return thread
 
