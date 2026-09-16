@@ -116,6 +116,16 @@ class ScopedWallets(WalletStore):
     def kv_set(self, key, value):
         self._inner.kv_set(f"{self._scope}:{key}", value)
 
+    def kv_insert(self, key, value) -> bool:
+        """Insert if absent. True if this call wrote a new row."""
+        fn = getattr(self._inner, "kv_insert", None)
+        if callable(fn):
+            return bool(fn(f"{self._scope}:{key}", value))
+        if self._inner.kv_get(f"{self._scope}:{key}"):
+            return False
+        self._inner.kv_set(f"{self._scope}:{key}", value)
+        return True
+
     def kv_scan(self, prefix: str) -> dict[str, str]:
         """Return {key: value} for every key starting with ``prefix`` in scope."""
         return self._inner.kv_scan(f"{self._scope}:{prefix}")
@@ -192,6 +202,9 @@ class ScopedWallets(WalletStore):
         # Scope always comes from this wrapper: a sub-bot must not write
         # another bot's seen-user row.
         self._inner.touch_user(user_id, scope=self._scope, username=username)
+
+    def user_exists(self, user_id: str, **_kw) -> bool:
+        return bool(self._inner.user_exists(user_id, scope=self._scope))
 
     def list_users(self, *, limit: int = 40, offset: int = 0):
         return self._inner.list_users(scope=self._scope, limit=limit, offset=offset)
@@ -338,6 +351,20 @@ def _clean_username(raw: str) -> str:
     """Telegram @username without the at-sign; empty if nothing usable."""
     s = (raw or "").strip().lstrip("@")
     return s[:32] if s else ""
+
+
+def _sql_like_prefix(prefix: str) -> str:
+    """LIKE pattern for a *literal* prefix. Pair with ``ESCAPE '\\'``.
+
+    SQL ``LIKE`` treats ``_`` as any-one-char and ``%`` as any-string, so a
+    prefix such as ``ref_of:`` would otherwise also match ``refXof:…``.
+    """
+    return (
+        (prefix or "")
+        .replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    ) + "%"
 
 
 def _bare_wallet_uid(stored: str, scope: str) -> str:
@@ -849,11 +876,21 @@ class SqliteWallets(WalletStore):
                 (key, value),
             )
 
+    def kv_insert(self, key: str, value: str) -> bool:
+        """Insert if absent. True if this call wrote a new row."""
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO kv(key, value) VALUES(?, ?) "
+                "ON CONFLICT(key) DO NOTHING",
+                (key, value),
+            )
+            return (cur.rowcount or 0) > 0
+
     def kv_scan(self, prefix: str) -> dict[str, str]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT key, value FROM kv WHERE key LIKE ?",
-                (f"{prefix}%",),
+                "SELECT key, value FROM kv WHERE key LIKE ? ESCAPE '\\'",
+                (_sql_like_prefix(prefix),),
             ).fetchall()
         return {k: v for k, v in rows}
 
@@ -946,6 +983,18 @@ class SqliteWallets(WalletStore):
                 " THEN excluded.username ELSE seen_users.username END",
                 (scope, uid, now, now, handle),
             )
+
+    def user_exists(self, user_id: str, *, scope: str = "") -> bool:
+        """True if ``user_id`` already has a seen_users row for this scope."""
+        uid = (user_id or "").strip()
+        if not uid:
+            return False
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM seen_users WHERE scope = ? AND user_id = ?",
+                (scope, uid),
+            ).fetchone()
+        return bool(row)
 
     def usernames(self, *, scope: str = "") -> dict[str, str]:
         """``user_id -> telegram username`` for this scope (empty names omitted)."""
@@ -1377,11 +1426,21 @@ class PostgresWallets(WalletStore):
                 (key, value),
             )
 
+    def kv_insert(self, key: str, value: str) -> bool:
+        """Insert if absent. True if this call wrote a new row."""
+        with self._lock:
+            cur = self._conn.execute(
+                f"INSERT INTO {self._tk}(key, value) VALUES(%s, %s) "
+                "ON CONFLICT(key) DO NOTHING",
+                (key, value),
+            )
+            return (cur.rowcount or 0) > 0
+
     def kv_scan(self, prefix: str) -> dict[str, str]:
         with self._lock:
             rows = self._conn.execute(
-                f"SELECT key, value FROM {self._tk} WHERE key LIKE %s",
-                (f"{prefix}%",),
+                f"SELECT key, value FROM {self._tk} WHERE key LIKE %s ESCAPE '\\'",
+                (_sql_like_prefix(prefix),),
             ).fetchall()
         return {k: v for k, v in rows}
 
@@ -1502,6 +1561,18 @@ class PostgresWallets(WalletStore):
                 f" THEN EXCLUDED.username ELSE {self._ts}.username END",
                 (scope, uid, now, now, handle),
             )
+
+    def user_exists(self, user_id: str, *, scope: str = "") -> bool:
+        """True if ``user_id`` already has a seen_users row for this scope."""
+        uid = (user_id or "").strip()
+        if not uid:
+            return False
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT 1 FROM {self._ts} WHERE scope = %s AND user_id = %s",
+                (scope, uid),
+            ).fetchone()
+        return bool(row)
 
     def usernames(self, *, scope: str = "") -> dict[str, str]:
         out: dict[str, str] = {}

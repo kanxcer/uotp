@@ -58,6 +58,8 @@ def test_parse_start_payload():
     assert parse_start_payload("/help") == ""
     assert parse_start_payload("r_123") == "123"
     assert parse_start_payload("r555") == "555"
+    assert parse_start_payload("/start r_notanid") == ""
+    assert parse_start_payload("/start r_") == ""
 
 
 def test_parse_rate_caps_at_ten_percent():
@@ -76,6 +78,25 @@ def test_bind_once_no_self():
     assert bind(store, USER, OWNER) is False  # already bound
     assert referrer_of(store, USER) == FRIEND
     assert bind(store, FRIEND, FRIEND) is False  # self
+    assert bind(store, "3", FRIEND, existing=True) is False
+    assert referrer_of(store, "3") == ""
+    assert bind(store, "abc", FRIEND) is False
+
+
+def test_stats_unique_and_like_safe():
+    store = SqliteWallets(":memory:")
+    # Unescaped LIKE 'ref_of:%' would also match this key (`_` = any char).
+    store.kv_set("refXof:zzz", FRIEND)
+    store.kv_set("referral_rate", "0.05")
+    assert bind(store, USER, FRIEND) is True
+    n, _ = stats(store, FRIEND)
+    assert n == 1
+    assert bind(store, USER, FRIEND) is False
+    n, _ = stats(store, FRIEND)
+    assert n == 1
+    scanned = store.kv_scan("ref_of:")
+    assert "refXof:zzz" not in scanned
+    assert scanned.get(f"ref_of:{USER}") == FRIEND
 
 
 def test_credit_and_clawback_percent_of_spend():
@@ -122,6 +143,59 @@ def test_invite_link_and_start_binds():
         assert "Invite" in card.text
         assert invite_link("YCOTP_Bot", USER) in card.text
         assert "5%" in card.text
+        assert stats(store, FRIEND)[0] == 1
+        assert "Friends joined: 0" in card.text  # USER was referred, they invited nobody
+    finally:
+        ledger.close()
+
+
+def test_first_start_binds_even_if_note_user_ran_first():
+    """Live Telegram notes the user before text(); first invite must still bind."""
+    store = SqliteWallets(":memory:")
+    ui, _r, _p, ledger = _rig(store)
+    try:
+        set_enabled(store, True)
+        ui.note_user(USER)
+        ui.text(USER, f"/start r_{FRIEND}")
+        assert referrer_of(store, USER) == FRIEND
+        n, _ = stats(store, FRIEND)
+        assert n == 1
+    finally:
+        ledger.close()
+
+
+def test_existing_user_cannot_bind_via_later_invite():
+    store = SqliteWallets(":memory:")
+    ui, _r, _p, ledger = _rig(store)
+    try:
+        set_enabled(store, True)
+        ui.text(USER, "/start")
+        assert referrer_of(store, USER) == ""
+        ui.note_user(USER)
+        ui.text(USER, f"/start r_{FRIEND}")
+        assert referrer_of(store, USER) == ""
+        n, _ = stats(store, FRIEND)
+        assert n == 0
+    finally:
+        ledger.close()
+
+
+def test_restart_same_invite_does_not_recount():
+    store = SqliteWallets(":memory:")
+    ui, _r, _p, ledger = _rig(store)
+    try:
+        set_enabled(store, True)
+        ui.text(USER, f"/start r_{FRIEND}")
+        assert referrer_of(store, USER) == FRIEND
+        assert stats(store, FRIEND)[0] == 1
+        ui.note_user(USER)
+        ui.text(USER, f"/start r_{FRIEND}")
+        ui.note_user(USER)
+        ui.text(USER, f"/start r_{FRIEND}")
+        assert referrer_of(store, USER) == FRIEND
+        assert stats(store, FRIEND)[0] == 1
+        card = ui.button(FRIEND, "rf")
+        assert "Friends joined: 1" in card.text
     finally:
         ledger.close()
 

@@ -1,7 +1,9 @@
 """Percentage referral programme.
 
 A customer shares ``https://t.me/<bot>?start=r_<their_id>``. The first
-``/start`` with that payload binds them to the referrer (once, never self).
+``/start`` with that payload binds them to the referrer (once, never self,
+never an account that already used the bot). A later ``/start r_*`` — even
+after they delete the chat — does not rebind or recount Friends joined.
 When the referee's OTP or social-boost purchase succeeds, the referrer is
 credited ``rate × net spend`` (default 5%, hard cap 10%). A later refund
 claws the same share back. Bindings and payouts live in the wallet kv
@@ -148,7 +150,7 @@ def parse_start_payload(text: str) -> str:
     token = payload.strip()
     if token.lower().startswith("r_"):
         uid = token[2:].strip()
-        return uid if uid else ""
+        return uid if uid and uid.lstrip("-").isdigit() else ""
     # Bare ``r`` + digits (deep-link payloads cannot contain ``?``).
     if len(token) > 1 and token[0] in "rR" and token[1:].isdigit():
         return token[1:]
@@ -162,17 +164,47 @@ def referrer_of(store, user_id: str) -> str:
     return _kv_get(store, _BIND.format(uid)).strip()
 
 
-def bind(store, user_id: str, referrer_id: str) -> bool:
+def _is_telegram_id(value: str) -> bool:
+    s = str(value or "").strip()
+    return bool(s) and s.lstrip("-").isdigit()
+
+
+def _referee_id_from_key(key: str) -> str:
+    """``ref_of:{uid}`` or scoped ``{bot}:ref_of:{uid}`` → referee uid."""
+    k = str(key or "")
+    marker = "ref_of:"
+    i = k.rfind(marker)
+    if i < 0:
+        return ""
+    if i != 0 and k[i - 1] != ":":
+        return ""
+    return k[i + len(marker):]
+
+
+def bind(store, user_id: str, referrer_id: str, *, existing: bool = False) -> bool:
     """Bind ``user_id`` to ``referrer_id`` once. False if skipped.
 
-    Never overwrites an existing bind. Never binds self. Empty ids no-op.
+    Never overwrites an existing bind. Never binds self. Never binds an
+    account that already used the bot (``existing=True``). Empty / non-id
+    values no-op. Insert is write-if-absent so a race cannot recount.
     """
     uid = str(user_id or "").strip()
     ref = str(referrer_id or "").strip()
     if not uid or not ref or uid == ref:
         return False
+    if not _is_telegram_id(uid) or not _is_telegram_id(ref):
+        return False
+    if existing:
+        return False
     if referrer_of(store, uid):
         return False
+    insert = getattr(store, "kv_insert", None)
+    if callable(insert):
+        try:
+            return bool(insert(_BIND.format(uid), ref))
+        except Exception:  # noqa: BLE001
+            log.debug("referral kv_insert %s failed", uid, exc_info=True)
+            return False
     return _kv_set(store, _BIND.format(uid), ref)
 
 

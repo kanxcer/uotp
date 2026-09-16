@@ -268,6 +268,11 @@ class MenuUI:
         #: user_id -> (epoch, is_member). Short TTL so a join is picked up
         #: quickly without calling getChatMember on every tap.
         self._fs_cache: dict[str, tuple[float, bool]] = {}
+        #: Peek of ``user_exists`` taken *before* ``note_user``/``touch_user``
+        #: on this request. Telegram notes the user before ``text()``, so
+        #: without this stash a first ``/start r_*`` would look like an
+        #: existing customer and never bind.
+        self._known_before_touch: dict[str, bool] = {}
 
     def favourites_card(self, user_id: str) -> Reply:
         """⭐ Favourites: the services this customer starred, each buyable."""
@@ -341,8 +346,30 @@ class MenuUI:
             log.debug("touch_user failed for %s", user_id, exc_info=True)
 
     def note_user(self, user_id: str, username: str = "") -> None:
-        """Transport hook: record last-seen + Telegram username."""
+        """Transport hook: record last-seen + Telegram username.
+
+        Snapshots whether this id was already a customer *before* the upsert
+        so a first-ever ``/start r_*`` can still bind.
+        """
+        if user_id and user_id not in self._known_before_touch:
+            self._known_before_touch[user_id] = self._user_known(user_id)
         self._touch_user(user_id, username=username)
+
+    def _user_known(self, user_id: str) -> bool:
+        """True if this Telegram id has used the bot before this request."""
+        store = self._store
+        fn = getattr(store, "user_exists", None)
+        if not callable(fn) or not user_id:
+            return False
+        try:
+            return bool(fn(user_id))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _consume_known_before(self, user_id: str) -> bool:
+        if user_id in self._known_before_touch:
+            return self._known_before_touch.pop(user_id)
+        return self._user_known(user_id)
 
     _USERS_BTN_PAGE = 8
 
@@ -725,7 +752,8 @@ class MenuUI:
         self._updates_auto_memory = new
         return new
 
-    def _try_bind_referral(self, user_id: str, body: str) -> None:
+    def _try_bind_referral(self, user_id: str, body: str, *,
+                           existing: bool = False) -> None:
         from ..referral import bind, parse_start_payload
         ref = parse_start_payload(body)
         if not ref:
@@ -734,7 +762,7 @@ class MenuUI:
         if store is None:
             return
         try:
-            bind(store, user_id, ref)
+            bind(store, user_id, ref, existing=existing)
         except Exception:  # noqa: BLE001
             log.debug("referral bind failed", exc_info=True)
 
@@ -1453,6 +1481,13 @@ class MenuUI:
         """
         body = (body or "").strip()
         low = body.lower()
+        already = self._consume_known_before(user_id)
+        start_cmd = (low.split()[0].split("@", 1)[0] if low else "")
+        # Bind BEFORE touch_user and BEFORE the force-sub wall: a first
+        # ``/start r_*`` must attach even if they still have to join the
+        # channel, and an account that already used the bot must not.
+        if start_cmd == "/start":
+            self._try_bind_referral(user_id, body, existing=already)
         self._touch_user(user_id)
         # Owner kill-switch: non-owners are shut out of everything (the router's
         # _authorised also gates typed commands, but give a friendly message).
@@ -1480,10 +1515,7 @@ class MenuUI:
                    "⚙ owner panel", "owner panel"):
             self._wizard.pop(user_id, None)
             return self.admin_panel(user_id)
-        start_cmd = (low.split()[0].split("@", 1)[0] if low else "")
         if start_cmd in ("/start", "/help") or low in ("/start", "/help"):
-            if start_cmd == "/start":
-                self._try_bind_referral(user_id, body)
             self._wizard.pop(user_id, None)
             return self.main_menu(user_id)
         if low in ("/boost", "/smm", "social boost"):
@@ -2498,6 +2530,7 @@ class MenuUI:
 
     def photo(self, user_id: str, file_id: str) -> Reply:
         """A photo message arrives: payment screenshot, QR, or confusion."""
+        self._consume_known_before(user_id)
         self._touch_user(user_id)
         closed = self._bot_closed_reply(user_id)
         if closed is not None:
