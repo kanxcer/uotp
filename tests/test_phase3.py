@@ -214,6 +214,9 @@ def test_persistent_menu_labels_route():
     # Tapping "🧾 My Numbers" opens the history screen (case-insensitive).
     reply = ui.text(USER, "🧾 My Numbers")
     assert "No numbers yet" in reply.text or "Your numbers" in reply.text
+    assert "👥 Invite & earn".lower() in REPLY_MENU_LABELS_LOW
+    assert "🤖 Create my own clone".lower() in REPLY_MENU_LABELS_LOW
+    assert "🤖 Run your own bot".lower() in REPLY_MENU_LABELS_LOW
 
 
 # ── Welcome copy replaced (no "buttons at the bottom") ────────────────────

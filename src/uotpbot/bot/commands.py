@@ -619,7 +619,7 @@ class CommandRouter:
             fn = getattr(self, "createbot_enabled_fn", None)
             if callable(fn) and not fn():
                 return Reply(
-                    "🤖 'Run your own bot' is currently turned OFF by the owner. "
+                    "🤖 'Create my own clone' is currently turned OFF by the owner. "
                     "You can't create a clone right now.",
                     ok=False,
                 )
@@ -636,7 +636,7 @@ class CommandRouter:
             return self._delete_mybot(user_id, data[len(CB_DELOK_PREFIX):])
         if not self._createbot_flow.pending(user_id):
             return Reply(
-                "That menu has expired. Tap 🤖 Run your own bot to start again.",
+                "That menu has expired. Tap 🤖 Create my own clone to start again.",
                 ok=False,
             )
         return self._createbot_reply(self._createbot_flow.on_button(user_id, data))
@@ -1444,7 +1444,7 @@ class CommandRouter:
         fn = getattr(self, "createbot_enabled_fn", None)
         if callable(fn) and not fn():
             return Reply(
-                "🤖 'Run your own bot' is currently turned OFF by the owner. "
+                "🤖 'Create my own clone' is currently turned OFF by the owner. "
                 "You can't create a clone right now.\n\n"
                 "Existing clones keep working. Ask the owner to turn the "
                 "feature back on to create more.",

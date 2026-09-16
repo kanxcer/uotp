@@ -225,7 +225,7 @@ class CreateBotFlow:
     def hub(self) -> CreateBotResult:
         """Landing: My bots + Create/add. Does not start a pending session."""
         return CreateBotResult(
-            "🤖 Run your own bot\n\n"
+            "🤖 Create my own clone\n\n"
             "Clone this shop as your own Telegram bot. You pick an extra % "
             "on our selling price; customers pay through our UPI.\n\n"
             "📋 My bots — bots you already run.\n"
@@ -263,7 +263,7 @@ class CreateBotFlow:
         p = self._pending.get(owner_id)
         if p is None:
             return CreateBotResult(
-                "Tap 🤖 Run your own bot, then ➕ Create / add bot to start.",
+                "Tap 🤖 Create my own clone, then ➕ Create / add bot to start.",
                 finished=True,
             )
         text = text.strip()
@@ -368,7 +368,7 @@ class CreateBotFlow:
         p = self._pending.get(owner_id)
         if p is None:
             return CreateBotResult(
-                "That menu expired. Tap 🤖 Run your own bot, then ➕ Create / add bot.",
+                "That menu expired. Tap 🤖 Create my own clone, then ➕ Create / add bot.",
                 finished=True,
             )
         if data == CB_MARGIN_SUGGESTED or data.startswith("cb:createbot:margin:"):

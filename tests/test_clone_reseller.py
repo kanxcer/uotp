@@ -268,10 +268,10 @@ def test_clone_run_your_own_bot_follows_platform_switch():
     ui = MenuUI(router)
     try:
         assert ui.createbot_enabled() is False
-        assert ("🤖 Run your own bot", "cb") not in _labels(ui.main_menu("cust"))
+        assert ("🤖 Create my own clone", "cb") not in _labels(ui.main_menu("cust"))
         store.kv_set("feature_createbot", "1")
         assert ui.createbot_enabled() is True
-        assert ("🤖 Run your own bot", "cb") in _labels(ui.main_menu("cust"))
+        assert ("🤖 Create my own clone", "cb") in _labels(ui.main_menu("cust"))
         landing = ui.button("cust", "cb")
         labs = " ".join(l for l, _ in _labels(landing))
         assert "My bots" in labs
@@ -291,7 +291,7 @@ def test_clone_run_your_own_bot_follows_platform_switch():
         assert "a:cb" not in datas
         store.kv_set("feature_createbot", "0")
         assert ui.createbot_enabled() is False
-        assert ("🤖 Run your own bot", "cb") not in _labels(ui.main_menu("cust"))
+        assert ("🤖 Create my own clone", "cb") not in _labels(ui.main_menu("cust"))
         off = ui.text("cust", "/createbot")
         assert not off.ok
         assert "turned OFF" in off.text

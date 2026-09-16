@@ -249,6 +249,16 @@ def test_reply_menu_hides_admin_from_users():
     smm_labels = [lbl for row in reply_keyboard_rows(include_smm=True) for lbl, _ in row]
     assert _SOCIAL_BOOST_LABEL in smm_labels
     assert not any(_is_admin_label(lbl) for lbl in smm_labels)
+    from uotpbot.bot.ui import (
+        _INVITE_LABEL, _CLONE_LABEL, _CLONE_LABEL_LEGACY, REPLY_MENU_LABELS_LOW,
+    )
+    extra = reply_keyboard_rows(include_referral=True, include_createbot=True)
+    extra_labels = [lbl for row in extra for lbl, _ in row]
+    assert _INVITE_LABEL in extra_labels
+    assert _CLONE_LABEL in extra_labels
+    assert REPLY_MENU_LABELS_LOW[_INVITE_LABEL.lower()] == "rf"
+    assert REPLY_MENU_LABELS_LOW[_CLONE_LABEL.lower()] == "cb"
+    assert REPLY_MENU_LABELS_LOW[_CLONE_LABEL_LEGACY.lower()] == "cb"
 
 
 def test_validity_resume_naive_timestamp_is_tz_safe():
@@ -842,7 +852,7 @@ def test_admin_toggle_users_may_use_bot_blocks_customers(rig):
 
 
 def test_admin_toggle_clonebot_hides_and_blocks(rig):
-    """'Run your own bot' toggle: off hides the menu entry AND refuses a typed
+    """'Create my own clone' toggle: off hides the menu entry AND refuses a typed
     /createbot; on restores both. Defaults to on when the registry is present."""
     from unittest import mock
     ui, router, _provider, _ledger = rig
@@ -856,7 +866,7 @@ def test_admin_toggle_clonebot_hides_and_blocks(rig):
     # Cloning is OFF by default ("disable the bot cloning feature for users").
     assert ui.createbot_enabled() is False
     assert ui._can_createbot() is False
-    assert ("🤖 Run your own bot", "cb") not in all_buttons(ui.main_menu(USER))
+    assert ("🤖 Create my own clone", "cb") not in all_buttons(ui.main_menu(USER))
     # A typed /createbot does not bypass the switch.
     assert "turned OFF" in router.handle(USER, "/createbot").text
 
@@ -865,7 +875,7 @@ def test_admin_toggle_clonebot_hides_and_blocks(rig):
     assert "**ON**" in r.text
     assert ui.createbot_enabled() is True
     assert ui._can_createbot() is True
-    assert ("🤖 Run your own bot", "cb") in all_buttons(ui.main_menu(USER))
+    assert ("🤖 Create my own clone", "cb") in all_buttons(ui.main_menu(USER))
     landing = ui.button(USER, "cb")
     labs = " ".join(l for l, _ in all_buttons(landing))
     assert "My bots" in labs
@@ -881,7 +891,7 @@ def test_admin_toggle_clonebot_hides_and_blocks(rig):
     r2 = ui.button(OWNER, "a:cb")
     assert "**OFF**" in r2.text
     assert ui._can_createbot() is False
-    assert ("🤖 Run your own bot", "cb") not in all_buttons(ui.main_menu(USER))
+    assert ("🤖 Create my own clone", "cb") not in all_buttons(ui.main_menu(USER))
 
 
 def test_admin_panel_shows_total_users(rig):

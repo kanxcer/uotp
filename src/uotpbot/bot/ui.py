@@ -109,23 +109,46 @@ _REPLY_MENU: tuple[tuple[tuple[str, str], ...], ...] = (
 )
 #: Shown on the bottom keyboard only while Social boost is ON (shop + toggle).
 _SOCIAL_BOOST_LABEL = "📣 Social boost"
+#: Shown on the bottom keyboard while referral is ON.
+_INVITE_LABEL = "👥 Invite & earn"
+#: Shown on the bottom keyboard while clone-bot is ON.
+_CLONE_LABEL = "🤖 Create my own clone"
+#: Cached Telegram keyboards may still send the old clone label.
+_CLONE_LABEL_LEGACY = "🤖 Run your own bot"
 
-def reply_keyboard_rows(*, include_smm: bool = False
+def reply_keyboard_rows(*, include_smm: bool = False,
+                        include_referral: bool = False,
+                        include_createbot: bool = False
                         ) -> tuple[tuple[tuple[str, str], ...], ...]:
-    """Persistent keyboard rows. Social boost sits next to Buy when enabled."""
+    """Persistent keyboard rows. Extra keys appear only while their feature is ON."""
     if include_smm:
-        return (
+        rows: list[tuple[tuple[str, str], ...]] = [
             (("🛒 Buy Number", "l"), (_SOCIAL_BOOST_LABEL, "sm")),
             (("🧾 My Numbers", "o"), ("💰 Wallet", "w")),
             (("⭐ Favourites", "fav"), ("❓ Help", "h")),
             (("🆘 Support", "support"),),
-        )
-    return _REPLY_MENU
+        ]
+    else:
+        rows = [tuple(row) for row in _REPLY_MENU]
+    extras: list[tuple[str, str]] = []
+    if include_referral:
+        extras.append((_INVITE_LABEL, "rf"))
+    if include_createbot:
+        extras.append((_CLONE_LABEL, "cb"))
+    if extras:
+        if len(extras) == 1:
+            rows.append((extras[0],))
+        else:
+            rows.append((extras[0], extras[1]))
+    return tuple(rows)
 
 REPLY_MENU_LABELS: dict[str, str] = {
     label: cb for row in _REPLY_MENU for label, cb in row
 }
 REPLY_MENU_LABELS[_SOCIAL_BOOST_LABEL] = "sm"
+REPLY_MENU_LABELS[_INVITE_LABEL] = "rf"
+REPLY_MENU_LABELS[_CLONE_LABEL] = "cb"
+REPLY_MENU_LABELS[_CLONE_LABEL_LEGACY] = "cb"
 #: Case-insensitive lookup (a Telegram reply-keyboard press arrives lowercased).
 REPLY_MENU_LABELS_LOW: dict[str, str] = {
     label.lower(): cb for label, cb in REPLY_MENU_LABELS.items()
@@ -1535,7 +1558,7 @@ class MenuUI:
             (("🆘 Support", "support"),),
         ]
         if self._can_createbot():
-            rows.append((("🤖 Run your own bot", "cb"),))
+            rows.append(((_CLONE_LABEL, "cb"),))
         if self.router._is_owner(user_id):
             rows.append((("📊 Owner: profit & health", "a"),))
         count = len(self.catalog)
@@ -3575,10 +3598,10 @@ class MenuUI:
                     )
                 on = self._toggle_createbot()
                 text = (
-                    "✅ 'Run your own bot' is **ON** — owners can create clones "
+                    "✅ 'Create my own clone' is **ON** — owners can create clones "
                     "from the main menu / /createbot."
                     if on else
-                    "🤖 'Run your own bot' is **OFF** — nobody can create a new "
+                    "🤖 'Create my own clone' is **OFF** — nobody can create a new "
                     "clone right now. Existing clones keep working. Turn it back "
                     "on here to allow more."
                 )

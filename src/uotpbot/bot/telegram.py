@@ -159,7 +159,9 @@ except ImportError:  # pragma: no cover
 
 
 def _reply_menu_markup(include_admin: bool = False,
-                      include_smm: bool = False) -> object:
+                      include_smm: bool = False,
+                      include_referral: bool = False,
+                      include_createbot: bool = False) -> object:
     """The always-visible bottom menu (ReplyKeyboardMarkup).
 
     Lives at the bottom of the chat so a customer never has to type. Only one
@@ -172,13 +174,18 @@ def _reply_menu_markup(include_admin: bool = False,
     non-owner (customers must never see an owner screen). The routing still
     re-checks ownership, so even a crafted press goes nowhere.
 
-    ``include_smm`` adds 📣 Social boost when the owner has the shop on.
+    Extra keys (Social boost / Invite / Create clone) follow their owner
+    toggles, matching the inline main menu.
     """
     if not HAS_TELEGRAM:
         return None
     from telegram import KeyboardButton, ReplyKeyboardMarkup
 
-    source = reply_keyboard_rows(include_smm=include_smm)
+    source = reply_keyboard_rows(
+        include_smm=include_smm,
+        include_referral=include_referral,
+        include_createbot=include_createbot,
+    )
     rows = [row for row in source
             if include_admin or all(not _is_admin_label(label) for label, _cb in row)]
     return ReplyKeyboardMarkup(
@@ -741,6 +748,11 @@ class TelegramFrontend:
                 return
             chat_id = getattr(getattr(sent, "chat", None), "id", None)
             message_id = getattr(sent, "message_id", None)
+            if chat_id is None or message_id is None:
+                log.warning("QR sent for %s but reply_photo returned no chat/message id",
+                            order_id)
+                return
+            self.ui.remember_fg_message(order_id, chat_)
             if chat_id is None or message_id is None:
                 log.warning("QR sent for %s but reply_photo returned no chat/message id",
                             order_id)

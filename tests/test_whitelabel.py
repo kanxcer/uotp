@@ -1055,7 +1055,7 @@ def test_createbot_command_opens_hub_not_token_paste():
         assert any("Back" in l for l, _ in
                    [item for row in (mine.rows or ()) for item in row])
         back = router.handle_callback("111", CB_HUB_BACK)
-        assert "Run your own bot" in back.text
+        assert "Create my own clone" in back.text
     finally:
         ledger.close()
 
