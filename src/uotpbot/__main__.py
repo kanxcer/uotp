@@ -690,6 +690,17 @@ class WhiteLabel:
     on_created: Optional[Callable[[object], None]] = None
 
 
+def _clone_username(token: str) -> str:
+    """Public @username for a clone token (getMe). Empty on failure."""
+    if not token:
+        return ""
+    try:
+        from .createbot import platform_username_from_token
+        return (platform_username_from_token(token) or "").lstrip("@")
+    except Exception:  # noqa: BLE001 - invite card can retry later
+        return ""
+
+
 def _make_whitelabel(settings: Settings, catalog, ledger, pricer, wallets,
                      updates_poster=None, smm_box=None) -> Optional[WhiteLabel]:
     """Build the sub-bot registry and manager, or None when disabled."""
@@ -760,6 +771,7 @@ def _make_whitelabel(settings: Settings, catalog, ledger, pricer, wallets,
             subbot_manager=mgr,
             platform_fee=_platform_fee(settings),
             platform_bot_username=platform_username,
+            clone_bot_username=_clone_username(bot.bot_token),
         )
         router.on_bot_created = _on_created
         router.updates_poster = updates_poster

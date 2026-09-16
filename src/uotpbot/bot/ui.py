@@ -752,6 +752,33 @@ class MenuUI:
         self._updates_auto_memory = new
         return new
 
+    def _invite_handle(self) -> str:
+        """Public @username of *this* bot (clone or platform), no @.
+
+        Clone invite links must open the clone, not YC OTP. Username is
+        cached on the router; if missing we resolve it once from the clone
+        token (getMe) and remember it.
+        """
+        if self._is_clone:
+            handle = (getattr(self.router, "clone_bot_username", "") or "").lstrip("@")
+            if handle:
+                return handle
+            token = getattr(self.router, "clone_bot_token", "") or ""
+            if not token:
+                return ""
+            try:
+                from ..createbot import platform_username_from_token
+                handle = (platform_username_from_token(token) or "").lstrip("@")
+            except Exception:  # noqa: BLE001 - never block the card
+                handle = ""
+            if handle:
+                try:
+                    self.router.clone_bot_username = handle
+                except Exception:  # noqa: BLE001
+                    pass
+            return handle
+        return (getattr(self.router, "platform_bot_username", "") or "").lstrip("@")
+
     def _try_bind_referral(self, user_id: str, body: str, *,
                            existing: bool = False) -> None:
         from ..referral import bind, parse_start_payload
@@ -775,12 +802,8 @@ class MenuUI:
                 ok=False, rows=((("🏠 Menu", "m"),),),
             )
         rate = self.referral_rate()
-        handle = (getattr(self.router, "platform_bot_username", "") or "").lstrip("@")
-        if self._is_clone:
-            # Clone deep-links must open THIS bot, not the platform one.
-            handle = ""
+        handle = self._invite_handle()
         link = invite_link(handle, user_id)
-        start_cmd = f"/start r_{user_id}"
         store = self._store_for_kv()
         n, earned = (0, None)
         if store is not None:
@@ -793,10 +816,9 @@ class MenuUI:
         share = (
             f"Your link:\n`{link}`\n\n"
             if link else
-            f"Share this with friends — they open this bot and send:\n`{start_cmd}`\n\n"
+            "Share this bot with friends. They must open this same bot "
+            "so the invite counts.\n\n"
         )
-        if link:
-            share += f"Or they send `{start_cmd}` after opening the bot.\n\n"
         return Reply(
             "👥 Invite & earn\n\n"
             f"You earn {rate:.0%} of every number or social boost a friend "

@@ -138,6 +138,7 @@ class CommandRouter:
         clone_bot_token: str = "",
         platform_bot_token: str = "",
         platform_bot_username: str = "",
+        clone_bot_username: str = "",
         bot_profile_applier=None,
     ) -> None:
         self.engine = engine
@@ -181,6 +182,8 @@ class CommandRouter:
         self.platform_owner_id = platform_owner_id or ""
         self.margin_fee_rate = _Dec(margin_fee_rate if margin_fee_rate is not None else "0.05")
         self.clone_bot_token = clone_bot_token or ""
+        #: This clone's public @username (no @). Empty on the platform bot.
+        self.clone_bot_username = (clone_bot_username or "").lstrip("@")
         #: Platform (YC OTP) bot token. Clone payout *requests* must ping
         #: the platform owner on this bot, not on the clone.
         self.platform_bot_token = platform_bot_token or ""

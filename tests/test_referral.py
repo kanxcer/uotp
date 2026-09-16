@@ -145,6 +145,8 @@ def test_invite_link_and_start_binds():
         assert "5%" in card.text
         assert stats(store, FRIEND)[0] == 1
         assert "Friends joined: 0" in card.text  # USER was referred, they invited nobody
+        assert "Or they send" not in card.text
+        assert "`/start" not in card.text
     finally:
         ledger.close()
 
@@ -196,6 +198,24 @@ def test_restart_same_invite_does_not_recount():
         assert stats(store, FRIEND)[0] == 1
         card = ui.button(FRIEND, "rf")
         assert "Friends joined: 1" in card.text
+    finally:
+        ledger.close()
+
+
+def test_clone_invite_card_uses_clone_username_not_platform():
+    store = SqliteWallets(":memory:")
+    ui, router, _p, ledger = _rig(store)
+    try:
+        set_enabled(store, True)
+        router.is_clone = True
+        router.clone_bot_username = "MyCloneBot"
+        router.platform_bot_username = "YCOTP_Bot"
+        card = ui.button(USER, "rf")
+        assert card.ok
+        assert invite_link("MyCloneBot", USER) in card.text
+        assert "YCOTP_Bot" not in card.text
+        assert "Or they send" not in card.text
+        assert "`/start" not in card.text
     finally:
         ledger.close()
 
