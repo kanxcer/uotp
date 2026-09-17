@@ -62,6 +62,32 @@ class WalletStore:
         return {}
 
 
+def claim_kv(store, key: str, value: str = "1") -> bool:
+    """True only for the first writer of ``key``.
+
+    FamGateway credits (webhook + sweep + Check status) must claim
+    ``fg_credited:<order>`` *before* ``adjust``. A get-then-set check races:
+    two paths both see empty, both add money, both post the deposit. ``kv_insert``
+    is INSERT … ON CONFLICT DO NOTHING, so the database is the lock.
+    """
+    if store is None or not key:
+        return False
+    insert = getattr(store, "kv_insert", None)
+    if callable(insert):
+        try:
+            return bool(insert(key, value))
+        except Exception:  # noqa: BLE001
+            return False
+    get = getattr(store, "kv_get", None)
+    set_ = getattr(store, "kv_set", None)
+    if callable(get) and get(key):
+        return False
+    if callable(set_):
+        set_(key, value)
+        return True
+    return False
+
+
 class ScopedWallets(WalletStore):
     """One bot's view of a shared wallet store.
 

@@ -143,15 +143,21 @@ def _make_poller(settings: Settings, router_factory, *, owner_alert=None,
 
 def _credit_fg_wallet(store, uid: str, order_id: str, amount_dec, *, notifier=None,
                       updates=None) -> bool:
-    """Atomically credit ``amount_dec`` rupees to ``uid`` and mark the order
-    credited. Returns True on success. Idempotent: callers check the
-    ``fg_credited:<order>`` marker first; the marker is (re)set here so two
-    paths (webhook + sweep) can never double-credit."""
+    """Credit ``amount_dec`` rupees to ``uid`` once per order.
+
+    Claims ``fg_credited:<order>`` *before* the wallet adjust so webhook,
+    sweep, and Check status cannot all pay the same UPI. Returns True when
+    this call credited *or* the order was already claimed (idempotent).
+    """
     from decimal import Decimal
     from .money import Money
+    from .wallets import claim_kv
 
     try:
         money = Money(int(amount_dec * Decimal(100)))
+        if not claim_kv(store, f"fg_credited:{order_id}"):
+            log.info("FamGateway order %s already credited; skip", order_id)
+            return True
         get_ = getattr(store, "kv_get", None)
         scope = ""
         if callable(get_):
@@ -164,9 +170,6 @@ def _credit_fg_wallet(store, uid: str, order_id: str, amount_dec, *, notifier=No
             store.adjust(wallet_uid, money, kind="deposit", note="FamPay")
         except TypeError:
             store.adjust(wallet_uid, money)
-        set_ = getattr(store, "kv_set", None)
-        if callable(set_):
-            set_(f"fg_credited:{order_id}", "1")
         touch = getattr(store, "touch_user", None)
         if callable(touch):
             try:

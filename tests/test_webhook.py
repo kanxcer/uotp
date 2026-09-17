@@ -23,6 +23,93 @@ def _sig(key, body):
     return hmac.new(key.encode(), body, hashlib.sha256).hexdigest()
 
 
+def test_credit_claim_beats_webhook_sweep_and_check_status():
+    """Live bug: ₹10 paid once, wallet +₹20, channel posted twice.
+
+    Webhook, sweep, and Check status all did get-then-credit-then-mark.
+    Two of them could pass the get before either wrote fg_credited.
+    The claim must land *before* adjust.
+    """
+    import threading
+    from uotpbot.wallets import claim_kv
+
+    wallets = SqliteWallets(":memory:")
+    wallets.kv_set("fg_order:fg_RACE", "222")
+    wallets.kv_set("fg_amt:fg_RACE", "10")
+    posts = []
+
+    class _Updates:
+        bot_username = "YCOTP_Bot"
+        def post(self, text):
+            posts.append(text)
+
+    barrier = threading.Barrier(8)
+    errors = []
+
+    def worker():
+        try:
+            barrier.wait(timeout=5)
+            _credit_fg_wallet(
+                wallets, "222", "fg_RACE", Decimal("10"), updates=_Updates())
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+    assert not errors
+    assert wallets.balance("222") == Money(1000), "₹10 once, not ₹80"
+    assert wallets.kv_get("fg_credited:fg_RACE") == "1"
+    assert len(posts) == 1, posts
+    assert "10" in posts[0]
+    assert not claim_kv(wallets, "fg_credited:fg_RACE")
+
+
+def test_check_status_and_webhook_share_the_claim():
+    """Customer taps Check status in the same second the webhook lands."""
+    from uotpbot.bot.commands import CommandRouter
+    from uotpbot.bot.ui import MenuUI
+    from uotpbot.catalog import Catalog, ServiceCost, WalletPack
+    from uotpbot.engine import BotEngine, EngineConfig
+    from uotpbot.ledger import Ledger
+    from uotpbot.money import INR
+    from uotpbot.pricing import Pricer
+    from uotpbot.provider.mock import MockProvider
+
+    catalog = Catalog(
+        {"x": ServiceCost("x", "X", "other", INR(10), Decimal("1"), Decimal("0"), Decimal("1"))},
+        (WalletPack("P", INR(100), INR(100)),),
+    )
+    ledger = Ledger()
+    pricer = Pricer(catalog)
+    engine = BotEngine(
+        catalog, MockProvider({}, balance=INR(0)), ledger, pricer,
+        config=EngineConfig(),
+    )
+    wallets = SqliteWallets(":memory:")
+    router = CommandRouter(
+        engine, catalog, pricer, ledger, owner_id="111", wallets=wallets)
+    ui = MenuUI(router)
+    wallets.kv_set("fg_order:fg_BOTH", "222")
+    wallets.kv_set("fg_amt:fg_BOTH", "10")
+    posts = []
+    ui._post_update = lambda text: posts.append(text)  # type: ignore[method-assign]
+    try:
+        tap = ui._credit_fg_order("222", "fg_BOTH", Decimal("10"))
+        assert tap.ok
+        hook = _credit_fg_wallet(wallets, "222", "fg_BOTH", Decimal("10"))
+        assert hook is True
+        assert wallets.balance("222") == Money(1000)
+        assert len(posts) == 1
+        again = ui._credit_fg_order("222", "fg_BOTH", Decimal("10"))
+        assert "already credited" in again.text.lower()
+        assert wallets.balance("222") == Money(1000)
+    finally:
+        ledger.close()
+
+
 def test_webhook_credits_and_is_idempotent():
     wallets = SqliteWallets(":memory:")
     settings = _settings()

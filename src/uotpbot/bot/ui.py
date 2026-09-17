@@ -2524,29 +2524,26 @@ class MenuUI:
     def _credit_fg_order(self, uid: str, order_id: str, amount: Decimal) -> Reply:
         """Idempotently credit an order. Returns a success/failure Reply.
 
-        Uses the wallet's atomic ``adjust`` and the ``kv`` record so a repeated
-        check (or a duplicate webhook) can never double-credit.
+        Claims ``fg_credited:<order>`` *before* money moves, same lock as the
+        webhook and sweep, so Check status cannot double-pay a live webhook.
         """
         store = self._fg_store() or self._store
         if store is None:
             return Reply("Wallet is offline right now.", ok=False)
+        from ..wallets import claim_kv
+        key = f"fg_credited:{order_id}"
+        if not claim_kv(store, key):
+            return Reply(
+                "✅ Already credited — no double charge. Your balance is "
+                f"{self.router.balance_of(uid)}.",
+                ok=True, rows=((("💰 Balance", "w"), (("🏠 Menu", "m"),)),),
+            )
         try:
-            key = f"fg_credited:{order_id}"
-            get = getattr(store, "kv_get", None)
-            set_ = getattr(store, "kv_set", None)
-            if callable(get) and callable(set_) and get(key):
-                return Reply(
-                    "✅ Already credited — no double charge. Your balance is "
-                    f"{self.router.balance_of(uid)}.",
-                    ok=True, rows=((("💰 Balance", "w"), (("🏠 Menu", "m"),)),),
-                )
             money = Money(int(amount * Decimal(100)))
             try:
                 self.router.credit(uid, money, kind="deposit", note="FamPay")
             except TypeError:
                 self.router.credit(uid, money)
-            if callable(set_):
-                set_(key, "1")
             self._touch_user(uid)
             self._fg_orders.pop(order_id, None)
             # Edit the QR message the customer was looking at to a success note
