@@ -423,6 +423,9 @@ class CreateBotFlow:
                 finished=True,
                 rows=[(("➕ Create / add bot", CB_HUB_ADD),)],
             )
+        handle = str(info or "").strip().lstrip("@")
+        if handle and handle != "?":
+            p.bot.bot_username = handle
         try:
             self._registry.add(p.bot)
         except Exception as exc:  # noqa: BLE001

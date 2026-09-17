@@ -316,12 +316,14 @@ def test_main_admin_lists_every_clone_with_owner_and_stats():
         owner_id="ownerA", bot_token=GOOD_TOKEN,
         mode=SubBotMode.PLATFORM_API, fee=DEFAULT_PLATFORM_FEE,
         reseller_rate=Decimal("0.38"),
+        bot_username="CloneAlpha",
     )
     b = SubBot(
         owner_id="ownerB",
         bot_token="987654321:AAG9876543210zyxwvutsrqponmlkjihgfedc",
         mode=SubBotMode.PLATFORM_API, fee=DEFAULT_PLATFORM_FEE,
         reseller_rate=Decimal("0.20"),
+        bot_username="CloneBeta",
     )
     registry.add(a)
     registry.add(b)
@@ -340,18 +342,23 @@ def test_main_admin_lists_every_clone_with_owner_and_stats():
         assert listing.ok
         assert "ownerA" in listing.text
         assert "ownerB" in listing.text
+        assert "@CloneAlpha" in listing.text
+        assert "@CloneBeta" in listing.text
         ldata = [d for row in (listing.rows or ()) for _l, d in row]
         assert not any(str(d).startswith("url:tg://") for d in ldata)
+        assert "url:https://t.me/CloneAlpha" in ldata
+        assert "url:https://t.me/CloneBeta" in ldata
         assert any(str(d).startswith("a:cld:") for d in ldata)
         assert "38%" in listing.text
         assert "20%" in listing.text
-        assert a.id[:8] in listing.text
         assert a.bot_token not in listing.text
         detail = ui.button("platform-owner", f"a:cld:{a.id}")
         assert detail.ok
         assert "ownerA" in detail.text
+        assert "@CloneAlpha" in detail.text
         ddata = [d for row in (detail.rows or ()) for _l, d in row]
         assert not any(str(d).startswith("url:tg://") for d in ddata)
+        assert "url:https://t.me/CloneAlpha" in ddata
         assert "38%" in detail.text
         assert a.bot_token not in detail.text
         assert "a:clr:" + a.id in {d for row in (detail.rows or ()) for _l, d in row}
@@ -368,6 +375,45 @@ def test_main_admin_lists_every_clone_with_owner_and_stats():
         clone_panel = clone_ui.admin_panel("ownerA")
         datas = {d for row in (clone_panel.rows or ()) for _l, d in row}
         assert "a:cl" not in datas
+    finally:
+        ledger.close()
+
+
+def test_clone_list_omits_open_button_without_username():
+    """No @username → no t.me button (empty URL would kill the whole keyboard)."""
+    catalog = Catalog({
+        "blinkit": ServiceCost(
+            "blinkit", "Blinkit", "food", INR(10),
+            Decimal("0.94"), Decimal("0.04"), Decimal("0.95"),
+        ),
+    }, (WalletPack("Pro", INR(1000), INR(1150)),))
+    ledger = Ledger()
+    pricer = Pricer(catalog)
+    provider = MockProvider({"blinkit": INR(10)}, balance=INR(5000), seed=3)
+    engine = BotEngine(catalog, provider, ledger, pricer)
+    store = SqliteWallets(":memory:")
+    registry = SubBotRegistry()
+    clone = SubBot(
+        owner_id="ownerA", bot_token=GOOD_TOKEN,
+        mode=SubBotMode.PLATFORM_API, fee=DEFAULT_PLATFORM_FEE,
+        reseller_rate=Decimal("0.38"),
+    )
+    registry.add(clone)
+    router = CommandRouter(
+        engine, catalog, pricer, ledger, owner_id="platform-owner",
+        wallets=store, subbots=registry, platform_fee=DEFAULT_PLATFORM_FEE,
+    )
+    ui = MenuUI(router)
+    try:
+        listing = ui.button("platform-owner", "a:cl")
+        ldata = [d for row in (listing.rows or ()) for _l, d in row]
+        assert not any(str(d).startswith("url:") for d in ldata)
+        assert clone.id[:8] in listing.text or clone.id in listing.text
+        detail = ui.button("platform-owner", f"a:cld:{clone.id}")
+        ddata = [d for row in (detail.rows or ()) for _l, d in row]
+        assert not any(str(d).startswith("url:") for d in ddata)
+        assert "Open clone" not in " ".join(
+            l for row in (detail.rows or ()) for l, _ in row)
     finally:
         ledger.close()
 

@@ -93,7 +93,8 @@ CREATE TABLE IF NOT EXISTS subbots (
     disclosure     TEXT    NOT NULL,
     created_at     TEXT    NOT NULL,
     active         INTEGER NOT NULL DEFAULT 1,
-    reseller_rate  TEXT    NOT NULL DEFAULT '0'
+    reseller_rate  TEXT    NOT NULL DEFAULT '0',
+    bot_username   TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_subbots_owner ON subbots(owner_id);
 """
@@ -162,6 +163,8 @@ class SubBot:
         default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds")
     )
     active: bool = True
+    #: Public Telegram @username (no @). Empty until getMe / create-time verify.
+    bot_username: str = ""
 
     def __post_init__(self) -> None:
         if not self.bot_token:
@@ -179,6 +182,10 @@ class SubBot:
             raise WhiteLabelError(
                 f"reseller extra must be in [0, 2], got {self.reseller_rate}"
             )
+        handle = (self.bot_username or "").strip().lstrip("@")
+        if handle == "?":
+            handle = ""
+        object.__setattr__(self, "bot_username", handle)
         if not self.disclosure:
             self.disclosure = self.fee_disclosure()
 
@@ -297,6 +304,10 @@ class SubBotRegistry:
             self._conn.execute(
                 "ALTER TABLE subbots ADD COLUMN reseller_rate TEXT NOT NULL DEFAULT '0'"
             )
+        if cols and "bot_username" not in cols:
+            self._conn.execute(
+                "ALTER TABLE subbots ADD COLUMN bot_username TEXT NOT NULL DEFAULT ''"
+            )
 
     def close(self) -> None:
         with self._lock:
@@ -352,12 +363,14 @@ class SubBotRegistry:
         self._write(
             "INSERT INTO {t} (id, owner_id, bot_token, mode, provider_key, "
             "provider_url, fee_rate, fee_fixed_p, disclosed_at, disclosure, "
-            "created_at, active, reseller_rate) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "created_at, active, reseller_rate, bot_username) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 bot.id, bot.owner_id, self._enc(bot.bot_token), bot.mode.value,
                 self._enc(bot.provider_key), bot.provider_url, str(bot.fee.rate),
                 bot.fee.fixed.paise, bot.disclosed_at, bot.disclosure,
                 bot.created_at, int(bot.active), str(bot.reseller_rate),
+                (bot.bot_username or "").lstrip("@"),
             ),
         )
         return bot
@@ -366,6 +379,13 @@ class SubBotRegistry:
         self._write(
             "UPDATE {t} SET active = ? WHERE id = ?", (int(active), bot_id)
         )
+
+    def set_username(self, bot_id: str, username: str) -> None:
+        """Persist a clone's public @username (no @). Never stores '?'."""
+        name = (username or "").strip().lstrip("@")
+        if name == "?":
+            name = ""
+        self._write("UPDATE {t} SET bot_username = ? WHERE id = ?", (name, bot_id))
 
     def delete(self, bot_id: str) -> bool:
         return self._write("DELETE FROM {t} WHERE id = ?", (bot_id,)) > 0
@@ -378,6 +398,11 @@ class SubBotRegistry:
                 reseller = Decimal(str(row[12]))
             except ArithmeticError:
                 reseller = Decimal("0")
+        username = ""
+        if len(row) > 13 and row[13] not in (None, ""):
+            username = str(row[13]).strip().lstrip("@")
+            if username == "?":
+                username = ""
         return SubBot(
             id=row[0], owner_id=row[1], bot_token=self._dec(row[2]),
             mode=SubBotMode(row[3]),
@@ -386,11 +411,12 @@ class SubBotRegistry:
             disclosed_at=row[8], disclosure=row[9], created_at=row[10],
             active=bool(row[11]),
             reseller_rate=reseller,
+            bot_username=username,
         )
 
     _COLS = ("id, owner_id, bot_token, mode, provider_key, provider_url, "
              "fee_rate, fee_fixed_p, disclosed_at, disclosure, created_at, "
-             "active, reseller_rate")
+             "active, reseller_rate, bot_username")
 
     def find_by_token(self, token: str) -> Optional[SubBot]:
         """Find a registered bot by its (plaintext) Telegram token.

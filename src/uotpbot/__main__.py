@@ -701,6 +701,20 @@ def _clone_username(token: str) -> str:
         return ""
 
 
+def _remember_clone_username(registry, bot) -> str:
+    """Return this clone's @username, persisting getMe when the row is empty."""
+    handle = (getattr(bot, "bot_username", "") or "").strip().lstrip("@")
+    if handle in {"", "?"}:
+        handle = _clone_username(getattr(bot, "bot_token", "") or "")
+        if handle:
+            try:
+                registry.set_username(bot.id, handle)
+                bot.bot_username = handle
+            except Exception:  # noqa: BLE001 - list can still use the live value
+                log.debug("could not persist clone username for %s", bot.id, exc_info=True)
+    return handle
+
+
 def _make_whitelabel(settings: Settings, catalog, ledger, pricer, wallets,
                      updates_poster=None, smm_box=None) -> Optional[WhiteLabel]:
     """Build the sub-bot registry and manager, or None when disabled."""

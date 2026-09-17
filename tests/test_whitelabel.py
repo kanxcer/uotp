@@ -280,10 +280,13 @@ def test_registry_round_trips_both_modes(tmp_path):
     assert found.disclosure == own.disclosure  # terms survive a restart
     plat = SubBot(owner_id="u2", bot_token=GOOD_TOKEN_2,
                   mode=SubBotMode.PLATFORM_API, fee=DEFAULT_PLATFORM_FEE,
-                  reseller_rate=Decimal("0.38"))
+                  reseller_rate=Decimal("0.38"), bot_username="ClonePlat")
     reopened.add(plat)
     again = reopened.find(plat.id)
     assert again.reseller_rate == Decimal("0.38")
+    assert again.bot_username == "ClonePlat"
+    reopened.set_username(plat.id, "@NewHandle")
+    assert reopened.find(plat.id).bot_username == "NewHandle"
     reopened.close()
 
 

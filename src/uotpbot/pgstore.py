@@ -290,7 +290,8 @@ CREATE TABLE IF NOT EXISTS {t} (
     disclosure     TEXT   NOT NULL,
     created_at     TEXT   NOT NULL,
     active         BIGINT NOT NULL DEFAULT 1,
-    reseller_rate  TEXT   NOT NULL DEFAULT '0'
+    reseller_rate  TEXT   NOT NULL DEFAULT '0',
+    bot_username   TEXT   NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_subbots_owner ON {t} (owner_id);
 """
@@ -376,6 +377,13 @@ class PostgresRegistry(SubBotRegistry):
                 self._conn.execute(
                     f"ALTER TABLE {self._table} "
                     "ADD COLUMN IF NOT EXISTS reseller_rate TEXT NOT NULL DEFAULT '0'"
+                )
+            except Exception:  # noqa: BLE001 - column already there
+                pass
+            try:
+                self._conn.execute(
+                    f"ALTER TABLE {self._table} "
+                    "ADD COLUMN IF NOT EXISTS bot_username TEXT NOT NULL DEFAULT ''"
                 )
             except Exception:  # noqa: BLE001 - column already there
                 pass

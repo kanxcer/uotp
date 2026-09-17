@@ -397,6 +397,16 @@ class MenuUI:
             return f"url:https://t.me/{handle}"
         return ""
 
+    @staticmethod
+    def _clone_bot_handle(bot) -> str:
+        """Public @username of a clone bot (no @), or empty."""
+        handle = (getattr(bot, "bot_username", "") or "").strip().lstrip("@")
+        if handle in {"", "?"}:
+            return ""
+        if all(c.isalnum() or c == "_" for c in handle):
+            return handle
+        return ""
+
     @property
     def support_contact(self) -> str:
         """The support username customers see, live-editable by the owner.
@@ -2956,15 +2966,23 @@ class MenuUI:
             created = (getattr(b, "created_at", None) or "")[:10]
             user_bit = f"{users_n} users" if users_n is not None else "users n/a"
             float_bit = f" · float {float_held}" if float_held is not None else ""
+            handle = self._clone_bot_handle(b)
+            shown = f"@{handle}" if handle else f"`{b.id}`"
             lines.append(
-                f"{mark} `{b.id}` · extra {extra_s}\n"
+                f"{mark} {shown} · extra {extra_s}\n"
                 f"   owner `{b.owner_id}` · {user_bit}{float_bit}\n"
                 f"   {state} · {created} · earnings {earn}"
             )
-            rows.append((
-                (f"👁 {b.id[:8]}", f"a:cld:{b.id}"),
-                ("👤 Owner", self._tg_profile_url(b.owner_id)),
-            ))
+            row: list[tuple[str, str]] = [
+                (f"👁 {handle or b.id[:8]}", f"a:cld:{b.id}"),
+            ]
+            open_bot = self._tg_profile_url("", handle)
+            if open_bot:
+                row.append(("🤖 Open", open_bot))
+            owner_url = self._tg_profile_url(b.owner_id)
+            if owner_url:
+                row.append(("👤 Owner", owner_url))
+            rows.append(tuple(row))
         nav: list[tuple[str, str]] = []
         if page > 0:
             nav.append(("◀️ Prev", f"a:cl:{page - 1}"))
@@ -3027,13 +3045,21 @@ class MenuUI:
             else "own API"
         )
         crows: list[tuple[tuple[str, str], ...]] = []
+        handle = self._clone_bot_handle(bot)
+        open_bot = self._tg_profile_url("", handle)
+        if open_bot:
+            crows.append((("🤖 Open clone", open_bot),))
         owner_url = self._tg_profile_url(bot.owner_id)
         if owner_url:
             crows.append((("👤 Open owner", owner_url),))
         crows.append((("🔄 Restart", f"a:clr:{bot.id}"),))
         crows.append((("◀️ Clone bots", "a:cl"), ("◀️ Owner panel", "a")))
+        title = f"@{handle}" if handle else f"`{bot.id}`"
+        handle_line = f"Bot: @{handle}\n" if handle else ""
         return Reply(
-            f"🤖 Clone `{bot.id}`\n\n"
+            f"🤖 Clone {title}\n"
+            f"`{bot.id}`\n\n"
+            f"{handle_line}"
             f"Owner: `{bot.owner_id}`\n"
             f"Extra: {extra_s} (we keep 5% of that extra)\n"
             f"Status: {mark} {state}\n"
