@@ -379,6 +379,46 @@ def test_main_admin_lists_every_clone_with_owner_and_stats():
         ledger.close()
 
 
+def test_clone_list_fills_missing_username_from_lookup():
+    """Existing clones with empty bot_username still get @handle + Open."""
+    catalog = Catalog({
+        "blinkit": ServiceCost(
+            "blinkit", "Blinkit", "food", INR(10),
+            Decimal("0.94"), Decimal("0.04"), Decimal("0.95"),
+        ),
+    }, (WalletPack("Pro", INR(1000), INR(1150)),))
+    ledger = Ledger()
+    pricer = Pricer(catalog)
+    provider = MockProvider({"blinkit": INR(10)}, balance=INR(5000), seed=3)
+    engine = BotEngine(catalog, provider, ledger, pricer)
+    store = SqliteWallets(":memory:")
+    registry = SubBotRegistry()
+    clone = SubBot(
+        owner_id="ownerA", bot_token=GOOD_TOKEN,
+        mode=SubBotMode.PLATFORM_API, fee=DEFAULT_PLATFORM_FEE,
+        reseller_rate=Decimal("0.38"),
+    )
+    registry.add(clone)
+    router = CommandRouter(
+        engine, catalog, pricer, ledger, owner_id="platform-owner",
+        wallets=store, subbots=registry, platform_fee=DEFAULT_PLATFORM_FEE,
+    )
+    ui = MenuUI(router)
+    ui.clone_username_fn = lambda token: "LiveCloneBot"
+    try:
+        listing = ui.button("platform-owner", "a:cl")
+        assert "@LiveCloneBot" in listing.text
+        ldata = [d for row in (listing.rows or ()) for _l, d in row]
+        assert "url:https://t.me/LiveCloneBot" in ldata
+        assert registry.find(clone.id).bot_username == "LiveCloneBot"
+        detail = ui.button("platform-owner", f"a:cld:{clone.id}")
+        assert "@LiveCloneBot" in detail.text
+        assert "url:https://t.me/LiveCloneBot" in [
+            d for row in (detail.rows or ()) for _l, d in row]
+    finally:
+        ledger.close()
+
+
 def test_clone_list_omits_open_button_without_username():
     """No @username → no t.me button (empty URL would kill the whole keyboard)."""
     catalog = Catalog({
@@ -404,6 +444,7 @@ def test_clone_list_omits_open_button_without_username():
         wallets=store, subbots=registry, platform_fee=DEFAULT_PLATFORM_FEE,
     )
     ui = MenuUI(router)
+    ui.clone_username_fn = False
     try:
         listing = ui.button("platform-owner", "a:cl")
         ldata = [d for row in (listing.rows or ()) for _l, d in row]
@@ -456,6 +497,7 @@ def test_clone_list_hides_stale_crash_when_poller_is_live():
         subbot_manager=_Mgr(),
     )
     ui = MenuUI(router)
+    ui.clone_username_fn = False
     try:
         listing = ui.button("platform-owner", "a:cl")
         assert listing.ok

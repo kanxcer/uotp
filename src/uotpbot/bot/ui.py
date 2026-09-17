@@ -407,6 +407,47 @@ class MenuUI:
             return handle
         return ""
 
+    def _ensure_clone_username(self, bot) -> str:
+        """Stored @username, else getMe + persist. Tests stub ``clone_username_fn``.
+
+        ``clone_username_fn``: callable(token)->name, ``False`` to skip network,
+        ``None`` (default) to call Telegram getMe.
+        """
+        handle = self._clone_bot_handle(bot)
+        if handle:
+            return handle
+        fn = getattr(self, "clone_username_fn", None)
+        if fn is False:
+            return ""
+        token = getattr(bot, "bot_token", "") or ""
+        if callable(fn):
+            try:
+                handle = (fn(token) or "").strip().lstrip("@")
+            except Exception:  # noqa: BLE001
+                handle = ""
+        else:
+            try:
+                from ..createbot import platform_username_from_token
+                handle = (platform_username_from_token(token) or "").lstrip("@")
+            except Exception:  # noqa: BLE001 - list still renders without it
+                handle = ""
+        if handle in {"", "?"}:
+            return ""
+        if not all(c.isalnum() or c == "_" for c in handle):
+            return ""
+        try:
+            bot.bot_username = handle
+        except Exception:  # noqa: BLE001
+            pass
+        registry = getattr(self.router, "subbots", None)
+        setter = getattr(registry, "set_username", None) if registry is not None else None
+        if callable(setter) and getattr(bot, "id", ""):
+            try:
+                setter(bot.id, handle)
+            except Exception:  # noqa: BLE001
+                log.debug("could not persist clone username for %s", bot.id, exc_info=True)
+        return handle
+
     @property
     def support_contact(self) -> str:
         """The support username customers see, live-editable by the owner.
@@ -2966,7 +3007,7 @@ class MenuUI:
             created = (getattr(b, "created_at", None) or "")[:10]
             user_bit = f"{users_n} users" if users_n is not None else "users n/a"
             float_bit = f" · float {float_held}" if float_held is not None else ""
-            handle = self._clone_bot_handle(b)
+            handle = self._ensure_clone_username(b)
             shown = f"@{handle}" if handle else f"`{b.id}`"
             lines.append(
                 f"{mark} {shown} · extra {extra_s}\n"
@@ -3045,7 +3086,7 @@ class MenuUI:
             else "own API"
         )
         crows: list[tuple[tuple[str, str], ...]] = []
-        handle = self._clone_bot_handle(bot)
+        handle = self._ensure_clone_username(bot)
         open_bot = self._tg_profile_url("", handle)
         if open_bot:
             crows.append((("🤖 Open clone", open_bot),))

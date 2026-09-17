@@ -785,7 +785,7 @@ def _make_whitelabel(settings: Settings, catalog, ledger, pricer, wallets,
             subbot_manager=mgr,
             platform_fee=_platform_fee(settings),
             platform_bot_username=platform_username,
-            clone_bot_username=_clone_username(bot.bot_token),
+            clone_bot_username=_remember_clone_username(registry, bot),
         )
         router.on_bot_created = _on_created
         router.updates_poster = updates_poster

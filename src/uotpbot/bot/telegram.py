@@ -712,6 +712,8 @@ class TelegramFrontend:
             return
         is_owner = False
         include_smm = False
+        include_referral = False
+        include_createbot = False
         if getattr(reply, "persistent_menu", False):
             user = getattr(message, "from_user", None)
             uid = str(getattr(user, "id", "")) if user else ""
@@ -720,8 +722,18 @@ class TelegramFrontend:
                 include_smm = bool(self.ui.smm_enabled())
             except Exception:  # noqa: BLE001
                 include_smm = False
-        markup = _reply_menu_markup(include_admin=is_owner, include_smm=include_smm) \
-            if getattr(reply, "persistent_menu", False) else _reply_markup(reply)
+            try:
+                include_referral = bool(self.ui.referral_enabled())
+            except Exception:  # noqa: BLE001
+                include_referral = False
+            try:
+                include_createbot = bool(self.ui.createbot_enabled())
+            except Exception:  # noqa: BLE001
+                include_createbot = False
+        markup = _reply_menu_markup(
+            include_admin=is_owner, include_smm=include_smm,
+            include_referral=include_referral, include_createbot=include_createbot,
+        ) if getattr(reply, "persistent_menu", False) else _reply_markup(reply)
         await message.reply_text(reply.text, reply_markup=markup)
 
     async def _send_notifications(self, context: Any, reply) -> None:

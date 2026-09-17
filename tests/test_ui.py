@@ -256,6 +256,13 @@ def test_reply_menu_hides_admin_from_users():
     extra_labels = [lbl for row in extra for lbl, _ in row]
     assert _INVITE_LABEL in extra_labels
     assert _CLONE_LABEL in extra_labels
+    import inspect
+    from uotpbot.bot.telegram import TelegramFrontend
+    src = inspect.getsource(TelegramFrontend._deliver_reply)
+    assert "include_referral" in src
+    assert "include_createbot" in src
+    assert "referral_enabled" in src
+    assert "createbot_enabled" in src
     assert REPLY_MENU_LABELS_LOW[_INVITE_LABEL.lower()] == "rf"
     assert REPLY_MENU_LABELS_LOW[_CLONE_LABEL.lower()] == "cb"
     assert REPLY_MENU_LABELS_LOW[_CLONE_LABEL_LEGACY.lower()] == "cb"
