@@ -523,6 +523,8 @@ def test_clone_withdraw_request_pings_platform_bot_not_clone():
         reply = ui.text("clone-owner", "50 name@okaxis")
         assert reply.ok
         assert not reply.notify
+        assert "Withdrawal request submitted" in reply.text
+        assert "Pending" in reply.text
         assert sent, "platform owner must be pinged via the main bot token"
         tok, chat, text = sent[0]
         assert tok == router.platform_bot_token
@@ -532,6 +534,59 @@ def test_clone_withdraw_request_pings_platform_bot_not_clone():
         pending = pending_withdrawals(store)
         assert len(pending) == 1
         assert pending[0].get("bot_id") == "clone1"
+        assert store.kv_get("wd_upi:clone-owner") == "name@okaxis"
+    finally:
+        ledger.close()
+
+
+def test_clone_withdraw_saves_upi_and_one_tap_submits():
+    """Add UPI once; Withdraw now submits instantly with a pending receipt."""
+    from uotpbot.reseller import payout_upi
+
+    router, ui, store, _, ledger, _ = _clone_rig()
+    sent = []
+    ui.direct_send_fn = lambda t, c, x: sent.append((t, c, x)) or True
+    try:
+        credit_earnings(store, "clone-owner", INR(80))
+        hub = ui.button("clone-owner", "ax:withdraw")
+        assert hub.ok
+        assert "not set" in hub.text.lower()
+        datas = {d for row in (hub.rows or ()) for _l, d in row}
+        assert "ax:wdupi" in datas
+        assert "ax:wdall" not in datas
+        prompt = ui.button("clone-owner", "ax:wdupi")
+        assert "UPI" in prompt.text
+        saved = ui.text("clone-owner", "me@okaxis")
+        assert saved.ok
+        assert "UPI saved" in saved.text
+        assert payout_upi(store, "clone-owner") == "me@okaxis"
+        assert "Withdraw" in saved.text
+        assert "ax:wdall" in {d for row in (saved.rows or ()) for _l, d in row}
+        sent.clear()
+        done = ui.button("clone-owner", "ax:wdall")
+        assert done.ok
+        assert "Withdrawal request submitted" in done.text
+        assert "Pending" in done.text
+        assert "me@okaxis" in done.text
+        assert "80" in done.text
+        assert earnings_balance(store, "clone-owner").is_zero
+        pending = pending_withdrawals(store)
+        assert len(pending) == 1
+        assert pending[0]["upi"] == "me@okaxis"
+        assert sent and sent[0][1] == "platform-owner"
+        # Change UPI without withdrawing.
+        ui.button("clone-owner", "ax:wdupi")
+        changed = ui.text("clone-owner", "new@ybl")
+        assert changed.ok
+        assert payout_upi(store, "clone-owner") == "new@ybl"
+        # Different amount uses the saved UPI.
+        credit_earnings(store, "clone-owner", INR(25))
+        ui.button("clone-owner", "ax:wdamt")
+        part = ui.text("clone-owner", "10")
+        assert part.ok
+        assert "Withdrawal request submitted" in part.text
+        assert "new@ybl" in part.text
+        assert earnings_balance(store, "clone-owner") == INR(15)
     finally:
         ledger.close()
 

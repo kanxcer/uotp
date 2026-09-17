@@ -38,8 +38,12 @@ __all__ = [
     "debit_earnings",
     "request_withdraw",
     "pending_withdrawals",
+    "withdrawals_for",
     "get_withdraw",
     "settle_withdraw",
+    "valid_upi",
+    "payout_upi",
+    "set_payout_upi",
 ]
 
 #: Suggested extra on our selling price (38% → ₹14.50 becomes ₹20.01).
@@ -49,6 +53,7 @@ MARGIN_FEE_RATE = Decimal("0.05")
 
 _EARN = "earn:{}"
 _WD = "wdpend:{}"
+_UPI = "wd_upi:{}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,11 +166,47 @@ def debit_earnings(store, owner_id: str, amount: Money) -> Money:
     return new
 
 
+def valid_upi(text: str) -> bool:
+    """True for a bare VPA like ``name@okaxis`` (no spaces, one @)."""
+    s = (text or "").strip()
+    if s.count("@") != 1 or " " in s:
+        return False
+    user, handle = s.split("@", 1)
+    if not user or not handle:
+        return False
+    if len(s) > 80:
+        return False
+    return True
+
+
+def payout_upi(store, owner_id: str) -> str:
+    """Saved payout VPA for this clone owner, or empty."""
+    get = getattr(store, "kv_get", None)
+    if not callable(get) or not owner_id:
+        return ""
+    try:
+        return (get(_UPI.format(owner_id)) or "").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def set_payout_upi(store, owner_id: str, upi: str) -> str:
+    """Persist a payout VPA. Raises ValueError if it is not a UPI id."""
+    upi = (upi or "").strip()
+    if not valid_upi(upi):
+        raise ValueError("send a UPI id, e.g. name@okaxis")
+    set_ = getattr(store, "kv_set", None)
+    if not callable(set_) or not owner_id:
+        raise ValueError("could not save UPI id")
+    set_(_UPI.format(owner_id), upi)
+    return upi
+
+
 def request_withdraw(store, owner_id: str, amount: Money, upi: str,
                      *, bot_id: str = "") -> str:
     """Freeze ``amount`` from earnings and open a pending payout request."""
     upi = (upi or "").strip()
-    if not upi or "@" not in upi:
+    if not valid_upi(upi):
         raise ValueError("send a UPI id, e.g. name@okaxis")
     debit_earnings(store, owner_id, amount)
     set_ = getattr(store, "kv_set", None)
@@ -201,7 +242,7 @@ def get_withdraw(store, wd_id: str) -> Optional[dict]:
     return _read_wd(store, wd_id)
 
 
-def pending_withdrawals(store) -> list[dict]:
+def _all_withdrawals(store) -> list[dict]:
     scan = getattr(store, "kv_scan", None)
     if not callable(scan):
         return []
@@ -215,10 +256,23 @@ def pending_withdrawals(store) -> list[dict]:
             data = json.loads(raw)
         except Exception:  # noqa: BLE001
             continue
-        if isinstance(data, dict) and data.get("status") == "pending":
+        if isinstance(data, dict) and data.get("id"):
             out.append(data)
     out.sort(key=lambda d: float(d.get("ts") or 0), reverse=True)
     return out
+
+
+def pending_withdrawals(store) -> list[dict]:
+    return [d for d in _all_withdrawals(store) if d.get("status") == "pending"]
+
+
+def withdrawals_for(store, owner_id: str, *, limit: int = 8) -> list[dict]:
+    """This clone owner's recent payout requests (pending / paid / declined)."""
+    if not owner_id:
+        return []
+    oid = str(owner_id)
+    out = [d for d in _all_withdrawals(store) if str(d.get("owner_id") or "") == oid]
+    return out[: max(0, int(limit or 0))]
 
 
 def settle_withdraw(store, wd_id: str, *, paid: bool) -> Optional[dict]:

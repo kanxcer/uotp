@@ -2326,6 +2326,10 @@ class MenuUI:
                 )
             if action == "withdraw":
                 return self._apply_withdraw(user_id, body)
+            if action == "wdupi":
+                return self._apply_payout_upi(user_id, body)
+            if action == "wdamt":
+                return self._apply_withdraw(user_id, body)
             self._wizard.pop(user_id, None)
             return self.main_menu(user_id)
 
@@ -3164,17 +3168,24 @@ class MenuUI:
 
     def _clone_admin_panel(self, user_id: str) -> Reply:
         """Clone-owner admin: no money rails, no clone on/off, no FamGateway."""
-        from ..reseller import earnings_balance
+        from ..reseller import earnings_balance, payout_upi
         extra = getattr(self.router, "reseller_rate", 0) or 0
         extra_pct = f"{(extra * 100):.0f}%"
         store = getattr(self.router, "platform_wallets", None) or self._store
         earn = earnings_balance(store, user_id) if store is not None else Money.zero()
+        upi = payout_upi(store, user_id) if store is not None else ""
+        upi_line = (
+            f"🏦 Payout UPI: `{upi}`\n"
+            if upi else
+            "🏦 Payout UPI: not set — add it on 💸 Withdraw\n"
+        )
         fs = self._float_stats()
         users = int(fs["users"]) if fs and fs.get("users") is not None else 0
         return Reply(
             "📊 Your clone panel\n\n"
             f"📈 Extra on our prices: {extra_pct} (locked)\n"
             f"💸 Withdrawable earnings: {earn}\n"
+            f"{upi_line}"
             "We keep 5% of your extra; you keep 95% — credited when a "
             "customer gets their OTP.\n"
             "Customers pay through our UPI. You cannot add a QR, UPI id, "
@@ -3194,56 +3205,198 @@ class MenuUI:
         )
 
     def withdraw_prompt(self, user_id: str) -> Reply:
-        """Clone owner: start a payout request."""
+        """Clone owner: payout hub — saved UPI + one-tap withdraw."""
         if not self.router._is_owner(user_id) or not self._is_clone:
             return Reply("Owner only.", ok=False, rows=((("🏠 Menu", "m"),),))
-        from ..reseller import earnings_balance
+        from ..reseller import earnings_balance, payout_upi, withdrawals_for
         store = getattr(self.router, "platform_wallets", None) or self._store
         earn = earnings_balance(store, user_id) if store is not None else Money.zero()
+        upi = payout_upi(store, user_id) if store is not None else ""
+        # Typed `500 name@okaxis` still works from this screen.
         self._wizard[user_id] = {"flow": "admin", "action": "withdraw", "step": "input"}
+        history = withdrawals_for(store, user_id, limit=4) if store is not None else []
+        hist_lines = []
+        for w in history:
+            amt = Money(int(w.get("amount_paise") or 0))
+            st = str(w.get("status") or "pending")
+            badge = {"pending": "⏳", "paid": "✅", "declined": "❌"}.get(st, "•")
+            hist_lines.append(f"{badge} {amt} · {st} · `{w.get('upi')}`")
+        hist = ("\n\nRecent requests:\n" + "\n".join(hist_lines)) if hist_lines else ""
+        rows: list[tuple[tuple[str, str], ...]] = []
+        if not upi:
+            text = (
+                f"💸 Withdraw earnings\n\n"
+                f"Available: {earn}\n"
+                "Payout UPI: not set\n\n"
+                "Add your UPI id once. After that, tap Withdraw and the "
+                "request is submitted instantly — we'll message you here "
+                "when it's paid."
+                f"{hist}"
+            )
+            rows.append((("🏦 Add UPI ID", "ax:wdupi"),))
+        else:
+            text = (
+                f"💸 Withdraw earnings\n\n"
+                f"Available: {earn}\n"
+                f"Payout UPI: `{upi}`\n\n"
+                "Tap Withdraw now to submit a request instantly. "
+                "We'll pay this UPI and message you here when it's done."
+                f"{hist}"
+            )
+            if earn.paise > 0:
+                rows.append(((f"💸 Withdraw {earn} now", "ax:wdall"),))
+                rows.append((("✏️ Different amount", "ax:wdamt"),))
+            rows.append((("🏦 Change UPI ID", "ax:wdupi"),))
+        rows.append((("◀️ Clone panel", "a"),))
+        return Reply(text, rows=tuple(rows))
+
+    def payout_upi_prompt(self, user_id: str) -> Reply:
+        """Clone owner: save / change the payout UPI id."""
+        if not self.router._is_owner(user_id) or not self._is_clone:
+            return Reply("Owner only.", ok=False, rows=((("🏠 Menu", "m"),),))
+        from ..reseller import payout_upi
+        store = getattr(self.router, "platform_wallets", None) or self._store
+        current = payout_upi(store, user_id) if store is not None else ""
+        self._wizard[user_id] = {"flow": "admin", "action": "wdupi", "step": "input"}
+        cur = f"`{current}`" if current else "not set"
         return Reply(
-            f"💸 Withdraw earnings\n\n"
-            f"Available: {earn}\n\n"
-            "Send the amount and your UPI id on one line, e.g.\n"
-            "`500 name@okaxis`\n\n"
-            "We'll pay it out and deduct it from your earnings. "
-            "If we decline, the money is put back.",
-            rows=((("✖️ Cancel", "a"),),),
+            "🏦 Payout UPI ID\n\n"
+            f"Current: {cur}\n\n"
+            "Send your UPI id, e.g.\n"
+            "`name@okaxis`  or  `9876543210@ybl`\n\n"
+            "We'll pay withdrawals to this id. You can change it any time.",
+            rows=((("✖️ Cancel", "ax:withdraw"),),),
         )
 
+    def withdraw_amount_prompt(self, user_id: str) -> Reply:
+        """Clone owner: type an amount; saved UPI is used."""
+        if not self.router._is_owner(user_id) or not self._is_clone:
+            return Reply("Owner only.", ok=False, rows=((("🏠 Menu", "m"),),))
+        from ..reseller import earnings_balance, payout_upi
+        store = getattr(self.router, "platform_wallets", None) or self._store
+        earn = earnings_balance(store, user_id) if store is not None else Money.zero()
+        upi = payout_upi(store, user_id) if store is not None else ""
+        if not upi:
+            return self.payout_upi_prompt(user_id)
+        self._wizard[user_id] = {"flow": "admin", "action": "wdamt", "step": "input"}
+        return Reply(
+            f"💸 Withdraw amount\n\n"
+            f"Available: {earn}\n"
+            f"Pays to: `{upi}`\n\n"
+            "Send just the amount in ₹ — e.g. `500`",
+            rows=((("✖️ Cancel", "ax:withdraw"),),),
+        )
+
+    def _withdraw_all_now(self, user_id: str) -> Reply:
+        """One tap: freeze the full earnings balance and confirm instantly."""
+        if not self.router._is_owner(user_id) or not self._is_clone:
+            return Reply("Owner only.", ok=False, rows=((("🏠 Menu", "m"),),))
+        from ..reseller import earnings_balance, payout_upi
+        store = getattr(self.router, "platform_wallets", None) or self._store
+        if store is None:
+            return Reply("Earnings store is offline.", ok=False,
+                         rows=((("◀️ Back", "a"),),))
+        upi = payout_upi(store, user_id)
+        if not upi:
+            return self.payout_upi_prompt(user_id)
+        earn = earnings_balance(store, user_id)
+        if earn.paise <= 0:
+            return Reply(
+                "Nothing to withdraw yet. Earnings land here when a "
+                "customer gets their OTP.",
+                ok=False, rows=((("◀️ Withdraw", "ax:withdraw"),),),
+            )
+        return self._submit_withdraw(user_id, earn, upi)
+
+    def _apply_payout_upi(self, user_id: str, body: str) -> Reply:
+        from ..reseller import set_payout_upi, valid_upi
+        store = getattr(self.router, "platform_wallets", None) or self._store
+        if store is None:
+            return Reply("Earnings store is offline.", ok=False,
+                         rows=((("◀️ Back", "a"),),))
+        raw = (body or "").strip().split()[0] if (body or "").strip() else ""
+        if not valid_upi(raw):
+            return Reply(
+                "That doesn't look like a UPI id. Send e.g. `name@okaxis`.",
+                ok=False, rows=((("✖️ Cancel", "ax:withdraw"),),),
+            )
+        try:
+            upi = set_payout_upi(store, user_id, raw)
+        except ValueError as exc:
+            return Reply(str(exc), ok=False, rows=((("✖️ Cancel", "ax:withdraw"),),))
+        self._wizard.pop(user_id, None)
+        hub = self.withdraw_prompt(user_id)
+        return Reply(
+            f"✅ UPI saved: `{upi}`\n\n" + hub.text,
+            rows=hub.rows,
+        )
+
+    def _parse_withdraw_amount(self, raw: str):
+        """Parse a rupee amount for payouts (₹0.01+). None if unusable."""
+        amount = self._parse_amount(raw)
+        if amount is not None:
+            return amount
+        cleaned = (raw or "").replace("₹", "").replace(",", "").strip()
+        try:
+            from decimal import Decimal as _D
+            rupees = _D(cleaned)
+            if rupees <= 0:
+                return None
+            return Money(int(rupees * 100))
+        except Exception:  # noqa: BLE001
+            return None
+
     def _apply_withdraw(self, user_id: str, body: str) -> Reply:
-        from ..reseller import request_withdraw
+        from ..reseller import payout_upi, set_payout_upi, valid_upi
         store = getattr(self.router, "platform_wallets", None) or self._store
         if store is None:
             return Reply("Earnings store is offline.", ok=False,
                          rows=((("◀️ Back", "a"),),))
         tokens = (body or "").strip().split()
-        if len(tokens) < 2:
+        if not tokens:
             return Reply(
-                "Format: <amount> <upi id> — e.g. `500 name@okaxis`.",
-                ok=False, rows=((("✖️ Cancel", "a"),),),
+                "Send an amount, e.g. `500`. Or `500 name@okaxis`.",
+                ok=False, rows=((("✖️ Cancel", "ax:withdraw"),),),
             )
-        amount = self._parse_amount(tokens[0])
+        # A lone UPI on this screen saves it (same as Add UPI).
+        if len(tokens) == 1 and valid_upi(tokens[0]):
+            return self._apply_payout_upi(user_id, tokens[0])
+        amount = self._parse_withdraw_amount(tokens[0])
         if amount is None:
-            # Allow amounts below ₹10 for small extras (min 1 rupee).
-            raw = tokens[0].replace("₹", "").replace(",", "").strip()
+            return Reply(
+                "That doesn't look like an amount. Send e.g. `500` "
+                "or `500 name@okaxis`.",
+                ok=False, rows=((("✖️ Cancel", "ax:withdraw"),),),
+            )
+        upi = tokens[1] if len(tokens) >= 2 else payout_upi(store, user_id)
+        if not valid_upi(upi):
+            return Reply(
+                "Add a UPI id first — tap 🏦 Add UPI ID, or send "
+                "`500 name@okaxis`.",
+                ok=False, rows=((("🏦 Add UPI ID", "ax:wdupi"),
+                                 ("✖️ Cancel", "ax:withdraw")),),
+            )
+        if valid_upi(upi):
             try:
-                from decimal import Decimal as _D
-                rupees = _D(raw)
-                if rupees <= 0:
-                    raise ValueError
-                amount = Money(int(rupees * 100))
-            except Exception:  # noqa: BLE001
-                return Reply("That doesn't look like an amount.",
-                             ok=False, rows=((("✖️ Cancel", "a"),),))
-        upi = tokens[1]
+                set_payout_upi(store, user_id, upi)
+            except ValueError:
+                pass
+        return self._submit_withdraw(user_id, amount, upi)
+
+    def _submit_withdraw(self, user_id: str, amount: Money, upi: str) -> Reply:
+        """Freeze earnings, ping the platform owner, confirm instantly."""
+        from ..reseller import request_withdraw
+        store = getattr(self.router, "platform_wallets", None) or self._store
+        if store is None:
+            return Reply("Earnings store is offline.", ok=False,
+                         rows=((("◀️ Back", "a"),),))
         try:
             wd_id = request_withdraw(
                 store, user_id, amount, upi,
                 bot_id=getattr(self.router, "clone_bot_id", "") or "",
             )
         except ValueError as exc:
-            return Reply(str(exc), ok=False, rows=((("✖️ Cancel", "a"),),))
+            return Reply(str(exc), ok=False, rows=((("✖️ Cancel", "ax:withdraw"),),))
         self._wizard.pop(user_id, None)
         plat = getattr(self.router, "platform_owner_id", "") or ""
         plat_tok = getattr(self.router, "platform_bot_token", "") or ""
@@ -3256,8 +3409,13 @@ class MenuUI:
                 log.warning(
                     "clone payout request ping to platform owner %s failed", plat)
         return Reply(
-            f"✅ Payout requested: {amount} to `{upi}`.\n"
-            f"Request id `{wd_id}`. We'll settle it and ping you.",
+            "✅ Withdrawal request submitted\n\n"
+            f"Amount: {amount}\n"
+            f"Paid to: `{upi}`\n"
+            "Status: Pending\n"
+            f"Ref: `{wd_id}`\n\n"
+            "We'll send this to your UPI and message you here when it's paid. "
+            "Usually the same day.",
             rows=((("◀️ Clone panel", "a"),),),
         )
 
@@ -3839,6 +3997,12 @@ class MenuUI:
                 return self._admin_input_prompt(user_id, "refrate")
             if action == "withdraw":
                 return self.withdraw_prompt(user_id)
+            if action == "wdupi":
+                return self.payout_upi_prompt(user_id)
+            if action == "wdall":
+                return self._withdraw_all_now(user_id)
+            if action == "wdamt":
+                return self.withdraw_amount_prompt(user_id)
             return self._badtap()
         if kind == "fs":
             if len(parts) == 2 and parts[1] == "ok":
